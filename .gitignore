@@ -1,0 +1,38 @@
+# Meta Ads Agent - .gitignore
+
+# Credentials
+.env.txt
+.secret_key
+
+# Runtime data
+campaigns.json
+campaigns_*.json
+posts.json
+accounts.json
+pixel_config.json
+leads.json
+leads_*.json
+tenants.json
+users.json
+audit_log_*.jsonl
+uploads/
+__pycache__/
+*.pyc
+
+# Logs
+server_out.log
+server_err.log
+*.log
+
+# Temp / helper scripts (not part of product)
+check_*.py
+test_*.py
+save_*.py
+gen_*.py
+temp_*.py
+
+# Python
+*.pyo
+*.pyd
+.vscode/
+.idea/
