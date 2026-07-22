@@ -12,7 +12,229 @@ import threading
 import re
 import requests
 from datetime import datetime
-from flask import Flask, send_from_directory, request, jsonify
+from flask import Flask, send_from_directory, request, jsonify, session
+from werkzeug.security import generate_password_hash, check_password_hash
+
+# ==================== SAFETY GUARD (spend caps + audit log) ====================
+# This layer sits between the AI/automation and any real money being spent.
+# Nothing that touches budget should bypass it.
+
+class SafetyGuard:
+    """
+    Central safety layer. Two jobs:
+    1. Enforce a hard, non-negotiable total daily budget cap across ALL campaigns.
+       No code path -- manual, AI, or optimizer -- may exceed it.
+    2. Write an append-only audit log of every budget-affecting decision,
+       whether it was allowed or blocked, so nothing happens silently.
+    """
+    _lock = threading.Lock()
+
+    def __init__(self, audit_log_path='audit_log.jsonl'):
+        self.audit_log_path = audit_log_path
+        # Hard ceiling for TOTAL daily spend across every active campaign combined.
+        # Defaults to a conservative $50/day if not set. This is intentional --
+        # better to force a deliberate opt-in to spend more than to guess high.
+        try:
+            self.max_total_daily_budget = float(os.environ.get('MAX_TOTAL_DAILY_BUDGET', 50))
+        except (TypeError, ValueError):
+            self.max_total_daily_budget = 50.0
+        # Automatic budget increases from the optimizer are OFF by default.
+        # The optimizer will still *suggest* increases, but won't apply them
+        # unless this is explicitly turned on in .env.txt.
+        self.auto_budget_increase_enabled = os.environ.get('AUTO_BUDGET_INCREASE_ENABLED', 'false').strip().lower() in ('1', 'true', 'yes')
+
+    def log(self, action, allowed, reason='', **details):
+        entry = {
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'action': action,
+            'allowed': allowed,
+            'reason': reason,
+            **details
+        }
+        try:
+            with self._lock:
+                with open(self.audit_log_path, 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+        except Exception as e:
+            print(f"[SafetyGuard] WARNING: could not write audit log: {e}")
+        tag = "ALLOWED" if allowed else "BLOCKED"
+        print(f"[SafetyGuard] {tag} — {action}: {reason}")
+        return entry
+
+    def current_committed_budget(self, campaigns, exclude_campaign_id=None):
+        """Sum of daily_budget across all non-archived/non-trashed campaigns we know about."""
+        total = 0.0
+        for cid, c in (campaigns or {}).items():
+            if exclude_campaign_id and cid == exclude_campaign_id:
+                continue
+            if c.get('status') in ('ARCHIVED', 'TRASHED'):
+                continue
+            b = c.get('budget_daily') or c.get('daily_budget')
+            try:
+                if b:
+                    total += float(b)
+            except (TypeError, ValueError):
+                pass
+        return total
+
+    def check_new_budget(self, campaigns, proposed_daily_budget, action='create_campaign', campaign_id=None):
+        """
+        Returns (allowed: bool, reason: str). Call this BEFORE spending any money
+        (creating a campaign, or raising a budget) -- never after.
+        """
+        committed = self.current_committed_budget(campaigns, exclude_campaign_id=campaign_id)
+        projected_total = committed + float(proposed_daily_budget or 0)
+        if projected_total > self.max_total_daily_budget:
+            reason = (f"Projected total daily budget ${projected_total:.2f} would exceed the hard cap "
+                      f"of ${self.max_total_daily_budget:.2f}/day (already committed: ${committed:.2f}/day)")
+            self.log(action, allowed=False, reason=reason, campaign_id=campaign_id,
+                     proposed_daily_budget=proposed_daily_budget, committed=committed,
+                     cap=self.max_total_daily_budget)
+            return False, reason
+        reason = f"Within cap: ${projected_total:.2f}/day of ${self.max_total_daily_budget:.2f}/day max"
+        self.log(action, allowed=True, reason=reason, campaign_id=campaign_id,
+                 proposed_daily_budget=proposed_daily_budget, committed=committed,
+                 cap=self.max_total_daily_budget)
+        return True, reason
+
+
+# Single shared instance used everywhere in this file.
+safety_guard = SafetyGuard()
+
+# ==================== CONFIG STORE (editable industry rules) ====================
+# Before this, targeting/budget/objective rules per industry were hardcoded in
+# three different places in the code. Now they live in one editable JSON file,
+# so changing them (or adding a new industry, for a future multi-tenant version)
+# doesn't require touching Python code at all.
+
+DEFAULT_INDUSTRY_CONFIG = {
+    'restaurant': {
+        'primary_offering': 'Food and Dining', 'peak_hours': 'lunch and dinner',
+        'target_demographics': 'families and young professionals',
+        'conversion_factors': ['ambiance', 'price', 'location', 'reviews'],
+        'primary_interests': ['food', 'dining', 'cooking', 'restaurants'],
+        'secondary_interests': ['travel', 'entertainment', 'socializing'],
+        'age_groups': ['25-44', '45-64'],
+        'budget_split': {'facebook': 40, 'instagram': 30, 'messenger': 20, 'whatsapp': 10},
+        'estimated_roas': 3.5,
+        'objectives': ['OUTCOME_LEADS', 'OUTCOME_TRAFFIC', 'OUTCOME_SALES'],
+        'ad_types': ['image carousel', 'video ads', 'collection'],
+    },
+    'retail': {
+        'primary_offering': 'Retail Products', 'peak_hours': 'weekends and evenings',
+        'target_demographics': 'all age groups',
+        'conversion_factors': ['price', 'quality', 'convenience', 'brand'],
+        'primary_interests': ['shopping', 'fashion', 'deals', 'products'],
+        'secondary_interests': ['travel', 'entertainment', 'home improvement'],
+        'age_groups': ['18-34', '35-54'],
+        'budget_split': {'facebook_feed': 50, 'instagram_feed': 30, 'facebook_marketplace': 20},
+        'estimated_roas': 4.2,
+        'objectives': ['OUTCOME_SALES', 'OUTCOME_LEADS', 'OUTCOME_AWARENESS'],
+        'ad_types': ['carousel ads', 'video ads', 'story ads'],
+    },
+    'service': {
+        'primary_offering': 'Professional Services', 'peak_hours': 'business hours',
+        'target_demographics': 'adults and businesses',
+        'conversion_factors': ['reputation', 'expertise', 'cost', 'convenience'],
+        'primary_interests': ['professional services', 'expertise', 'advice'],
+        'secondary_interests': ['finance', 'insurance', 'real estate'],
+        'age_groups': ['35-54', '55+'],
+        'budget_split': {'facebook': 50, 'instagram': 30, 'messenger': 20},
+        'estimated_roas': 5.1,
+        'objectives': ['OUTCOME_LEADS', 'OUTCOME_TRAFFIC', 'OUTCOME_SALES'],
+        'ad_types': ['image ads', 'text ads', 'video ads'],
+    },
+    'ecommerce': {
+        'primary_offering': 'E-commerce', 'peak_hours': 'weekends and holidays',
+        'target_demographics': 'tech-savvy shoppers',
+        'conversion_factors': ['price', 'reviews', 'shipping', 'return policy'],
+        'primary_interests': ['online shopping', 'deals', 'reviews', 'products'],
+        'secondary_interests': ['technology', 'finance', 'travel'],
+        'age_groups': ['18-34', '35-54'],
+        'budget_split': {'facebook': 35, 'instagram': 35, 'google_ads': 30},
+        'estimated_roas': 6.8,
+        'objectives': ['OUTCOME_SALES', 'OUTCOME_TRAFFIC', 'OUTCOME_AWARENESS'],
+        'ad_types': ['product carousel', 'video ads', 'collection ads'],
+    },
+    'martialarts': {
+        'primary_offering': 'classes', 'peak_hours': 'afternoons and weekends',
+        'target_demographics': 'adults and children',
+        'conversion_factors': ['instructor quality', 'location', 'pricing', 'community'],
+        'primary_interests': ['martial arts', 'self defense', 'karate', 'fitness for kids', 'discipline'],
+        'secondary_interests': ['parenting', 'family activities', 'health and fitness'],
+        'age_groups': ['25-54'],
+        'budget_split': {'facebook': 40, 'instagram': 35, 'messenger': 25},
+        'estimated_roas': 4.0,
+        'objectives': ['OUTCOME_LEADS', 'OUTCOME_TRAFFIC'],
+        'ad_types': ['image ads', 'video ads', 'carousel ads'],
+    },
+    'medical': {
+        'primary_offering': 'services', 'peak_hours': 'business hours',
+        'target_demographics': 'adults and families',
+        'conversion_factors': ['credentials', 'location', 'insurance', 'reviews'],
+        'primary_interests': ['health', 'wellness', 'medical care'],
+        'secondary_interests': ['insurance', 'family health'],
+        'age_groups': ['35-64'],
+        'budget_split': {'facebook': 50, 'instagram': 25, 'messenger': 25},
+        'estimated_roas': 4.0,
+        'objectives': ['OUTCOME_LEADS', 'OUTCOME_TRAFFIC', 'OUTCOME_SALES'],
+        'ad_types': ['image ads', 'text ads', 'video ads'],
+    },
+}
+
+
+class ConfigStore:
+    """Loads/saves per-industry rules from a JSON file that anyone can edit
+    (by hand, or later through a dashboard form) without touching Python."""
+
+    def __init__(self, path='industry_config.json'):
+        self.path = path
+        self.data = self._load()
+
+    def _load(self):
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, 'r', encoding='utf-8') as f:
+                    loaded = json.load(f)
+                # Fill in any industries/fields present in defaults but missing
+                # from the user's file, so upgrades never crash on a missing key.
+                merged = json.loads(json.dumps(DEFAULT_INDUSTRY_CONFIG))
+                for industry, cfg in loaded.items():
+                    merged.setdefault(industry, {})
+                    merged[industry].update(cfg)
+                return merged
+            except Exception as e:
+                print(f"[ConfigStore] WARNING: could not read {self.path}, using defaults: {e}")
+        return json.loads(json.dumps(DEFAULT_INDUSTRY_CONFIG))
+
+    def save(self):
+        try:
+            with open(self.path, 'w', encoding='utf-8') as f:
+                json.dump(self.data, f, indent=2, ensure_ascii=False)
+            return True
+        except Exception as e:
+            print(f"[ConfigStore] WARNING: could not save {self.path}: {e}")
+            return False
+
+    def get(self, industry):
+        return self.data.get(industry, self.data.get('service', {}))
+
+    def list_industries(self):
+        return list(self.data.keys())
+
+    def set(self, industry, config_dict):
+        self.data[industry] = config_dict
+        return self.save()
+
+    def update(self, industry, partial_dict):
+        current = self.data.get(industry, {})
+        current.update(partial_dict)
+        self.data[industry] = current
+        return self.save()
+
+
+# Single shared instance used everywhere in this file.
+config_store = ConfigStore()
 
 # ==================== META API INTEGRATION ====================
 
@@ -189,18 +411,36 @@ class MetaAPI:
             return []
 
     def refresh_access_token(self):
-        if self.app_id and self.app_secret:
+        if self.app_id and self.app_secret and self.access_token:
             url = f"{self.base_url}/oauth/access_token"
             params = {
+                'grant_type': 'fb_exchange_token',
+                'client_id': self.app_id,
+                'client_secret': self.app_secret,
+                'fb_exchange_token': self.access_token,
+            }
+            try:
+                response = self.session.get(url, params=params)
+                if response.status_code == 200:
+                    data = response.json()
+                    new_token = data.get('access_token')
+                    if new_token:
+                        self.access_token = new_token
+                        return True
+            except Exception:
+                pass
+            params2 = {
                 'client_id': self.app_id,
                 'client_secret': self.app_secret,
                 'grant_type': 'client_credentials'
             }
             try:
-                response = self.session.get(url, params=params)
+                response = self.session.get(url, params=params2)
                 if response.status_code == 200:
-                    self.access_token = response.json().get('access_token')
-                    return True
+                    new_token = response.json().get('access_token')
+                    if new_token:
+                        self.access_token = new_token
+                        return True
             except Exception:
                 pass
         return False
@@ -221,7 +461,15 @@ class MetaAPI:
 
     def upload_image(self, image_path):
         url = f"{self.base_url}/{self.ad_account_id}/adimages"
-        full_path = os.path.join(os.path.dirname(__file__), image_path.lstrip('/'))
+        safe = os.path.normpath(image_path.lstrip('/')).replace('\\', '/')
+        if '..' in safe or safe.startswith('/'):
+            print(f"Image path rejected (possible traversal): {image_path}")
+            return None
+        full_path = os.path.join(os.path.dirname(__file__), safe)
+        full_path = os.path.normpath(full_path)
+        if not full_path.startswith(os.path.normpath(os.path.dirname(__file__))):
+            print(f"Image path rejected (outside app dir): {full_path}")
+            return None
         if not os.path.exists(full_path):
             print(f"Image file not found: {full_path}")
             return None
@@ -242,7 +490,15 @@ class MetaAPI:
 
     def upload_video(self, video_path):
         url = f"{self.base_url}/{self.ad_account_id}/advideos"
-        full_path = os.path.join(os.path.dirname(__file__), video_path.lstrip('/'))
+        safe = os.path.normpath(video_path.lstrip('/')).replace('\\', '/')
+        if '..' in safe or safe.startswith('/'):
+            print(f"Video path rejected (possible traversal): {video_path}")
+            return None
+        full_path = os.path.join(os.path.dirname(__file__), safe)
+        full_path = os.path.normpath(full_path)
+        if not full_path.startswith(os.path.normpath(os.path.dirname(__file__))):
+            print(f"Video path rejected (outside app dir): {full_path}")
+            return None
         if not os.path.exists(full_path):
             print(f"Video file not found: {full_path}")
             return None
@@ -414,6 +670,35 @@ class MetaAPI:
             pass
         return None
 
+    def delete_facebook_post(self, post_id, page_token=None):
+        """Delete a post from Facebook by its post_id (format: page_id_post_id)"""
+        token = page_token or self.page_token or self.access_token
+        try:
+            url = f"{self.base_url}/{post_id}"
+            r = self.session.delete(url, params={'access_token': token})
+            data = r.json()
+            if data.get('success') or data.get('result') == 'true':
+                return {'success': True}
+            # Facebook sometimes returns True as boolean
+            if data is True or data == True:
+                return {'success': True}
+            return {'success': False, 'error': data.get('error', {}).get('message', 'Unknown error')}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    def delete_instagram_post(self, ig_media_id, page_token=None):
+        """Delete an Instagram post by its media ID"""
+        token = page_token or self.page_token or self.access_token
+        try:
+            url = f"{self.base_url}/{ig_media_id}"
+            r = self.session.delete(url, params={'access_token': token})
+            data = r.json()
+            if data.get('success') or data is True:
+                return {'success': True}
+            return {'success': False, 'error': data.get('error', {}).get('message', 'Unknown error')}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
     def _ensure_public_url(self, media_url, page_id, token):
         if media_url.startswith('/uploads/') or media_url.startswith('uploads/'):
             fb_url = self._upload_to_facebook_for_ig(media_url, page_id, token)
@@ -529,54 +814,17 @@ class MetaAPI:
 
 class AudienceAnalyzer:
     def __init__(self):
-        self.audience_insights = {
-            'restaurant': {
-                'primary_interests': ['food', 'dining', 'cooking', 'restaurants'],
-                'secondary_interests': ['travel', 'entertainment', 'socializing'],
-                'demographic_targeting': {
-                    'age_groups': ['25-44', '45-64'],
-                    'income_levels': ['medium', 'high'],
-                    'locations': ['urban', 'suburban']
-                }
-            },
-            'retail': {
-                'primary_interests': ['shopping', 'fashion', 'deals', 'products'],
-                'secondary_interests': ['travel', 'entertainment', 'home improvement'],
-                'demographic_targeting': {
-                    'age_groups': ['18-34', '35-54'],
-                    'income_levels': ['low', 'medium', 'high'],
-                    'locations': ['urban', 'suburban', 'rural']
-                }
-            },
-            'service': {
-                'primary_interests': ['professional services', 'expertise', 'advice'],
-                'secondary_interests': ['finance', 'insurance', 'real estate'],
-                'demographic_targeting': {
-                    'age_groups': ['35-54', '55+'],
-                    'income_levels': ['medium', 'high'],
-                    'locations': ['urban', 'suburban']
-                }
-            },
-            'ecommerce': {
-                'primary_interests': ['online shopping', 'deals', 'reviews', 'products'],
-                'secondary_interests': ['technology', 'finance', 'travel'],
-                'demographic_targeting': {
-                    'age_groups': ['18-34', '35-54'],
-                    'income_levels': ['low', 'medium', 'high'],
-                    'locations': ['urban', 'suburban']
-                }
-            }
-        }
+        pass  # targeting rules now live in config_store (industry_config.json), not here
 
     def identify_target_audience(self, business_profile):
         industry = business_profile.get('industry', 'service')
         location = business_profile.get('location', '')
-        insights = self.audience_insights.get(industry, self.audience_insights['service'])
+        cfg = config_store.get(industry)
         return {
-            'primary_audience': insights['primary_interests'],
-            'secondary_audience': insights['secondary_interests'],
+            'primary_audience': cfg.get('primary_interests', []),
+            'secondary_audience': cfg.get('secondary_interests', []),
             'geographic_targeting': self.get_geographic_targeting(location),
-            'interest_targeting': insights['primary_interests'],
+            'interest_targeting': cfg.get('primary_interests', []),
             'behavioral_targeting': ['mobile shopper', 'price sensitive', 'brand loyal']
         }
 
@@ -588,8 +836,7 @@ class AudienceAnalyzer:
         }
 
     def get_interest_targeting(self, industry):
-        insights = self.audience_insights.get(industry, self.audience_insights['service'])
-        return insights['primary_interests']
+        return config_store.get(industry).get('primary_interests', [])
 
     def get_behavioral_targeting(self, industry):
         return ['mobile shopper', 'price sensitive', 'brand loyal', 'social media user']
@@ -626,63 +873,18 @@ class AIStrategyEngine:
         }
 
     def get_industry_insights(self, industry):
-        insights_db = {
-            'restaurant': {
-                'industry': 'restaurant',
-                'primary_offering': 'Food and Dining',
-                'peak_hours': 'lunch and dinner',
-                'target_demographics': 'families and young professionals',
-                'conversion_factors': ['ambiance', 'price', 'location', 'reviews']
-            },
-            'retail': {
-                'industry': 'retail',
-                'primary_offering': 'Retail Products',
-                'peak_hours': 'weekends and evenings',
-                'target_demographics': 'all age groups',
-                'conversion_factors': ['price', 'quality', 'convenience', 'brand']
-            },
-            'service': {
-                'industry': 'service',
-                'primary_offering': 'Professional Services',
-                'peak_hours': 'business hours',
-                'target_demographics': 'adults and businesses',
-                'conversion_factors': ['reputation', 'expertise', 'cost', 'convenience']
-            },
-            'ecommerce': {
-                'industry': 'ecommerce',
-                'primary_offering': 'E-commerce',
-                'peak_hours': 'weekends and holidays',
-                'target_demographics': 'tech-savvy shoppers',
-                'conversion_factors': ['price', 'reviews', 'shipping', 'return policy']
-            },
-            'martialarts': {
-                'industry': 'martialarts',
-                'primary_offering': 'classes',
-                'peak_hours': 'afternoons and weekends',
-                'target_demographics': 'adults and children',
-                'conversion_factors': ['instructor quality', 'location', 'pricing', 'community']
-            },
-            'medical': {
-                'industry': 'medical',
-                'primary_offering': 'services',
-                'peak_hours': 'business hours',
-                'target_demographics': 'adults and families',
-                'conversion_factors': ['credentials', 'location', 'insurance', 'reviews']
-            }
+        cfg = config_store.get(industry)
+        return {
+            'industry': industry if industry in config_store.data else 'service',
+            'primary_offering': cfg.get('primary_offering', 'Professional Services'),
+            'peak_hours': cfg.get('peak_hours', 'business hours'),
+            'target_demographics': cfg.get('target_demographics', 'adults'),
+            'conversion_factors': cfg.get('conversion_factors', []),
         }
-        return insights_db.get(industry, insights_db['service'])
 
     def recommend_budget(self, business_profile):
         industry = business_profile.get('industry', 'service')
-        budgets = {
-            'restaurant': {'facebook': 40, 'instagram': 30, 'messenger': 20, 'whatsapp': 10},
-            'retail': {'facebook_feed': 50, 'instagram_feed': 30, 'facebook_marketplace': 20},
-            'ecommerce': {'facebook': 35, 'instagram': 35, 'google_ads': 30},
-            'service': {'facebook': 50, 'instagram': 30, 'messenger': 20},
-            'martialarts': {'facebook': 40, 'instagram': 35, 'messenger': 25},
-            'medical': {'facebook': 50, 'instagram': 25, 'messenger': 25}
-        }
-        return budgets.get(industry, budgets['service'])
+        return config_store.get(industry).get('budget_split', config_store.get('service').get('budget_split', {}))
 
     def assess_competition(self, business_profile):
         size = business_profile.get('business_size', 'small')
@@ -702,26 +904,16 @@ class AIStrategyEngine:
         return patterns.get(industry, patterns['retail'])
 
     def select_objectives(self, industry_insights):
-        objectives_db = {
-            'restaurant': ['OUTCOME_LEADS', 'OUTCOME_TRAFFIC', 'OUTCOME_SALES'],
-            'retail': ['OUTCOME_SALES', 'OUTCOME_LEADS', 'OUTCOME_AWARENESS'],
-            'service': ['OUTCOME_LEADS', 'OUTCOME_TRAFFIC', 'OUTCOME_SALES'],
-            'ecommerce': ['OUTCOME_SALES', 'OUTCOME_TRAFFIC', 'OUTCOME_AWARENESS']
-        }
-        return objectives_db.get(industry_insights.get('industry', 'service'), objectives_db['service'])
+        industry = industry_insights.get('industry', 'service')
+        return config_store.get(industry).get('objectives', config_store.get('service').get('objectives', ['OUTCOME_LEADS']))
 
     def select_ad_types(self, industry_insights):
-        ad_types_db = {
-            'restaurant': ['image carousel', 'video ads', 'collection'],
-            'retail': ['carousel ads', 'video ads', 'story ads'],
-            'service': ['image ads', 'text ads', 'video ads'],
-            'ecommerce': ['product carousel', 'video ads', 'collection ads']
-        }
-        return ad_types_db.get(industry_insights.get('industry', 'service'), ad_types_db['service'])
+        industry = industry_insights.get('industry', 'service')
+        return config_store.get(industry).get('ad_types', config_store.get('service').get('ad_types', ['image ads']))
 
     def estimate_roas(self, industry_insights):
-        roas_db = {'restaurant': 3.5, 'retail': 4.2, 'service': 5.1, 'ecommerce': 6.8}
-        return roas_db.get(industry_insights.get('industry', 'service'), 4.0)
+        industry = industry_insights.get('industry', 'service')
+        return config_store.get(industry).get('estimated_roas', 4.0)
 
     def recommend_bidding(self, industry_insights):
         return {
@@ -861,9 +1053,10 @@ MESSAGES:
 # ==================== PERFORMANCE OPTIMIZER ====================
 
 class PerformanceOptimizer:
-    def __init__(self, meta_api=None):
+    def __init__(self, meta_api=None, safety_guard_instance=None):
         self.meta_api = meta_api
         self.monitoring_active = False
+        self.safety_guard = safety_guard_instance or safety_guard
 
     def start_monitoring(self, campaign_id):
         self.monitoring_active = True
@@ -944,11 +1137,157 @@ class PerformanceOptimizer:
             'lead_quality': 'Good' if metrics.get('conversion_rate', 0) > 0.2 else 'Average'
         }
 
-    def analyze_budget_efficiency(self, metrics):
-        return {
-            'roi': metrics.get('roas', 0),
-            'efficiency_score': round(metrics.get('roas', 0) / 4.0, 2)
-        }
+    def generate_pdf_reports(self, campaign_data, business_profile, weeks=4):
+        """Generate comprehensive PDF performance reports"""
+        try:
+            from io import BytesIO
+            from fpdf import FPDF
+            from datetime import datetime
+            
+            pdf = FPDF()
+            pdf.add_page()
+            
+            # Title Page
+            pdf.set_font("Arial", "B", 20)
+            pdf.cell(0, 10, "Campaign Performance Report", 0, 1, "C")
+            pdf.set_font("Arial", "", 12)
+            pdf.cell(0, 10, f"Business: {business_profile.get('business_name', 'Business')}", 0, 1, "C")
+            pdf.cell(0, 10, f"Period: Last {weeks} weeks", 0, 1, "C")
+            pdf.cell(0, 10, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}", 0, 1, "C")
+            
+            pdf.ln(20)
+            
+            # Executive Summary
+            pdf.set_font("Arial", "B", 16)
+            pdf.cell(0, 10, "Executive Summary", 0, 1)
+            pdf.set_font("Arial", "", 11)
+            
+            # Calculate metrics
+            total_spend = sum(c.get('spend', 0) for c in campaign_data)
+            total_revenue = sum(c.get('revenue', 0) for c in campaign_data)
+            total_conversions = sum(c.get('conversions', 0) for c in campaign_data)
+            
+            roi = (total_revenue - total_spend) / total_spend if total_spend > 0 else 0
+            
+            metrics = [
+                f"Total Investment: ${total_spend:,.2f}",
+                f"Total Revenue Generated: ${total_revenue:,.2f}",
+                f"ROI: {roi:.1%}",
+                f"Total Conversions: {total_conversions:,}",
+                f"Average CPA: ${total_spend / max(total_conversions, 1):,.2f}",
+                f"Conversion Rate: {(total_conversions / max(total_spend/10, 1)):.2%}"
+            ]
+            
+            for metric in metrics:
+                pdf.cell(0, 8, metric, 0, 1)
+            
+            pdf.ln(10)
+            
+            # Campaign Performance
+            pdf.set_font("Arial", "B", 16)
+            pdf.cell(0, 10, "Campaign Performance", 0, 1)
+            
+            campaigns = campaign_data[:5]
+            for i, campaign in enumerate(campaigns):
+                pdf.set_font("Arial", "B", 12)
+                pdf.cell(0, 8, f"{campaign.get('name', 'Campaign ' + str(i+1))}", 0, 1)
+                pdf.set_font("Arial", "", 11)
+                
+                campaign_metrics = [
+                    f"Spend: ${campaign.get('spend', 0):,.2f}",
+                    f"Revenue: ${campaign.get('revenue', 0):,.2f}",
+                    f"ROI: {(campaign.get('revenue', 0) - campaign.get('spend', 0)) / max(campaign.get('spend', 1), 1):.1%}",
+                    f"Conversions: {campaign.get('conversions', 0)}",
+                    f"CTR: {campaign.get('ctr', 0):.2%}",
+                    f"CPA: ${campaign.get('cpa', 0):,.2f}"
+                ]
+                
+                for metric in campaign_metrics:
+                    pdf.cell(0, 6, metric, 0, 1)
+                pdf.ln(5)
+            
+            # Generate Report
+            pdf_output = BytesIO()
+            pdf_bytes = pdf.output(dest='S')
+            pdf_output.write(pdf_bytes)
+            pdf_output.seek(0)
+            
+            return pdf_output, "PDF report generated successfully"
+            
+        except Exception as e:
+            print(f"Error generating PDF reports: {e}")
+            return None, "PDF generation failed"
+    
+    def generate_ad_copy_with_ai(self, business_profile, objective='lead_generation', count=3):
+        """Generate multiple ad copy variations using OpenAI"""
+        if not self.openai_client:
+            return []
+        
+        industry = business_profile.get('industry', 'service')
+        business_name = business_profile.get('business_name', 'Your Business')
+        
+        prompt = f"""
+        Create {count} different Facebook ad copy variations for {business_name}.
+        
+        Business Profile:
+        - Industry: {industry}
+        - Target audience: {business_profile.get('target_audience', 'local customers')}
+        - Objective: {objective}
+        - Key selling points: {business_profile.get('key_points', 'professional services')}
+        
+        Each ad should include:
+        - Hook (strong opening)
+        - Problem statement
+        - Solution (your business)
+        - Call to action with emoji
+        - Length: 40-80 characters for hook, 80-150 for body
+        
+        Make them different in tone and approach.
+        Return only the copy, one per line.
+        """
+        
+        try:
+            response = self.openai_client.ChatCompletion.create(
+                model="gpt-4",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=500,
+                temperature=0.7
+            )
+            
+            copies = []
+            for choice in response['choices']:
+                copy = choice['message']['content'].strip()
+                if copy and len(copy) > 20:
+                    copies.append(copy)
+            
+            return copies[:count]
+        except Exception as e:
+            print(f"Error generating ad copy: {e}")
+            return []
+    
+    def generate_image_with_ai(self, prompt, size="1024x1024"):
+        """Generate image using DALL-E if available"""
+        if not self.openai_client:
+            return None
+        
+        try:
+            response = self.openai_client.Image.create(
+                model="dall-e-3",
+                prompt=prompt,
+                n=1,
+                size=size,
+                quality="standard"
+            )
+            
+            image_url = response['data'][0]['url']
+            import requests as rq
+            img_response = rq.get(image_url)
+            if img_response.status_code == 200:
+                return img_response.content
+            return None
+        except Exception as e:
+            print(f"Error generating image: {e}")
+            return None
 
     def analyze_targeting_effectiveness(self, metrics):
         return {
@@ -1007,19 +1346,35 @@ class PerformanceOptimizer:
         for opt in optimizations:
             try:
                 if opt == 'increase_budget' and current_budget:
-                    new_budget = min(current_budget * 1.2, 500)
-                    result = self.meta_api.update_campaign(campaign_id, daily_budget=int(new_budget * 100))
-                    results.append(f"Budget increased: ${current_budget:.0f} → ${new_budget:.0f}/day")
-                    print(f"Action: increase_budget -> ${new_budget:.0f}/day")
+                    if not self.safety_guard.auto_budget_increase_enabled:
+                        results.append(f"Suggestion (not applied — auto budget increases are OFF): raise to ~${min(current_budget * 1.2, 500):.0f}/day")
+                        self.safety_guard.log('increase_budget', allowed=False, reason='AUTO_BUDGET_INCREASE_ENABLED is off', campaign_id=campaign_id)
+                    else:
+                        new_budget = min(current_budget * 1.2, 500)
+                        ok, reason = self.safety_guard.check_new_budget(getattr(self, 'campaigns_ref', {}) or {}, new_budget - current_budget, action='increase_budget', campaign_id=campaign_id)
+                        if not ok:
+                            results.append(f"Budget increase BLOCKED by safety cap: {reason}")
+                        else:
+                            result = self.meta_api.update_campaign(campaign_id, daily_budget=int(new_budget * 100))
+                            results.append(f"Budget increased: ${current_budget:.0f} → ${new_budget:.0f}/day")
+                            print(f"Action: increase_budget -> ${new_budget:.0f}/day")
 
                 elif opt == 'adjust_budget_allocation' and current_budget:
                     grade = getattr(self, '_last_grade', 'Average')
                     factor = 1.3 if grade in ('Excellent', 'Good') else (0.8 if grade == 'Poor' else 1.0)
                     new_budget = min(current_budget * factor, 500)
-                    result = self.meta_api.update_campaign(campaign_id, daily_budget=int(new_budget * 100))
-                    direction = 'increased' if factor > 1 else 'decreased'
-                    results.append(f"Budget {direction}: ${current_budget:.0f} → ${new_budget:.0f}/day ({grade})")
-                    print(f"Action: adjust_budget_allocation -> {direction} to ${new_budget:.0f}/day")
+                    if factor > 1 and not self.safety_guard.auto_budget_increase_enabled:
+                        results.append(f"Suggestion (not applied — auto budget increases are OFF): {grade} performance, could raise to ~${new_budget:.0f}/day")
+                        self.safety_guard.log('adjust_budget_allocation', allowed=False, reason='AUTO_BUDGET_INCREASE_ENABLED is off', campaign_id=campaign_id)
+                    else:
+                        ok, reason = (True, 'decrease, no cap check needed') if factor <= 1 else self.safety_guard.check_new_budget(getattr(self, 'campaigns_ref', {}) or {}, new_budget - current_budget, action='adjust_budget_allocation', campaign_id=campaign_id)
+                        if not ok:
+                            results.append(f"Budget adjustment BLOCKED by safety cap: {reason}")
+                        else:
+                            result = self.meta_api.update_campaign(campaign_id, daily_budget=int(new_budget * 100))
+                            direction = 'increased' if factor > 1 else 'decreased'
+                            results.append(f"Budget {direction}: ${current_budget:.0f} → ${new_budget:.0f}/day ({grade})")
+                            print(f"Action: adjust_budget_allocation -> {direction} to ${new_budget:.0f}/day")
 
                 elif opt == 'test_new_audiences':
                     results.append("Suggestion: Create a new ad set with broader targeting to test new audiences")
@@ -1063,7 +1418,15 @@ class PerformanceOptimizer:
 # ==================== UNIVERSAL META ADS AGENT ====================
 
 class UniversalMetaAdsAgent:
-    def __init__(self, meta_credentials, ai_api_key=None):
+    def __init__(self, meta_credentials, ai_api_key=None, groq_api_key=None, gemini_api_key=None,
+                 tenant_id='default', safety_guard_instance=None, campaigns_file=None):
+        self.tenant_id = tenant_id
+        # Each tenant gets its OWN safety guard (own spend cap, own audit log file)
+        # so one studio's campaigns can never eat into another studio's budget cap.
+        # Falls back to the shared global one for 100% backward compatibility with
+        # single-tenant setups (this is exactly what happens for 'default').
+        self.safety_guard = safety_guard_instance or safety_guard
+
         self.meta_api = MetaAPI(
             meta_credentials['access_token'],
             meta_credentials['ad_account_id'],
@@ -1071,11 +1434,29 @@ class UniversalMetaAdsAgent:
             meta_credentials.get('app_secret'),
             page_token=meta_credentials.get('page_token')
         )
+        # Initialize OpenAI if available
+        self.openai_client = None
+        try:
+            import openai
+            if ai_api_key:
+                openai.api_key = ai_api_key
+                self.openai_client = openai
+            elif groq_api_key:
+                openai.api_key = groq_api_key
+                self.openai_client = openai
+            elif gemini_api_key:
+                # For Google Gemini, we'll use a different approach
+                import requests
+                self.gemini_api_key = gemini_api_key
+        except ImportError:
+            pass
+        
         self.ai_strategy_engine = AIStrategyEngine(ai_api_key)
-        self.performance_optimizer = PerformanceOptimizer(self.meta_api)
+        self.performance_optimizer = PerformanceOptimizer(self.meta_api, safety_guard_instance=self.safety_guard)
         self.audience_analyzer = AudienceAnalyzer()
-        self.campaigns_file = os.path.join(os.path.dirname(__file__), 'campaigns.json')
+        self.campaigns_file = campaigns_file or os.path.join(os.path.dirname(__file__), 'campaigns.json')
         self.campaigns = self._load_campaigns()
+        self.performance_optimizer.campaigns_ref = self.campaigns  # live reference for safety-cap checks
         # Enrich with Meta data on startup
         self._sync_from_meta()
 
@@ -1150,6 +1531,18 @@ class UniversalMetaAdsAgent:
         strategy = self.ai_strategy_engine.generate_strategy(business_analysis)
 
         daily_budget = business_profile.get('budget', {}).get('daily', 10)
+
+        # SAFETY GUARD: never call the real Meta API until we've confirmed this
+        # won't push total daily spend across all campaigns past the hard cap.
+        allowed, reason = self.safety_guard.check_new_budget(self.campaigns, daily_budget, action='create_campaign')
+        if not allowed:
+            return {
+                'campaign_id': None,
+                'error': {'message': f"Blocked by safety cap: {reason}"},
+                'strategy': strategy,
+                'blocked_by_safety_guard': True
+            }
+
         campaign_result = self.meta_api.create_campaign({
             'name': strategy['campaign_name'],
             'objective': strategy['objectives'][0] if strategy['objectives'] else 'OUTCOME_LEADS',
@@ -1259,7 +1652,7 @@ class UniversalMetaAdsAgent:
         adset_result = self.meta_api.create_ad_set({
             'name': f"{strategy['campaign_name']} - Ad Set",
             'campaign_id': campaign_id,
-            'optimization_goal': 'LINK_CLICKS',
+            'optimization_goal': business_profile.get('optimization_goal', 'OUTCOME_LEADS'),
             'targeting': targeting,
             'page_id': page_id,
         })
@@ -1410,12 +1803,15 @@ class ContentScheduler:
             print(f"Error saving posts: {e}")
 
     def create_post(self, data):
-        post_id = f"post_{int(time.time())}"
+        post_id = f"post_{int(time.time() * 1000)}"
         post = {
             'id': post_id,
             'platform': data.get('platform', 'facebook'),
             'content_type': data.get('content_type', 'image'),
+            'headline': data.get('headline', ''),
             'message': data.get('message', ''),
+            'ai_instruction': data.get('ai_instruction', ''),
+            'cta': data.get('cta', ''),
             'media_file': data.get('media_file', ''),
             'media_url': data.get('media_url', ''),
             'media_urls': data.get('media_urls', []),
@@ -1455,6 +1851,19 @@ class ContentScheduler:
 
     def delete_forever(self, post_id):
         if post_id in self.posts:
+            post = self.posts[post_id]
+            # Try to delete from Facebook/Instagram if it was published
+            meta_response = post.get('meta_response') or {}
+            platform = post.get('platform', 'facebook')
+            fb_post_id = meta_response.get('post_id') or meta_response.get('id')
+            if fb_post_id and post.get('status') == 'published':
+                try:
+                    if platform == 'instagram':
+                        self.meta_api.delete_instagram_post(fb_post_id)
+                    else:
+                        self.meta_api.delete_facebook_post(fb_post_id)
+                except Exception:
+                    pass  # Don't block local delete if Meta API fails
             del self.posts[post_id]
             self._save_posts()
             return True
@@ -1462,6 +1871,9 @@ class ContentScheduler:
 
     def get_all_posts(self):
         return list(self.posts.values())
+
+    def get_post(self, post_id):
+        return self.posts.get(post_id)
 
     def publish_now(self, post_id):
         post = self.posts.get(post_id)
@@ -1519,6 +1931,547 @@ class ContentScheduler:
                 return self.meta_api.create_facebook_post(page_id, message, media_url, scheduled, page_token=pt)
             else:
                 return self.meta_api.create_facebook_post(page_id, message, scheduled_time=scheduled, page_token=pt)
+
+
+class SocialMediaAutoResponder:
+    def __init__(self, meta_api, ai_engine=None):
+        self.meta_api = meta_api
+        self.ai_engine = ai_engine or AIStrategyEngine(meta_api)
+        self.rules_file = os.path.join(os.path.dirname(__file__), 'responder_rules.json')
+        self.rules = self._load_rules()
+        self.responses_file = os.path.join(os.path.dirname(__file__), 'responder_log.json')
+        self.responses = self._load_responses()
+        self.enabled = True
+
+    def _load_rules(self):
+        try:
+            if os.path.exists(self.rules_file):
+                with open(self.rules_file) as f:
+                    return json.load(f)
+        except: pass
+        return {'rules': [], 'default_response': 'Thank you for your comment!', 'use_ai': True}
+
+    def _save_rules(self):
+        try:
+            with open(self.rules_file, 'w') as f:
+                json.dump(self.rules, f, indent=2, default=str)
+        except Exception as e:
+            print(f"Error saving rules: {e}")
+
+    def _load_responses(self):
+        try:
+            if os.path.exists(self.responses_file):
+                with open(self.responses_file) as f:
+                    return json.load(f)
+        except: pass
+        return {'responses': []}
+
+    def _save_responses(self):
+        try:
+            with open(self.responses_file, 'w') as f:
+                json.dump(self.responses, f, indent=2, default=str)
+        except Exception as e:
+            print(f"Error saving responses: {e}")
+
+    def add_rule(self, keyword, response_template, platform='all', sentiment=None):
+        rule_id = f"rule_{int(time.time())}_{len(self.rules['rules'])}"
+        rule = {
+            'id': rule_id,
+            'keyword': keyword.lower(),
+            'response_template': response_template,
+            'platform': platform,
+            'sentiment': sentiment,
+            'created_at': datetime.now().strftime('%Y-%m-%d %H:%M'),
+            'enabled': True
+        }
+        self.rules['rules'].append(rule)
+        self._save_rules()
+        return rule
+
+    def delete_rule(self, rule_id):
+        self.rules['rules'] = [r for r in self.rules['rules'] if r['id'] != rule_id]
+        self._save_rules()
+
+    def set_default_response(self, text):
+        self.rules['default_response'] = text
+        self._save_rules()
+
+    def set_ai_mode(self, enabled):
+        self.rules['use_ai'] = enabled
+        self._save_rules()
+
+    def get_page_comments(self, page_id=None, limit=50):
+        pid = page_id or self.meta_api.get_page_id()
+        if not pid:
+            return []
+        try:
+            url = f"https://graph.facebook.com/v19.0/{pid}/feed?fields=message,from,created_time,comments&limit={limit}&access_token={self.meta_api.page_token or self.meta_api.access_token}"
+            resp = requests.get(url)
+            if resp.status_code == 200:
+                data = resp.json()
+                comments = []
+                for post in data.get('data', []):
+                    if 'comments' in post:
+                        for c in post['comments'].get('data', []):
+                            c['post_id'] = post.get('id')
+                            c['post_message'] = post.get('message', '')
+                            comments.append(c)
+                return comments
+        except Exception as e:
+            print(f"Error fetching comments: {e}")
+        return []
+
+    def auto_respond_to_comment(self, comment_data, page_id=None):
+        comment_id = comment_data.get('id')
+        comment_message = comment_data.get('message', '')
+        from_name = comment_data.get('from', {}).get('name', 'User')
+        if not comment_id or not comment_message:
+            return None
+        if not self.enabled:
+            return None
+        response_text = None
+        if self.rules.get('use_ai') and self.ai_engine:
+            try:
+                prompt = f"A user named {from_name} commented: \"{comment_message}\". Write a friendly, professional reply (max 2 sentences) as the page owner."
+                ai_resp = self.ai_engine.generate_ad_copy_with_ai(prompt, count=1)
+                if ai_resp and 'error' not in ai_resp:
+                    response_text = ai_resp.get('variations', [ai_resp.get('text', '')])[0]
+            except:
+                pass
+        if not response_text:
+            for rule in self.rules['rules']:
+                if not rule.get('enabled', True):
+                    continue
+                if rule['keyword'] in comment_message.lower():
+                    response_text = rule['response_template']
+                    break
+        if not response_text:
+            response_text = self.rules.get('default_response', 'Thank you for your comment!')
+        try:
+            pid = page_id or self.meta_api.get_page_id()
+            if pid and comment_id:
+                url = f"https://graph.facebook.com/v19.0/{comment_id}/comments?message={requests.utils.quote(response_text)}&access_token={self.meta_api.page_token or self.meta_api.access_token}"
+                resp = requests.post(url)
+                log_entry = {
+                    'comment_id': comment_id,
+                    'original_message': comment_message,
+                    'response': response_text,
+                    'from_name': from_name,
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'success': resp.status_code == 200,
+                    'meta_response': resp.json() if resp.status_code == 200 else resp.text
+                }
+                self.responses['responses'].append(log_entry)
+                self._save_responses()
+                if resp.status_code == 200:
+                    return log_entry
+                return None
+        except Exception as e:
+            print(f"Error posting reply: {e}")
+        return None
+
+    def auto_respond_all(self, page_id=None, limit=20):
+        comments = self.get_page_comments(page_id, limit)
+        results = []
+        for c in comments:
+            already = any(r['comment_id'] == c['id'] for r in self.responses['responses'])
+            if not already:
+                result = self.auto_respond_to_comment(c, page_id)
+                if result:
+                    results.append(result)
+        return results
+
+    def get_log(self, limit=50):
+        logs = list(reversed(self.responses['responses']))
+        return logs[:limit]
+
+
+class MultiPlatformScheduler:
+    def __init__(self, meta_api):
+        self.meta_api = meta_api
+        self.queue_file = os.path.join(os.path.dirname(__file__), 'multi_queue.json')
+        self.queue = self._load_queue()
+        self.thread = None
+        self.running = False
+
+    def _load_queue(self):
+        try:
+            if os.path.exists(self.queue_file):
+                with open(self.queue_file) as f:
+                    return json.load(f)
+        except: pass
+        return {'items': []}
+
+    def _save_queue(self):
+        try:
+            with open(self.queue_file, 'w') as f:
+                json.dump(self.queue, f, indent=2, default=str)
+        except Exception as e:
+            print(f"Error saving queue: {e}")
+
+    def schedule_post(self, platforms, message, media_urls=None, scheduled_time=None, page_id=None, ig_id=None, content_type='image', link_url='', media_file='', media_files=None, headline='', ai_instruction='', cta=''):
+        item_id = f"multi_{int(time.time())}_{len(self.queue['items'])}"
+        item = {
+            'id': item_id,
+            'platforms': platforms if isinstance(platforms, list) else [platforms],
+            'headline': headline,
+            'message': message,
+            'ai_instruction': ai_instruction,
+            'cta': cta,
+            'media_urls': media_urls or [],
+            'scheduled_time': scheduled_time,
+            'page_id': page_id,
+            'ig_id': ig_id,
+            'content_type': content_type,
+            'link_url': link_url,
+            'media_file': media_file,
+            'media_files': media_files or [],
+            'status': 'pending',
+            'created_at': datetime.now().strftime('%Y-%m-%d %H:%M'),
+            'results': {}
+        }
+        self.queue['items'].append(item)
+        self._save_queue()
+        return item
+
+    def publish_to_facebook(self, item, page_id=None):
+        pid = page_id or item.get('page_id') or self.meta_api.get_page_id()
+        if not pid:
+            return {'error': 'No page ID'}
+        pt = self.meta_api.page_token or self.meta_api.access_token
+        message = item['message']
+        media = item.get('media_urls', [])
+        scheduled = item.get('scheduled_time')
+        if media:
+            url = media[0]
+            return self.meta_api.create_facebook_post(pid, message, url, scheduled, page_token=pt)
+        return self.meta_api.create_facebook_post(pid, message, scheduled_time=scheduled, page_token=pt)
+
+    def publish_to_instagram(self, item, page_id=None):
+        pid = page_id or item.get('page_id') or self.meta_api.get_page_id()
+        if not pid:
+            return {'error': 'No page ID'}
+        ig_id = item.get('ig_id') or self.meta_api.get_instagram_business_account_id(pid)
+        if not ig_id:
+            return {'error': 'No Instagram Business ID'}
+        media = item.get('media_urls', [])
+        message = item['message']
+        scheduled = item.get('scheduled_time')
+        if media:
+            return self.meta_api.create_instagram_post(ig_id, media[0], message, scheduled, page_id=pid)
+        return {'error': 'Instagram requires media'}
+
+    def publish_item(self, item_id):
+        item = None
+        for q in self.queue['items']:
+            if q['id'] == item_id:
+                item = q
+                break
+        if not item:
+            return {'error': 'Item not found'}
+        results = {}
+        for platform in item['platforms']:
+            platform = platform.lower().strip()
+            if platform in ('facebook', 'fb'):
+                r = self.publish_to_facebook(item)
+                results['facebook'] = r
+            elif platform in ('instagram', 'ig'):
+                r = self.publish_to_instagram(item)
+                results['instagram'] = r
+            elif platform == 'twitter':
+                results['twitter'] = {'error': 'Twitter API not configured'}
+            elif platform == 'linkedin':
+                results['linkedin'] = {'error': 'LinkedIn API not configured'}
+            else:
+                results[platform] = {'error': f'Unknown platform: {platform}'}
+        item['results'] = results
+        all_success = all('error' not in r for r in results.values())
+        item['status'] = 'published' if all_success else 'partial'
+        self._save_queue()
+        return results
+
+    def publish_pending(self):
+        now = datetime.now()
+        results = []
+        for item in self.queue['items']:
+            if item['status'] != 'pending':
+                continue
+            sched = item.get('scheduled_time')
+            if sched:
+                try:
+                    sched_dt = datetime.strptime(sched, '%Y-%m-%d %H:%M')
+                    if sched_dt <= now:
+                        r = self.publish_item(item['id'])
+                        results.append({'id': item['id'], 'result': r})
+                except:
+                    pass
+            else:
+                r = self.publish_item(item['id'])
+                results.append({'id': item['id'], 'result': r})
+        return results
+
+    def get_queue(self):
+        return list(reversed(self.queue['items']))
+
+    def get_item(self, item_id):
+        for q in self.queue['items']:
+            if q['id'] == item_id:
+                return q
+        return None
+
+    def delete_item(self, item_id):
+        self.queue['items'] = [q for q in self.queue['items'] if q['id'] != item_id]
+        self._save_queue()
+
+    def start_auto_publish(self, interval=60):
+        self.running = True
+        def _loop():
+            while self.running:
+                try:
+                    self.publish_pending()
+                except Exception as e:
+                    print(f"Auto-publish error: {e}")
+                time.sleep(interval)
+        self.thread = threading.Thread(target=_loop, daemon=True)
+        self.thread.start()
+
+    def stop_auto_publish(self):
+        self.running = False
+
+
+class AdvancedLeadManagement:
+    def __init__(self, meta_api, ai_engine=None):
+        self.meta_api = meta_api
+        self.ai_engine = ai_engine
+        self.leads_file = os.path.join(os.path.dirname(__file__), 'leads.json')
+        self.workflows_file = os.path.join(os.path.dirname(__file__), 'workflows.json')
+        self.leads = self._load_leads()
+        self.workflows = self._load_workflows()
+
+    def _load_leads(self):
+        try:
+            if os.path.exists(self.leads_file):
+                with open(self.leads_file) as f:
+                    return json.load(f)
+        except: pass
+        return {'leads': [], 'score_config': {}}
+
+    def _save_leads(self):
+        try:
+            with open(self.leads_file, 'w') as f:
+                json.dump(self.leads, f, indent=2, default=str)
+        except Exception as e:
+            print(f"Error saving leads: {e}")
+
+    def _load_workflows(self):
+        try:
+            if os.path.exists(self.workflows_file):
+                with open(self.workflows_file) as f:
+                    return json.load(f)
+        except: pass
+        return {'workflows': []}
+
+    def _save_workflows(self):
+        try:
+            with open(self.workflows_file, 'w') as f:
+                json.dump(self.workflows, f, indent=2, default=str)
+        except Exception as e:
+            print(f"Error saving workflows: {e}")
+
+    def fetch_meta_leads(self, ad_id=None, limit=50):
+        try:
+            params = f"limit={limit}&access_token={self.meta_api.access_token}"
+            if ad_id:
+                url = f"https://graph.facebook.com/v19.0/{ad_id}/leads?{params}"
+            else:
+                url = f"https://graph.facebook.com/v19.0/act_{self.meta_api.ad_account_id.replace('act_','')}/leads?{params}"
+            resp = requests.get(url)
+            if resp.status_code == 200:
+                data = resp.json().get('data', [])
+                for lead in data:
+                    self._import_meta_lead(lead)
+                return data
+        except Exception as e:
+            print(f"Error fetching leads: {e}")
+        return []
+
+    def _import_meta_lead(self, meta_lead):
+        lid = meta_lead.get('id')
+        if not lid:
+            return None
+        if any(l.get('lead_id') == lid for l in self.leads['leads']):
+            return None
+        field_data = {}
+        for f in meta_lead.get('field_data', []):
+            name = f.get('name', '')
+            values = f.get('values', [''])
+            field_data[name] = values[0] if values else ''
+        lead = {
+            'lead_id': lid,
+            'created_time': meta_lead.get('created_time', ''),
+            'ad_id': meta_lead.get('ad_id', ''),
+            'ad_name': meta_lead.get('ad_name', ''),
+            'form_id': meta_lead.get('form_id', ''),
+            'field_data': field_data,
+            'name': field_data.get('full_name', field_data.get('name', 'Unknown')),
+            'email': field_data.get('email', field_data.get('email_address', '')),
+            'phone': field_data.get('phone_number', field_data.get('phone', '')),
+            'status': 'new',
+            'score': 0,
+            'notes': '',
+            'imported_at': datetime.now().strftime('%Y-%m-%d %H:%M'),
+            'last_contacted': None,
+            'workflow_id': None
+        }
+        self.leads['leads'].append(lead)
+        self._save_leads()
+        return lead
+
+    def add_lead_manual(self, name, email, phone='', source='manual', notes='', field_data=None):
+        lead = {
+            'lead_id': f"lead_{int(time.time())}_{len(self.leads['leads'])}",
+            'created_time': datetime.now().isoformat(),
+            'ad_id': '',
+            'ad_name': '',
+            'form_id': '',
+            'field_data': field_data or {},
+            'name': name,
+            'email': email,
+            'phone': phone,
+            'source': source,
+            'status': 'new',
+            'score': 0,
+            'notes': notes,
+            'imported_at': datetime.now().strftime('%Y-%m-%d %H:%M'),
+            'last_contacted': None,
+            'workflow_id': None
+        }
+        self.leads['leads'].append(lead)
+        self._save_leads()
+        return lead
+
+    def score_lead(self, lead_id):
+        for lead in self.leads['leads']:
+            if lead.get('lead_id') == lead_id:
+                score = 0
+                if lead.get('email'):
+                    score += 20
+                if lead.get('phone'):
+                    score += 15
+                if lead.get('name') and lead['name'] != 'Unknown':
+                    score += 10
+                fd = lead.get('field_data', {})
+                for key in fd:
+                    val = str(fd[key]).strip()
+                    if val and len(val) > 5:
+                        score += 5
+                if lead.get('source') == 'manual':
+                    score += 5
+                if self.ai_engine:
+                    try:
+                        freq = sum(1 for l in self.leads['leads'] if l.get('email') == lead.get('email'))
+                        if freq > 1:
+                            score -= 10
+                    except:
+                        pass
+                lead['score'] = min(score, 100)
+                self._save_leads()
+                return lead['score']
+        return 0
+
+    def update_lead_status(self, lead_id, status, notes=None):
+        for lead in self.leads['leads']:
+            if lead.get('lead_id') == lead_id:
+                lead['status'] = status
+                if notes is not None:
+                    lead['notes'] = notes
+                if status in ('contacted', 'converted'):
+                    lead['last_contacted'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+                self._save_leads()
+                return lead
+        return None
+
+    def assign_workflow(self, lead_id, workflow_id):
+        for lead in self.leads['leads']:
+            if lead.get('lead_id') == lead_id:
+                lead['workflow_id'] = workflow_id
+                self._save_leads()
+                return lead
+        return None
+
+    def create_workflow(self, name, steps):
+        wid = f"wf_{int(time.time())}"
+        workflow = {
+            'id': wid,
+            'name': name,
+            'steps': steps,
+            'created_at': datetime.now().strftime('%Y-%m-%d %H:%M'),
+            'enabled': True
+        }
+        self.workflows['workflows'].append(workflow)
+        self._save_workflows()
+        return workflow
+
+    def delete_workflow(self, workflow_id):
+        self.workflows['workflows'] = [w for w in self.workflows['workflows'] if w['id'] != workflow_id]
+        self._save_workflows()
+
+    def process_workflow_step(self, lead, step):
+        step_type = step.get('type', '')
+        if step_type == 'email':
+            print(f"[LeadMgmt] Would send email to {lead.get('email')}: {step.get('template', '')}")
+        elif step_type == 'wait':
+            print(f"[LeadMgmt] Wait step: {step.get('duration', '1d')}")
+        elif step_type == 'update_status':
+            lead['status'] = step.get('status', 'contacted')
+        elif step_type == 'add_note':
+            existing = lead.get('notes', '')
+            lead['notes'] = f"{existing}\\n{step.get('note', '')}" if existing else step.get('note', '')
+        return lead
+
+    def run_workflows(self):
+        results = []
+        now = datetime.now()
+        for lead in self.leads['leads']:
+            wf_id = lead.get('workflow_id')
+            if not wf_id:
+                continue
+            workflow = None
+            for w in self.workflows['workflows']:
+                if w['id'] == wf_id and w.get('enabled', True):
+                    workflow = w
+                    break
+            if not workflow:
+                continue
+            for step in workflow.get('steps', []):
+                self.process_workflow_step(lead, step)
+            results.append({'lead_id': lead.get('lead_id'), 'workflow': workflow.get('name')})
+        self._save_leads()
+        return results
+
+    def get_leads(self, status=None, limit=100):
+        leads = self.leads['leads']
+        if status:
+            leads = [l for l in leads if l.get('status') == status]
+        return sorted(leads, key=lambda x: x.get('imported_at', ''), reverse=True)[:limit]
+
+    def get_lead_stats(self):
+        total = len(self.leads['leads'])
+        by_status = {}
+        for l in self.leads['leads']:
+            s = l.get('status', 'unknown')
+            by_status[s] = by_status.get(s, 0) + 1
+        avg_score = sum(l.get('score', 0) for l in self.leads['leads']) / max(total, 1)
+        return {
+            'total': total,
+            'by_status': by_status,
+            'average_score': round(avg_score, 1),
+            'score_config': self.leads.get('score_config', {})
+        }
+
+    def delete_lead(self, lead_id):
+        self.leads['leads'] = [l for l in self.leads['leads'] if l.get('lead_id') != lead_id]
+        self._save_leads()
 
 
 # ==================== WEB INTERFACE ====================
@@ -1636,6 +2589,7 @@ HTML_TEMPLATE = """
   <span style="font-size:1.5rem">&#x1f4ca;</span>
   <h1 data-i18n="title">Meta Ads Agent Dashboard</h1>
   <button id="lang-toggle" onclick="toggleLang()" style="background:#fff;border:1px solid #ddd;border-radius:6px;padding:4px 12px;cursor:pointer;font-size:13px;font-weight:600;margin-left:10px;">ES/EN</button>
+  <button id="logout-btn" onclick="tenantLogout()" style="display:none; background:#dc2626; color:#fff; border:none; border-radius:6px; padding:5px 14px; cursor:pointer; font-size:13px; font-weight:600; margin-left:10px;" data-i18n="logout">Logout</button>
   <span style="margin-left:auto;font-size:.85rem;opacity:.85;" id="token-status"></span>
 </div>
 
@@ -1643,6 +2597,9 @@ HTML_TEMPLATE = """
   <div class="nav-tabs">
     <button class="nav-tab active" data-page="campaigns" data-i18n="campaigns_tab">Campaigns</button>
     <button class="nav-tab" data-page="content" data-i18n="content_tab">Content</button>
+    <button class="nav-tab" data-page="leads" data-i18n="leads_tab">Leads</button>
+    <button class="nav-tab" data-page="multiplatform" data-i18n="multiplatform_tab">Multi-Platform</button>
+    <button class="nav-tab" data-page="responder" data-i18n="responder_tab">Auto Responder</button>
     <button class="nav-tab" data-page="reports" data-i18n="reports_tab">Reports</button>
     <button class="nav-tab" data-page="settings" data-i18n="settings_tab">Settings</button>
   </div>
@@ -1758,14 +2715,99 @@ HTML_TEMPLATE = """
   <div class="section">
     <h2 data-i18n="meta_pixel">Meta Pixel</h2>
     <p style="font-size:.85rem;color:#65676b;margin-bottom:8px;" data-i18n="pixel_desc">Optional: Add your Meta Pixel ID for conversion tracking.</p>
-    <div style="display:flex;gap:8px;">
+    <div style="display:flex;gap:8px;flex-wrap:wrap;">
       <input type="text" id="pixel-id" data-i18n-placeholder="pixel_id" placeholder="Pixel ID" style="flex:1;padding:8px;border:1px solid #ddd;border-radius:6px;">
+      <input type="number" id="lead-value" placeholder="Lead Value ($)" value="50" min="1" style="width:120px;padding:8px;border:1px solid #ddd;border-radius:6px;" title="Estimated value per lead for ROAS calculation">
       <button class="btn btn-primary btn-sm" onclick="savePixel()" data-i18n="save_pixel">Save Pixel</button>
     </div>
+    <p style="font-size:11px;color:#888;margin-top:4px;" data-i18n="lead_value_desc">Lead Value: estimated revenue per lead, used for ROAS calculations.</p>
+  </div>
+  <div class="section" style="border:2px solid #f59e0b;border-radius:12px;padding:20px;">
+    <h2 style="color:#d97706;margin-bottom:8px;">&#x1f6e1; Safety Guard</h2>
+    <p style="font-size:.85rem;color:#65676b;margin-bottom:12px;">Control your daily spending limits. The optimizer will never exceed these limits.</p>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+      <div>
+        <label style="font-size:12px;font-weight:600;color:#374151;">Max Daily Budget ($)</label>
+        <div style="display:flex;gap:6px;margin-top:4px;">
+          <input type="number" id="safety-max-budget" min="1" value="50" style="flex:1;padding:8px;border:1px solid #ddd;border-radius:6px;">
+          <button class="btn btn-sm btn-primary" onclick="updateSafetyBudget()" data-i18n="save">Save</button>
+        </div>
+      </div>
+      <div>
+        <label style="font-size:12px;font-weight:600;color:#374151;">Auto Budget Increase</label>
+        <div style="display:flex;align-items:center;gap:10px;margin-top:6px;">
+          <label style="position:relative;display:inline-block;width:44px;height:24px;">
+            <input type="checkbox" id="safety-auto-budget" onchange="toggleAutoBudget()" style="opacity:0;width:0;height:0;">
+            <span style="position:absolute;cursor:pointer;inset:0;background:#ccc;border-radius:12px;transition:.3s;" id="auto-budget-slider"></span>
+          </label>
+          <span id="auto-budget-label" style="font-size:13px;color:#65676b;">OFF</span>
+        </div>
+        <p style="font-size:11px;color:#888;margin-top:4px;">When ON, the optimizer can automatically increase budgets on performing campaigns.</p>
+      </div>
+    </div>
+    <div id="safety-status-bar" style="margin-top:12px;padding:10px;background:#f0f2f5;border-radius:8px;font-size:12px;color:#374151;">
+      Loading...
+    </div>
+  </div>
+  <div class="section" id="admin-panel" style="border:2px solid #2563eb;border-radius:12px;padding:20px;display:none;">
+    <h2 style="color:#2563eb;margin-bottom:4px;">&#x1f464; Client Management (Admin)</h2>
+    <p style="font-size:.85rem;color:#65676b;margin-bottom:16px;">Create and manage client accounts. Each client has their own isolated campaigns, leads, and Meta credentials.</p>
+    <div id="tenants-list" style="margin-bottom:16px;"></div>
+    <div style="padding:16px;background:#f0f2f5;border-radius:8px;">
+      <h3 style="font-size:.9rem;margin-bottom:8px;">Add New Client</h3>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+        <input type="text" id="tenant-id" placeholder="Client ID (e.g. dojo-2)" style="padding:8px;border:1px solid #ddd;border-radius:6px;" title="Unique identifier, no spaces">
+        <input type="text" id="tenant-name" placeholder="Client Name (e.g. Dojo 2)" style="padding:8px;border:1px solid #ddd;border-radius:6px;">
+        <input type="password" id="tenant-password" placeholder="Password" style="padding:8px;border:1px solid #ddd;border-radius:6px;">
+        <input type="password" id="tenant-password-confirm" placeholder="Confirm Password" style="padding:8px;border:1px solid #ddd;border-radius:6px;">
+        <select id="tenant-industry" style="padding:8px;border:1px solid #ddd;border-radius:6px;">
+          <option value="martialarts">Martial Arts</option>
+          <option value="service">Service</option>
+          <option value="restaurant">Restaurant</option>
+          <option value="retail">Retail</option>
+          <option value="ecommerce">E-commerce</option>
+          <option value="medical">Medical</option>
+        </select>
+        <input type="text" id="tenant-meta-token" placeholder="Meta Access Token (optional - client connects later)" style="grid-column:span 2;padding:8px;border:1px solid #ddd;border-radius:6px;">
+        <input type="text" id="tenant-ad-account" placeholder="Ad Account ID (optional - client connects later)" style="padding:8px;border:1px solid #ddd;border-radius:6px;">
+        <input type="text" id="tenant-page-token" placeholder="Page Token (optional)" style="padding:8px;border:1px solid #ddd;border-radius:6px;">
+        <input type="number" id="tenant-budget" placeholder="Daily Budget Cap ($)" value="50" min="1" style="padding:8px;border:1px solid #ddd;border-radius:6px;">
+        <input type="text" id="tenant-payment-url" placeholder="Payment URL for this client (optional)" style="grid-column:span 2;padding:8px;border:1px solid #ddd;border-radius:6px;">
+      </div>
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center;">
+        <button class="btn btn-success" onclick="createTenant()">Create Client</button>
+        <span id="tenant-create-msg" style="font-size:12px;"></span>
+      </div>
+    </div>
+    <div style="margin-top:12px;padding:12px;background:#fef3c7;border-radius:8px;font-size:12px;color:#92400e;">
+      <strong>How it works:</strong> Each client logs in at your-domain.com/?tenant=CLIENT-ID with their password. They only see their own campaigns and data.
+    </div>
+    <div style="margin-top:12px;padding:16px;background:#f0f2f5;border-radius:8px;">
+      <h3 style="font-size:.9rem;margin-bottom:8px;">Admin Password</h3>
+      <p style="font-size:.8rem;color:#65676b;margin-bottom:8px;">Set a password for the admin (default) account. Without this, anyone with the URL can access the admin panel.</p>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <input type="password" id="admin-new-password" placeholder="New admin password" style="padding:8px;border:1px solid #ddd;border-radius:6px;flex:1;">
+        <input type="password" id="admin-new-password-confirm" placeholder="Confirm password" style="padding:8px;border:1px solid #ddd;border-radius:6px;flex:1;">
+        <button class="btn btn-primary" onclick="setAdminPassword()">Set Password</button>
+        <span id="admin-pw-msg" style="font-size:12px;"></span>
+      </div>
+    </div>
+    <div style="margin-top:12px;padding:16px;background:#f0f2f5;border-radius:8px;">
+      <h3 style="font-size:.9rem;margin-bottom:8px;">Payment Link</h3>
+      <p style="font-size:.8rem;color:#65676b;margin-bottom:8px;">Set a URL for any payment platform (Stripe, PayPal, QuickBooks, etc.). The Payment button will open this link.</p>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <input type="text" id="admin-payment-url" placeholder="https://..." style="padding:8px;border:1px solid #ddd;border-radius:6px;flex:1;">
+        <button class="btn btn-primary" onclick="setPaymentUrl()">Save</button>
+        <span id="admin-pay-msg" style="font-size:12px;"></span>
+      </div>
+    </div>
+  </div>
+  <div class="section" id="agreement-settings-section" style="display:none; border:2px solid #8b5cf6; border-radius:12px; padding:20px;">
+    <h2 style="color:#8b5cf6; margin-bottom:8px;">&#x1f4dc; <span data-i18n="agreement_title">Payment & Service Agreement</span></h2>
+    <p style="font-size:.85rem;color:#65676b;margin-bottom:12px;">Review the terms and payment agreement for this account.</p>
+    <button class="btn btn-primary" onclick="document.getElementById('agreement-modal').style.display='flex';" data-i18n="view_agreement">View Agreement</button>
   </div>
 </div>
-
-<!-- ===== PAGE: CONTENT ===== -->
 <div class="page" id="page-content">
   <div class="section">
     <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
@@ -1825,45 +2867,222 @@ HTML_TEMPLATE = """
     </div>
     <div class="form-group">
       <label data-i18n="platform">Platform</label>
-      <select id="cp-platform" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;" onchange="toggleCpMedia()">
-        <option value="facebook">Facebook</option>
-        <option value="instagram">Instagram</option>
-      </select>
+      <div style="display:flex;gap:16px;padding:10px 12px;border:1px solid #ddd;border-radius:6px;background:#f8f9fa;">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-weight:600;color:#1877f2;">
+          <input type="checkbox" id="cp-platform-fb" value="facebook" checked onchange="toggleCpMedia()" style="width:18px;height:18px;cursor:pointer;accent-color:#1877f2;">
+          <span>📘 Facebook</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-weight:600;color:#e1306c;">
+          <input type="checkbox" id="cp-platform-ig" value="instagram" onchange="toggleCpMedia()" style="width:18px;height:18px;cursor:pointer;accent-color:#e1306c;">
+          <span>📸 Instagram</span>
+        </label>
+      </div>
+      <div id="cp-platform-warning" style="display:none;color:#dc2626;font-size:.8rem;margin-top:4px;">⚠️ Select at least one platform.</div>
     </div>
     <div class="form-group">
-      <label data-i18n="message">Message</label>
-      <textarea id="cp-message" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;min-height:80px;" data-i18n-placeholder="write_post" placeholder="Write your post..."></textarea>
+      <label data-i18n="headline">Headline</label>
+      <div style="display:flex;gap:6px;">
+        <input type="text" id="cp-headline" placeholder="e.g. Special Offer!" maxlength="40" style="flex:1;padding:8px;border:1px solid #ddd;border-radius:6px;">
+        <button class="btn btn-sm btn-outline" onclick="generateCpCopy()" style="white-space:nowrap;flex-shrink:0;" data-i18n="gen_ai">Gen AI</button>
+        <a href="https://chat.openai.com" target="_blank" class="btn btn-sm btn-outline" style="white-space:nowrap;flex-shrink:0;text-decoration:none;background:#10a37f;color:#fff;border-color:#10a37f;" data-i18n="chatgpt" title="Open ChatGPT">ChatGPT</a>
+      </div>
+    </div>
+    <div class="form-group">
+      <label data-i18n="primary_text">Primary Text</label>
+      <div style="display:flex;gap:6px;align-items:flex-start;">
+        <textarea id="cp-message" style="flex:1;padding:8px;border:1px solid #ddd;border-radius:6px;min-height:60px;" data-i18n-placeholder="write_post" placeholder="Write your post..."></textarea>
+        <button class="btn btn-sm btn-outline" onclick="generateCpCopy()" style="white-space:nowrap;flex-shrink:0;" data-i18n="gen_ai">Gen AI</button>
+      </div>
+    </div>
+    <div class="form-group">
+      <label data-i18n="ai_instruction">AI Instruction</label>
+      <textarea id="cp-ai-instruction" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;resize:vertical;min-height:50px;" data-i18n-placeholder="ai_instruction_placeholder" placeholder="Describe what to promote. AI will use this to generate unique headlines and text."></textarea>
+    </div>
+    <div class="form-group">
+      <label data-i18n="cta">Call to Action</label>
+      <select id="cp-cta" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;">
+        <option value="LEARN_MORE" data-i18n="cta_learn_more">Learn More</option>
+        <option value="SIGN_UP" data-i18n="cta_sign_up">Sign Up</option>
+        <option value="CONTACT_US" data-i18n="cta_contact_us">Contact Us</option>
+        <option value="BOOK_NOW" data-i18n="cta_book_now">Book Now</option>
+        <option value="GET_OFFER" data-i18n="cta_get_offer">Get Offer</option>
+        <option value="SUBSCRIBE" data-i18n="cta_subscribe">Subscribe</option>
+      </select>
     </div>
     <div class="form-group" id="cp-link-group">
-      <label data-i18n="dest_url">Link URL (optional)</label>
-      <input type="url" id="cp-link" placeholder="https://..." style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;">
-    </div>
-    <div class="form-group">
-      <label data-i18n="type">Content Type</label>
-      <select id="cp-content-type" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;" onchange="toggleCpMedia()">
-        <option value="image">Image</option>
-        <option value="carousel">Carousel (multiple images)</option>
-        <option value="video">Video</option>
-      </select>
+      <label data-i18n="dest_url">Destination URL</label>
+      <input type="url" id="cp-link" placeholder="https://your-site.com/page" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;">
     </div>
     <div class="form-group">
       <label data-i18n="upload_media">Media</label>
-      <input type="file" id="cp-media" accept="image/*" style="width:100%;padding:8px;">
-      <div style="font-size:.75rem;margin-top:4px;color:#65676b;" data-i18n="media_hint">Select multiple images for carousel, or one video</div>
-      <div id="cp-media-preview" style="margin-top:8px;display:none;"><img id="cp-preview-img" style="max-width:200px;max-height:200px;border-radius:8px;"></div>
-      <div id="cp-carousel-thumbs" style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;display:none;"></div>
-      <video id="cp-preview-video" style="max-height:160px;border-radius:6px;display:none;margin-top:8px;" controls></video>
+      <div class="upload-zone" onclick="document.getElementById('cp-media-input').click()" style="border:2px dashed #ddd;border-radius:8px;padding:20px;text-align:center;cursor:pointer;">
+        <div id="cp-upload-placeholder" style="color:#65676b;">
+          <div style="font-size:2rem;margin-bottom:8px;">+</div>
+          <div data-i18n="click_to_upload">Click to upload images (multiple allowed)</div>
+          <div style="font-size:.75rem;margin-top:4px;" data-i18n="media_hint">Select multiple images for carousel, or one video</div>
+        </div>
+        <div id="cp-upload-preview" style="display:none;">
+          <div id="cp-carousel-thumbs" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px;"></div>
+          <video id="cp-preview-video" style="max-height:120px;border-radius:6px;display:none;" controls></video>
+          <div id="cp-preview-filename" style="font-size:.85rem;margin-top:6px;font-weight:600;"></div>
+        </div>
+      </div>
+      <input type="file" id="cp-media-input" accept="image/*,video/*" style="display:none" multiple onchange="handleCpMediaUpload(this.files)">
+      <div style="margin-top:6px;font-size:.8rem;color:#65676b;">
+        <span><span data-i18n="images">Images</span>: <span id="cp-img-count">0</span> | </span>
+        <a href="#" onclick="event.preventDefault();document.getElementById('cp-media-input').click();return false;" style="color:#1877f2;" data-i18n="add_more">Add more</a>
+      </div>
     </div>
-    <div class="form-group">
-      <label data-i18n="schedule_label">Schedule (optional — leave empty for draft)</label>
-      <input type="datetime-local" id="cp-schedule" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;">
+  </div>
+  <div style="margin-bottom:16px;font-weight:600;font-size:.9rem;color:#1877f2;" data-i18n="quick_schedule">Quick Schedule</div>
+  <div class="form-group" style="background:#f0f2f5;border-radius:8px;padding:12px;margin-bottom:12px;">
+    <div style="font-size:.8rem;color:#65676b;margin-bottom:8px;" data-i18n="single_post_hint">Set one date &amp; time for THIS post.</div>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap;">
+      <input type="date" id="cp-schedule-start-date" style="flex:1;min-width:140px;padding:8px;border:1px solid #ddd;border-radius:6px;font-size:.85rem;">
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+        <select id="cp-schedule-hour" style="padding:6px 8px;border:1px solid #ddd;border-radius:6px;font-size:.85rem;width:60px;">
+          <option>12</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option><option>10</option><option>11</option>
+        </select>
+        <span style="font-weight:700;color:#65676b;font-size:.9rem;">:</span>
+        <select id="cp-schedule-min" style="padding:6px 8px;border:1px solid #ddd;border-radius:6px;font-size:.85rem;width:65px;">
+          <option>00</option><option>15</option><option>30</option><option>45</option>
+        </select>
+        <select id="cp-schedule-ampm" style="padding:6px 8px;border:1px solid #ddd;border-radius:6px;font-size:.85rem;width:65px;">
+          <option value="AM">AM</option><option value="PM">PM</option>
+        </select>
+        <button class="btn btn-sm btn-primary" onclick="addCpScheduleManualTime()" style="height:34px;" data-i18n="add_time">+ Add</button>
+      </div>
     </div>
+    <div id="cp-schedule-confirm" style="display:none;align-items:center;gap:8px;background:#e6f4ea;border:1px solid #34a853;border-radius:6px;padding:8px 10px;margin-top:6px;font-size:.85rem;color:#1e7e34;">
+      <span id="cp-schedule-confirm-text" style="flex:1;"></span>
+      <span style="cursor:pointer;color:#dc2626;font-weight:700;" onclick="clearCpScheduleManualTime()" title="Remove" data-i18n-title="remove">✕</span>
+    </div>
+    <div id="cp-schedule-manual-empty" style="color:#65676b;font-size:.85rem;margin-top:6px;" data-i18n="no_time_yet">No time added yet. Pick date &amp; time and click "+ Add".</div>
+    <div style="margin-top:14px;border-top:1px solid #dadde1;padding-top:10px;">
+      <div style="font-size:.8rem;color:#65676b;margin-bottom:6px;" data-i18n="repeat_hint">Want to repeat this same post automatically (so you don't have to schedule it day by day)? Save it first, then choose how often:</div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;">
+        <button class="btn btn-sm" onclick="sendCpToRepeat(7)" style="background:#e7f3ff;" data-i18n="preset_7d">7 Days</button>
+        <button class="btn btn-sm" onclick="sendCpToRepeat(28)" style="background:#e7f3ff;" data-i18n="preset_weekly">4 Weeks</button>
+        <button class="btn btn-sm" onclick="sendCpToRepeat(90)" style="background:#e7f3ff;" data-i18n="preset_monthly">3 Months</button>
+        <button class="btn btn-sm" onclick="sendCpToRepeat(180)" style="background:#e7f3ff;" data-i18n="preset_3m">6 Months</button>
+        <button class="btn btn-sm" onclick="sendCpToRepeat(365)" style="background:#e7f3ff;" data-i18n="preset_12m">12 Months</button>
+      </div>
+    </div>
+  </div>
+
+    <input type="hidden" id="cp-schedule" value="">
     <div class="form-group" style="display:flex;gap:8px;flex-wrap:wrap;">
       <button class="btn btn-primary" onclick="savePostAsDraft()" style="flex:1;" data-i18n="save_draft">Save as Draft</button>
       <button class="btn btn-success" onclick="schedulePost()" style="flex:1;" data-i18n="schedule_post">Schedule</button>
       <button class="btn btn-warn" onclick="publishPostNow()" style="flex:1;" data-i18n="publish_post">Publish Now</button>
     </div>
     <div id="cp-status" style="margin-top:12px;font-size:.85rem;text-align:center;"></div>
+  </div>
+</div>
+
+<!-- Repeat Schedule Modal -->
+<div class="modal-bg" id="repeat-modal">
+  <div class="modal" style="max-width:620px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
+      <h3><span data-i18n="repeat_schedule">Repeat Schedule</span></h3>
+      <button onclick="closeRepeatModal()" style="background:none;border:none;font-size:1.4rem;cursor:pointer;">x</button>
+    </div>
+    <input type="hidden" id="rpt-source-id" value="">
+    <input type="hidden" id="rpt-source-type" value="post">
+    <div class="form-group">
+      <label data-i18n="headline">Headline</label>
+      <div style="display:flex;gap:6px;">
+        <input type="text" id="rpt-headline" maxlength="40" style="flex:1;padding:8px;border:1px solid #ddd;border-radius:6px;">
+        <button class="btn btn-sm btn-outline" onclick="generateRptCopy()" style="white-space:nowrap;flex-shrink:0;" data-i18n="gen_ai">Gen AI</button>
+        <a href="https://chat.openai.com" target="_blank" class="btn btn-sm btn-outline" style="white-space:nowrap;flex-shrink:0;text-decoration:none;background:#10a37f;color:#fff;border-color:#10a37f;" data-i18n="chatgpt" title="Open ChatGPT">ChatGPT</a>
+      </div>
+    </div>
+    <div class="form-group">
+      <label data-i18n="primary_text">Primary Text</label>
+      <div style="display:flex;gap:6px;align-items:flex-start;">
+        <textarea id="rpt-message" style="flex:1;padding:8px;border:1px solid #ddd;border-radius:6px;min-height:60px;"></textarea>
+        <button class="btn btn-sm btn-outline" onclick="generateRptCopy()" style="white-space:nowrap;flex-shrink:0;" data-i18n="gen_ai">Gen AI</button>
+      </div>
+    </div>
+    <div class="form-group">
+      <label data-i18n="ai_instruction">AI Instruction</label>
+      <textarea id="rpt-ai-instruction" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;min-height:40px;" data-i18n-placeholder="ai_instruction_placeholder" placeholder="Describe what to promote. AI will use this to generate unique headlines and text."></textarea>
+    </div>
+    <div class="form-group">
+      <label data-i18n="cta">CTA</label>
+      <select id="rpt-cta" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;">
+        <option value="LEARN_MORE">Learn More</option>
+        <option value="SIGN_UP">Sign Up</option>
+        <option value="CONTACT_US">Contact Us</option>
+        <option value="BOOK_NOW">Book Now</option>
+        <option value="GET_OFFER">Get Offer</option>
+        <option value="SUBSCRIBE">Subscribe</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label data-i18n="dest_url">Destination URL</label>
+      <input type="url" id="rpt-link" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;">
+    </div>
+    <div class="form-group">
+      <label data-i18n="media">Media (kept from original — upload new to replace)</label>
+      <div class="upload-zone" onclick="document.getElementById('rpt-media-input').click()" style="border:2px dashed #ddd;border-radius:8px;padding:20px;text-align:center;cursor:pointer;">
+        <div id="rpt-upload-placeholder" style="color:#65676b;">
+          <div style="font-size:2rem;margin-bottom:8px;">+</div>
+          <div data-i18n="click_to_upload">Click to upload images (multiple allowed)</div>
+          <div style="font-size:.75rem;margin-top:4px;" data-i18n="media_hint">Select multiple images for carousel, or one video</div>
+        </div>
+        <div id="rpt-upload-preview" style="display:none;">
+          <div id="rpt-carousel-thumbs" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px;"></div>
+          <video id="rpt-preview-video" style="max-height:120px;border-radius:6px;display:none;" controls></video>
+          <div id="rpt-preview-filename" style="font-size:.85rem;margin-top:6px;font-weight:600;"></div>
+        </div>
+      </div>
+      <input type="file" id="rpt-media-input" accept="image/*,video/*" style="display:none" multiple onchange="handleRptMediaUpload(this.files)">
+      <div style="margin-top:6px;font-size:.8rem;color:#65676b;">
+        <span><span data-i18n="images">Images</span>: <span id="rpt-img-count">0</span> | </span>
+        <a href="#" onclick="event.preventDefault();document.getElementById('rpt-media-input').click();return false;" style="color:#1877f2;" data-i18n="add_more">Add more</a>
+      </div>
+      <div id="rpt-media-info" style="font-size:.85rem;margin-top:4px;color:#65676b;"></div>
+    </div>
+
+    <!-- Quick Schedule: date + hours + presets -->
+    <div class="form-group" style="background:#f0f2f5;border-radius:8px;padding:12px;margin-bottom:12px;">
+      <label style="font-weight:600;margin-bottom:8px;display:block;"><span data-i18n="quick_schedule">Quick Schedule</span></label>
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+        <input type="date" id="rpt-start-date" style="flex:1;min-width:140px;padding:8px;border:1px solid #ddd;border-radius:6px;">
+        <select id="rpt-hour-select" style="padding:8px;border:1px solid #ddd;border-radius:6px;width:75px;">
+          <option>12</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option><option>10</option><option>11</option>
+        </select>
+        <span style="font-weight:700;">:</span>
+        <select id="rpt-minute-select" style="padding:8px;border:1px solid #ddd;border-radius:6px;width:75px;">
+          <option>00</option><option>15</option><option>30</option><option>45</option>
+        </select>
+        <select id="rpt-ampm-select" style="padding:8px;border:1px solid #ddd;border-radius:6px;width:75px;">
+          <option value="AM">AM</option><option value="PM">PM</option>
+        </select>
+        <button class="btn btn-sm btn-primary" onclick="addRepeatHour()" data-i18n="add_hour">+ Hour</button>
+      </div>
+      <div id="rpt-hours-list" style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;"></div>
+      <div id="rpt-hours-empty" style="color:#65676b;font-size:.8rem;margin-top:4px;" data-i18n="no_hours">No hours added. Add hours and click a preset below.</div>
+      <div style="margin-top:8px;display:flex;gap:4px;flex-wrap:wrap;">
+        <button class="btn btn-sm" onclick="generateRepeatPreset(7)" style="background:#e7f3ff;" data-i18n="preset_7d">7 Days</button>
+        <button class="btn btn-sm" onclick="generateRepeatPreset(28)" style="background:#e7f3ff;" data-i18n="preset_weekly">4 Weeks</button>
+        <button class="btn btn-sm" onclick="generateRepeatPreset(90)" style="background:#e7f3ff;" data-i18n="preset_monthly">3 Months</button>
+        <button class="btn btn-sm" onclick="generateRepeatPreset(180)" style="background:#e7f3ff;" data-i18n="preset_3m">6 Months</button>
+        <button class="btn btn-sm" onclick="generateRepeatPreset(365)" style="background:#e7f3ff;" data-i18n="preset_12m">12 Months</button>
+      </div>
+    </div>
+
+    <!-- Manual Schedule Times -->
+    <div class="form-group">
+      <label><span data-i18n="manual_times">Manual Times</span> <button class="btn btn-sm btn-primary" onclick="addRepeatTime()" style="margin-left:8px;" data-i18n="add_time">+ Add</button></label>
+      <div id="rpt-times-list" style="margin-top:6px;"></div>
+      <div id="rpt-times-empty" style="color:#65676b;font-size:.85rem;text-align:center;padding:12px;" data-i18n="no_times">No times added. Use Quick Schedule presets or add manually.</div>
+    </div>
+    <div class="form-group" style="text-align:right;">
+      <button class="btn btn-success" onclick="scheduleRepeatCopies()" style="font-weight:700;" data-i18n="schedule_all">Schedule All</button>
+    </div>
+    <div id="rpt-status" style="margin-top:12px;font-size:.85rem;text-align:center;"></div>
   </div>
 </div>
 
@@ -2012,7 +3231,7 @@ HTML_TEMPLATE = """
       <div class="form-group">
         <label data-i18n="ai_instruction">Instrucci\u00f3n para la IA</label>
         <textarea id="f-ai-instruction" data-i18n-placeholder="ai_instruction_placeholder" placeholder="Ej: Quiero promocionar la inscripci\u00f3n de verano para ni\u00f1os, 50% de descuento, incluye uniforme gratis. Mencionar que son clases divertidas y seguras." style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;resize:vertical;min-height:60px;"></textarea>
-        <div style="font-size:11px;color:#888;margin-top:2px">Describe lo que quieres promocionar. La IA usar\u00e1 esto para generar headlines y textos \u00fanicos.</div>
+        <div data-i18n="ai_instruction_hint" style="font-size:11px;color:#888;margin-top:2px">Describe what you want to promote. The AI will use this to generate unique headlines and text.</div>
       </div>
       <div class="form-group">
         <label data-i18n="cta">Call to Action</label>
@@ -2083,15 +3302,15 @@ HTML_TEMPLATE = """
         </div>
       </div>
       <div class="form-group">
-        <label data-i18n="platforms">Plataformas</label>
+        <label data-i18n="platforms">Platforms</label>
         <select id="f-platforms" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;" onchange="toggleBudgetSplit()">
-          <option value="both" data-i18n="both">Facebook + Instagram (ambos)</option>
-          <option value="facebook" data-i18n="facebook">Solo Facebook</option>
-          <option value="instagram" data-i18n="instagram">Solo Instagram</option>
+          <option value="both" data-i18n="both">Facebook + Instagram</option>
+          <option value="facebook" data-i18n="facebook">Facebook Only</option>
+          <option value="instagram" data-i18n="instagram">Instagram Only</option>
         </select>
       </div>
       <div class="form-group" id="budget-split-group" style="display:none;">
-        <label data-i18n="budget_split">Reparto del presupuesto</label>
+        <label data-i18n="budget_split">Budget Split</label>
         <div style="display:flex;align-items:center;gap:12px;">
           <span style="font-size:.85rem;">Facebook</span>
           <input type="range" id="f-fb-pct" min="0" max="100" value="60" oninput="updateBudgetSplit()" style="flex:1;">
@@ -2102,7 +3321,7 @@ HTML_TEMPLATE = """
         </div>
       </div>
       <div class="form-group" id="placements-group">
-        <label data-i18n="placements">Ubicaciones (placements)</label>
+        <label data-i18n="placements">Placements</label>
         <div style="display:flex;flex-wrap:wrap;gap:8px;padding:8px;border:1px solid #ddd;border-radius:6px;background:#f9f9f9;">
           <label style="display:flex;align-items:center;gap:4px;font-size:13px;font-weight:400;"><input type="checkbox" value="feed" checked onchange="updatePlacements()"> <span data-i18n="feed">Feed</span></label>
           <label style="display:flex;align-items:center;gap:4px;font-size:13px;font-weight:400;"><input type="checkbox" value="story" checked onchange="updatePlacements()"> <span data-i18n="stories">Stories</span></label>
@@ -2111,31 +3330,41 @@ HTML_TEMPLATE = """
           <label style="display:flex;align-items:center;gap:4px;font-size:13px;font-weight:400;" class="ig-only"><input type="checkbox" value="explore" onchange="updatePlacements()"> <span data-i18n="explore">Explore</span></label>
           <label style="display:flex;align-items:center;gap:4px;font-size:13px;font-weight:400;"><input type="checkbox" value="video_feeds" onchange="updatePlacements()"> <span data-i18n="video_feed">Video Feed</span></label>
         </div>
-        <div style="font-size:11px;color:#888;margin-top:4px">Selecciona d\u00f3nde aparecer\u00e1n tus anuncios</div>
+        <div style="font-size:11px;color:#888;margin-top:4px" data-i18n="placements_hint">Select where your ads will appear</div>
       </div>
       <div class="form-group">
-        <label data-i18n="gender">Genero</label>
+        <label data-i18n="gender">Gender</label>
         <select id="f-gender" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;">
-          <option value="all" data-i18n="all">Todos</option>
-          <option value="male" data-i18n="male">Hombres</option>
-          <option value="female" data-i18n="female">Mujeres</option>
+          <option value="all" data-i18n="all">All</option>
+          <option value="male" data-i18n="male">Male</option>
+          <option value="female" data-i18n="female">Female</option>
         </select>
       </div>
       <div class="form-group">
-        <label data-i18n="interests">Intereses</label>
+        <label data-i18n="optimization_goal">Optimization Goal</label>
+        <select id="f-optimization-goal" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;">
+          <option value="OUTCOME_LEADS" data-i18n="opt_leads">Leads</option>
+          <option value="OUTCOME_TRAFFIC" data-i18n="opt_traffic">Traffic</option>
+          <option value="OUTCOME_AWARENESS" data-i18n="opt_awareness">Awareness</option>
+          <option value="LINK_CLICKS" data-i18n="opt_clicks">Link Clicks</option>
+        </select>
+        <div style="font-size:11px;color:#888;margin-top:4px" data-i18n="opt_goal_hint">How Meta optimizes delivery for your ad set</div>
+      </div>
+      <div class="form-group">
+        <label data-i18n="interests">Interests</label>
         <div id="interest-presets" style="display:flex;flex-wrap:wrap;gap:6px;padding:8px;border:1px solid #ddd;border-radius:6px;background:#f9f9f9;margin-bottom:8px;"></div>
         <div style="display:flex;gap:6px;margin-bottom:6px;">
           <input type="text" id="f-custom-interest" data-i18n-placeholder="custom_interest_placeholder" placeholder="Nombre del inter\u00e9s o ID de Facebook" style="flex:1;padding:6px;border:1px solid #ddd;border-radius:6px;font-size:13px;">
-          <button class="btn btn-sm btn-primary" onclick="addCustomInterest()" data-i18n="add_interest">Agregar</button>
+          <button class="btn btn-sm btn-primary" onclick="addCustomInterest()" data-i18n="add_interest">Add</button>
         </div>
         <div id="interest-tags" style="display:flex;flex-wrap:wrap;gap:4px;"></div>
-        <div style="font-size:11px;color:#888;margin-top:4px" data-i18n="interest_helper">Selecciona intereses predefinidos o agrega los tuyos (ID num\u00e9rico de Facebook Ads)</div>
+        <div style="font-size:11px;color:#888;margin-top:4px" data-i18n="interest_helper">Select predefined interests or add your own (Facebook numeric ID)</div>
       </div>
       <div class="form-group">
-        <label data-i18n="has_children">Tiene hijos</label>
+        <label data-i18n="has_children">Has Children</label>
         <select id="f-has-children" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;">
-          <option value="" data-i18n="no_filter">No filtrar</option>
-          <option value="yes" data-i18n="yes">Si</option>
+          <option value="" data-i18n="no_filter">No filter</option>
+          <option value="yes" data-i18n="yes">Yes</option>
           <option value="no" data-i18n="no">No</option>
         </select>
       </div>
@@ -2154,7 +3383,7 @@ HTML_TEMPLATE = """
         <div class="preview-header">
           <div class="avatar" id="preview-avatar">MB</div>
           <div>
-            <div class="page-name" id="preview-page-name">Tu Negocio</div>
+            <div class="page-name" id="preview-page-name">Your Business</div>
             <div class="sponsored" data-i18n="sponsored">Sponsored</div>
           </div>
         </div>
@@ -2173,10 +3402,7 @@ HTML_TEMPLATE = """
       <div class="alert alert-warn" style="background:#fff3cd;border:1px solid #ffc107;color:#856404;padding:12px;border-radius:6px;margin-bottom:12px;display:flex;align-items:flex-start;gap:8px;">
         <span style="font-size:1.2rem;">⚠</span>
         <div>
-          <strong>IMPORTANTE:</strong> Al crear la campaña, Meta la crea en <strong>PAUSED</strong>. 
-          Si ya tienes tarjeta configurada, revisa <strong>inmediatamente</strong> en Meta Ads Manager 
-          que Campaign, Ad Set y Ad estén en <strong>OFF</strong> (gris). 
-          Meta puede reactivarlos solo al agregar tarjeta.
+          <strong data-i18n="safety_header">IMPORTANT:</strong> <span data-i18n="safety_body">When creating the campaign, Meta creates it in <strong>PAUSED</strong> state. If you already have a card configured, check <strong>immediately</strong> in Meta Ads Manager that Campaign, Ad Set, and Ad are <strong>OFF</strong> (gray). Meta may reactivate them when you add a card.</span>
         </div>
       </div>
       <div style="margin-bottom:12px;">
@@ -2200,7 +3426,7 @@ HTML_TEMPLATE = """
 <div id="toast"></div>
 
 <script>
-var lang = localStorage.getItem('meta_ads_lang') || 'en';
+var lang = (function() { try { return localStorage.getItem('meta_ads_lang') || 'en'; } catch(e) { return 'en'; } })();
 var langData = {
   en: {
     title: 'Meta Ads Agent Dashboard',
@@ -2447,6 +3673,13 @@ var langData = {
     error_loading_leads: 'Error loading leads',
     error_loading_details: 'Error loading details',
     images_uploaded: 'images uploaded',
+    selected: 'selected',
+    repeat: 'Repeat',
+    repeat_schedule: 'Repeat Schedule',
+    add_time: 'Add Time',
+    remove_time: 'Remove',
+    schedule_all: 'Schedule All',
+    no_times: 'No times added',
     uploaded: 'Uploaded',
     upload_failed: 'Upload failed',
     upload_error_at: 'Upload error at',
@@ -2500,6 +3733,125 @@ var langData = {
     cta_subscribe: 'Subscribe',
     lang_en: 'English',
     lang_es: 'Espa\u00f1ol',
+    leads_tab: 'Leads',
+    multiplatform_tab: 'Multi-Platform',
+    responder_tab: 'Auto Responder',
+    lead_management: 'Lead Management',
+    fetch_leads: 'Fetch from Meta',
+    add_lead: '+ Add Lead',
+    new_leads: 'New',
+    contacted: 'Contacted',
+    converted: 'Converted',
+    lost: 'Lost',
+    avg_score: 'Avg Score',
+    search_leads: 'Search leads...',
+    score: 'Score',
+    source: 'Source',
+    name: 'Name',
+    email: 'Email',
+    phone: 'Phone',
+    notes: 'Notes',
+    save_lead: 'Save Lead',
+    workflows: 'Workflows',
+    create_workflow: '+ Create Workflow',
+    workflow_name: 'Workflow Name',
+    workflow_steps: 'Steps (JSON array)',
+    save_workflow: 'Save Workflow',
+    no_scheduled_posts: 'No scheduled posts.',
+    enabled: 'Enabled',
+    scan_comments: 'Scan & Respond',
+    auto_responder: 'Social Media Auto Responder',
+    add_rule: '+ Add Rule',
+    use_ai: 'Use AI Responses',
+    default_response: 'Default:',
+    auto_reply_rules: 'Auto-Reply Rules',
+    response_log: 'Response Log',
+    from: 'From',
+    comment: 'Comment',
+    response: 'Response',
+    no_responses: 'No responses yet.',
+    keyword: 'Keyword',
+    save_rule: 'Save Rule',
+    multi_platform_scheduler: 'Multi-Platform Scheduler',
+    schedule_post: 'Schedule Post',
+    schedule: 'Schedule',
+    save_schedule: 'Save Schedule',
+    fetching_leads: 'Fetching leads from Meta...',
+    lead_deleted: 'Lead deleted!',
+    name_required: 'Name is required',
+    lead_added: 'Lead added!',
+    invalid_json_steps: 'Invalid JSON for steps',
+    workflow_created: 'Workflow created!',
+    workflow_deleted: 'Workflow deleted!',
+    select_platform: 'Select at least one platform',
+    deleted: 'Deleted!',
+    default_response_saved: 'Default response saved!',
+    keyword_response_required: 'Keyword and response are required',
+    rule_added: 'Rule added!',
+    rule_deleted: 'Rule deleted!',
+    scanning_comments: 'Scanning comments...',
+    error_scanning: 'Error scanning',
+    quick_schedule: 'Quick Schedule',
+    single_post_hint: 'Set one date & time for THIS post.',
+    repeat_hint: "Want to repeat this same post automatically (so you don't have to schedule it day by day)? Save it first, then choose how often:",
+    time_added: 'Time added',
+    add_content_first: 'Add a message or image first.',
+    repeat_setup_hint: 'Draft saved. Add at least one time of day below, then this preset will fill in the dates automatically.',
+    no_time_yet: 'No time added yet. Pick date & time and click "+ Add".',
+    add_hour: '+ Hour',
+    no_hours: 'No hours added.',
+    add_hours_first: 'Add hours first.',
+    select_start_date: 'Select a start date.',
+    select_hour_first: 'Select an hour first.',
+    preset_7d: '7 Days',
+    preset_weekly: '4 Weeks',
+    preset_monthly: '3 Months',
+    preset_3m: '6 Months',
+    preset_12m: '12 Months',
+    manual_times: 'Manual Times',
+    slots_generated: 'slots generated!',
+    login_title: 'Sign In',
+    login_desc: 'This dashboard has multiple clients configured. Enter your credentials.',
+    login_client_id: 'Client (tenant ID)',
+    sign_in: 'Sign In',
+    logout: 'logout',
+    safety_header: 'IMPORTANT:',
+    safety_body: 'When creating the campaign, Meta creates it in PAUSED state. If you already have a card configured, check immediately in Meta Ads Manager that Campaign, Ad Set, and Ad are OFF (gray). Meta may reactivate them when you add a card.',
+    kpi_title: 'Is it working?',
+    kpi_refresh: 'refresh',
+    kpi_cost_per_lead: 'cost/lead',
+    kpi_booked: 'booked',
+    kpi_enrolled: 'enrolled',
+    remove: 'Remove',
+    optimization_goal: 'Optimization Goal',
+    opt_leads: 'Leads',
+    opt_traffic: 'Traffic',
+    opt_awareness: 'Awareness',
+    opt_clicks: 'Link Clicks',
+    opt_goal_hint: 'How Meta optimizes delivery for your ad set',
+    placements_hint: 'Select where your ads will appear',
+    ai_instruction_hint: 'Describe what you want to promote. The AI will use this to generate unique headlines and text.',
+    no_interests_selected: 'No interests selected',
+    default_business_name: 'Your Business',
+    placements_label: 'Placements:',
+    token_unlimited: 'Token: Unlimited',
+    token_expiring: 'Token expires in {days} days - RENEW',
+    token_renew_soon: 'Token: {days} days - Renew soon',
+    token_days: 'Token: {days} days',
+    confidence_sin_datos: 'No leads recorded for this period yet.',
+    confidence_muy_bajo: 'Fewer than 10 leads \u2014 just an initial sample, don\\'t draw conclusions yet.',
+    confidence_bajo: 'Between 10 and 30 leads \u2014 starting to be useful, but wait for more before making big changes.',
+    confidence_aceptable: '30+ leads \u2014 enough to start trusting these numbers.',
+    trial_remaining: 'Your trial ends in',
+    trial_days_label: 'days',
+    trial_activate_now: 'Activate Now',
+    trial_expired_title: 'Trial Expired',
+    trial_expired_msg: 'Your 30-day trial has ended. Activate your account to keep using the dashboard.',
+    trial_activate_btn: 'Activate Account',
+    agreement_title: 'Payment & Service Agreement',
+    agreement_accept_label: 'I have read and agree to the Payment & Service Agreement',
+    agreement_confirm: 'I Accept',
+    view_agreement: 'View Agreement',
   },
   es: {
     title: 'Panel de Control de Anuncios',
@@ -2746,6 +4098,13 @@ var langData = {
     error_loading_leads: 'Error al cargar leads',
     error_loading_details: 'Error al cargar detalles',
     images_uploaded: 'im\u00e1genes subidas',
+    selected: 'seleccionado',
+    repeat: 'Repetir',
+    repeat_schedule: 'Programar Repetici\u00f3n',
+    add_time: 'Agregar Hora',
+    remove_time: 'Quitar',
+    schedule_all: 'Programar Todo',
+    no_times: 'Sin horas agregadas',
     uploaded: 'Subido',
     upload_failed: 'Subida fallida',
     upload_error_at: 'Error de subida en',
@@ -2799,12 +4158,131 @@ var langData = {
     cta_subscribe: 'Suscribirse',
     lang_en: 'Ingl\u00e9s',
     lang_es: 'Espa\u00f1ol',
+    leads_tab: 'Leads',
+    multiplatform_tab: 'Multi-Plataforma',
+    responder_tab: 'Auto Responder',
+    lead_management: 'Gesti\u00f3n de Leads',
+    fetch_leads: 'Obtener de Meta',
+    add_lead: '+ Agregar Lead',
+    new_leads: 'Nuevos',
+    contacted: 'Contactados',
+    converted: 'Convertidos',
+    lost: 'Perdidos',
+    avg_score: 'Puntaje Prom.',
+    search_leads: 'Buscar leads...',
+    score: 'Puntaje',
+    source: 'Fuente',
+    name: 'Nombre',
+    email: 'Correo',
+    phone: 'Tel\u00e9fono',
+    notes: 'Notas',
+    save_lead: 'Guardar Lead',
+    workflows: 'Flujos de Trabajo',
+    create_workflow: '+ Crear Flujo',
+    workflow_name: 'Nombre del Flujo',
+    workflow_steps: 'Pasos (array JSON)',
+    save_workflow: 'Guardar Flujo',
+    no_scheduled_posts: 'Sin posts programados.',
+    enabled: 'Activado',
+    scan_comments: 'Escanear y Responder',
+    auto_responder: 'Auto Responder de Redes Sociales',
+    add_rule: '+ Agregar Regla',
+    use_ai: 'Usar Respuestas AI',
+    default_response: 'Predeterminada:',
+    auto_reply_rules: 'Reglas de Respuesta Autom\u00e1tica',
+    response_log: 'Registro de Respuestas',
+    from: 'De',
+    comment: 'Comentario',
+    response: 'Respuesta',
+    no_responses: 'Sin respuestas a\u00fan.',
+    keyword: 'Palabra Clave',
+    save_rule: 'Guardar Regla',
+    multi_platform_scheduler: 'Programador Multi-Plataforma',
+    schedule_post: 'Programar Post',
+    schedule: 'Programar',
+    save_schedule: 'Guardar Programaci\u00f3n',
+    fetching_leads: 'Obteniendo leads de Meta...',
+    lead_deleted: 'Lead eliminado!',
+    name_required: 'Nombre es requerido',
+    lead_added: 'Lead agregado!',
+    invalid_json_steps: 'JSON de pasos inv\u00e1lido',
+    workflow_created: 'Flujo de trabajo creado!',
+    workflow_deleted: 'Flujo de trabajo eliminado!',
+    select_platform: 'Selecciona al menos una plataforma',
+    deleted: 'Eliminado!',
+    default_response_saved: 'Respuesta predeterminada guardada!',
+    keyword_response_required: 'Palabra clave y respuesta son requeridas',
+    rule_added: 'Regla agregada!',
+    rule_deleted: 'Regla eliminada!',
+    scanning_comments: 'Escaneando comentarios...',
+    error_scanning: 'Error al escanear',
+    quick_schedule: 'Programaci\u00f3n R\u00e1pida',
+    single_post_hint: 'Pon una sola fecha y hora para ESTE post.',
+    repeat_hint: 'Quieres repetir este mismo post automaticamente para no tener que programarlo dia a dia? Primero se guarda, y luego elige cada cuanto:',
+    time_added: 'Horario a\u00f1adido',
+    add_content_first: 'Agrega un mensaje o imagen primero.',
+    repeat_setup_hint: 'Borrador guardado. Agrega al menos una hora abajo y este preset llenara las fechas automaticamente.',
+    no_time_yet: 'Sin horario todavia. Elige fecha y hora y oprime "+ Add".',
+    add_hour: '+ Hora',
+    no_hours: 'Sin horas a\u00f1adidas.',
+    add_hours_first: 'A\u00f1ade horas primero.',
+    select_start_date: 'Selecciona una fecha de inicio.',
+    select_hour_first: 'Selecciona una hora primero.',
+    preset_7d: '7 D\u00edas',
+    preset_weekly: '4 Semanas',
+    preset_monthly: '3 Meses',
+    preset_3m: '6 Meses',
+    preset_12m: '12 Meses',
+    manual_times: 'Horas Manuales',
+    slots_generated: 'espacios generados!',
+    login_title: 'Iniciar sesi\u00f3n',
+    login_desc: 'Este panel tiene m\u00faltiples clientes configurados. Ingresa tus datos.',
+    login_client_id: 'Cliente (tenant ID)',
+    sign_in: 'Entrar',
+    logout: 'salir',
+    safety_header: 'IMPORTANTE:',
+    safety_body: 'Al crear la campa\u00f1a, Meta la crea en estado PAUSED. Si ya tienes tarjeta configurada, revisa inmediatamente en Meta Ads Manager que Campaign, Ad Set y Ad est\u00e9n en OFF (gris). Meta puede reactivarlos solo al agregar tarjeta.',
+    kpi_title: '\u00bfEst\u00e1 funcionando?',
+    kpi_refresh: 'actualizar',
+    kpi_cost_per_lead: 'costo/lead',
+    kpi_booked: 'agend\u00f3',
+    kpi_enrolled: 'se inscribe',
+    remove: 'Quitar',
+    optimization_goal: 'Objetivo de Optimizaci\u00f3n',
+    opt_leads: 'Leads',
+    opt_traffic: 'Tr\u00e1fico',
+    opt_awareness: 'Notoriedad',
+    opt_clicks: 'Clics en Enlace',
+    opt_goal_hint: 'C\u00f3mo Meta optimiza la entrega para tu conjunto de anuncios',
+    placements_hint: 'Selecciona d\u00f3nde aparecer\u00e1n tus anuncios',
+    ai_instruction_hint: 'Describe lo que quieres promocionar. La IA usar\u00e1 esto para generar headlines y textos \u00fanicos.',
+    no_interests_selected: 'Ning\u00fan inter\u00e9s seleccionado',
+    default_business_name: 'Tu Negocio',
+    placements_label: 'Ubicaciones:',
+    token_unlimited: 'Token: Ilimitado',
+    token_expiring: 'Token expira en {days} d\u00edas - RENUEVA',
+    token_renew_soon: 'Token: {days} d\u00edas - Renueva pronto',
+    token_days: 'Token: {days} d\u00edas',
+    confidence_sin_datos: 'Todav\u00eda no hay leads registrados para este per\u00edodo.',
+    confidence_muy_bajo: 'Menos de 10 leads \u2014 es solo una muestra inicial, no saques conclusiones todav\u00eda.',
+    confidence_bajo: 'Entre 10 y 30 leads \u2014 ya empieza a ser \u00fatil, pero espera a tener m\u00e1s para decidir cambios grandes.',
+    confidence_aceptable: '30+ leads \u2014 suficiente para empezar a confiar en estos n\u00fameros.',
+    trial_remaining: 'Tu prueba termina en',
+    trial_days_label: 'd\u00edas',
+    trial_activate_now: 'Activar Ahora',
+    trial_expired_title: 'Prueba Expirada',
+    trial_expired_msg: 'Tu prueba de 30 d\u00edas ha terminado. Activa tu cuenta para seguir usando el panel.',
+    trial_activate_btn: 'Activar Cuenta',
+    agreement_title: 'Acuerdo de Pago y Servicio',
+    agreement_accept_label: 'He leido y acepto el Acuerdo de Pago y Servicio',
+    agreement_confirm: 'Acepto',
+    view_agreement: 'Ver Acuerdo',
   }
 };
 function _t(key) { return langData[lang] && langData[lang][key] !== undefined ? langData[lang][key] : langData.en[key] || key; }
 function toggleLang() {
   lang = lang === 'en' ? 'es' : 'en';
-  localStorage.setItem('meta_ads_lang', lang);
+  try { localStorage.setItem('meta_ads_lang', lang); } catch(e) {}
   document.getElementById('lang-toggle').textContent = lang === 'en' ? 'ES/EN' : 'EN/ES';
   translateDOM();
   renderInterestPresets();
@@ -2817,6 +4295,10 @@ function translateDOM() {
   document.querySelectorAll('[data-i18n-placeholder]').forEach(function(el) {
     var key = el.getAttribute('data-i18n-placeholder');
     el.placeholder = _t(key);
+  });
+  document.querySelectorAll('[data-i18n-title]').forEach(function(el) {
+    var key = el.getAttribute('data-i18n-title');
+    el.title = _t(key);
   });
 }
 var campaigns = [];
@@ -2941,7 +4423,7 @@ function renderInterestTags() {
   for (var i = 0; i < keys.length; i++) {
     html += '<span style="display:inline-flex;align-items:center;gap:4px;background:#e7f3ff;color:#1877f2;padding:3px 8px;border-radius:12px;font-size:12px;font-weight:500;">' + selectedInterests[keys[i]] + ' <span onclick="removeInterest(' + "'" + keys[i] + "'" + ')" style="cursor:pointer;font-weight:700;font-size:14px;">&times;</span></span>';
   }
-  document.getElementById('interest-tags').innerHTML = html || '<span style="font-size:12px;color:#888;">Ning\u00fan inter\u00e9s seleccionado</span>';
+  document.getElementById('interest-tags').innerHTML = html || '<span style="font-size:12px;color:#888;">' + _t('no_interests_selected') + '</span>';
 }
 
 function getSelectedInterestIds() {
@@ -2964,7 +4446,7 @@ function updatePreview() {
   const cta = document.getElementById('f-cta');
   const ctaLabel = cta.options[cta.selectedIndex]?.text || _t('cta_learn_more');
   const destUrl = document.getElementById('f-destination-url').value || '#';
-  const bizName = document.getElementById('f-name').value || 'Tu Negocio';
+  const bizName = document.getElementById('f-name').value || _t('default_business_name');
 
   document.getElementById('preview-headline').textContent = headline;
   document.getElementById('preview-message').textContent = message;
@@ -3354,7 +4836,7 @@ async function viewDetail(campaignId) {
     var pl = campaign.placements;
     if (pl && pl.length > 0) {
       var plNames = {feed:'Feed', story:'Stories', marketplace:'Marketplace', reels:'Reels', explore:'Explore', video_feeds:'Video Feed'};
-      var plHtml = '<div style="margin-top:8px;font-size:.8rem;color:#65676b;">Ubicaciones: ' + pl.map(function(v) { return plNames[v]||v; }).join(', ') + '</div>';
+      var plHtml = '<div style="margin-top:8px;font-size:.8rem;color:#65676b;">' + _t('placements_label') + ' ' + pl.map(function(v) { return plNames[v]||v; }).join(', ') + '</div>';
       document.getElementById('budget-info').innerHTML += plHtml;
     }
     document.getElementById('detail-optimize-btn').onclick = function() { optimizeCampaign(campaignId); };
@@ -3397,8 +4879,11 @@ function switchPage(name) {
   var tab = document.querySelector('.nav-tab[data-page="' + name + '"]');
   if (tab) tab.classList.add('active');
   if (name === 'reports') loadReports();
-  if (name === 'settings') { loadAccounts(); loadPixel(); }
+  if (name === 'settings') { loadAccounts(); loadPixel(); loadTenants(); checkAdminRole(); loadSafetyStatus(); }
   if (name === 'content') loadPosts();
+  if (name === 'leads') { loadLeads(); loadWorkflows(); }
+  if (name === 'multiplatform') { loadMultiQueue(); }
+  if (name === 'responder') { loadResponder(); }
 }
 
 document.addEventListener('click', function(e) {
@@ -3495,6 +4980,245 @@ function clearAccountForm() {
   document.getElementById('acc-app-id').value = '';
   document.getElementById('acc-app-secret').value = '';
 }
+
+async function loadTenants() {
+  try {
+    const res = await fetch('/api/tenants');
+    const d = await res.json();
+    const tenants = d.tenants || {};
+    const container = document.getElementById('tenants-list');
+    if (!container) return;
+    const keys = Object.keys(tenants);
+    if (keys.length === 0) {
+      container.innerHTML = '<p style="color:#65676b;">No clients yet.</p>';
+      return;
+    }
+    var now = Math.floor(Date.now() / 1000);
+    var html = '';
+    keys.forEach(function(tid) {
+      var t = tenants[tid];
+      var isDefault = tid === 'default';
+      var label = t.name || tid;
+      var industry = t.industry || '-';
+      var budget = t.max_total_daily_budget || 50;
+      var trialHtml = '';
+      if (!isDefault && t.created_at) {
+        var trialDays = t.trial_days || 30;
+        var trialEnd = t.created_at + (trialDays * 86400);
+        var daysLeft = Math.max(0, Math.ceil((trialEnd - now) / 86400));
+        var expired = now > trialEnd;
+        if (expired) {
+          trialHtml = ' <span style="background:#dc2626;color:#fff;font-size:10px;padding:2px 6px;border-radius:4px;">Expired</span>';
+        } else if (daysLeft <= 10) {
+          trialHtml = ' <span style="background:#f59e0b;color:#fff;font-size:10px;padding:2px 6px;border-radius:4px;">Trial: ' + daysLeft + 'd</span>';
+        } else {
+          trialHtml = ' <span style="background:#16a34a;color:#fff;font-size:10px;padding:2px 6px;border-radius:4px;">Active: ' + daysLeft + 'd</span>';
+        }
+      }
+      var demoHtml = t.demo_mode ? ' <span style="background:#f59e0b;color:#fff;font-size:10px;padding:2px 6px;border-radius:4px;">Demo</span>' : '';
+      var agreementHtml = (!isDefault && !t.agreement_accepted) ? ' <span style="background:#8b5cf6;color:#fff;font-size:10px;padding:2px 6px;border-radius:4px;">No Agreement</span>' : '';
+      html += '<div style="display:flex;align-items:center;justify-content:space-between;padding:12px;border:1px solid #e5e7eb;border-radius:8px;margin-bottom:8px;background:#fafafa;">' +
+        '<div><strong>' + _esc(label) + '</strong>' +
+        ' <span style="font-size:11px;color:#65676b;">(' + _esc(tid) + ')</span>' +
+        (isDefault ? ' <span class="badge" style="background:#2563eb;color:#fff;font-size:10px;">Admin</span>' : '') +
+        trialHtml + demoHtml + agreementHtml +
+        '<br><span style="font-size:.8rem;color:#65676b;">' + _esc(industry) + ' | Budget cap: $' + budget + '/day</span></div>' +
+        '<div style="display:flex;gap:6px;align-items:center;">' +
+        '<a href="/?tenant=' + _esc(tid) + '" style="font-size:12px;color:#2563eb;text-decoration:none;">Open &rarr;</a>' +
+        '<button class="btn btn-sm" style="background:#e4e6eb;" onclick="editTenant(\\x27' + _esc(tid) + '\\x27)">Edit</button>' +
+        (!isDefault ? '<button class="btn btn-sm" style="background:#fef3c7;color:#92400e;" onclick="resetTrial(\\x27' + _esc(tid) + '\\x27)">Reset Trial</button>' : '') +
+        (isDefault ? '' : '<button class="btn btn-sm btn-danger" onclick="deleteTenant(\\x27' + _esc(tid) + '\\x27)">Delete</button>') +
+        '</div></div>';
+    });
+    container.innerHTML = html;
+  } catch(e) {}
+}
+
+async function resetTrial(tid) {
+  if (!confirm('Reset 30-day trial for "' + tid + '"?')) return;
+  try {
+    var res = await fetch('/api/tenants/' + tid, {
+      method: 'PUT', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({reset_trial: true})
+    });
+    var r = await res.json();
+    if (r.success) { showToast('Trial reset for ' + tid); loadTenants(); }
+    else showToast('Error: ' + (r.error || ''), true);
+  } catch(e) { showToast('Error: ' + e.message, true); }
+}
+
+async function createTenant() {
+  var tid = document.getElementById('tenant-id').value.trim().toLowerCase().replace(/[^a-z0-9-]/g, '');
+  var name = document.getElementById('tenant-name').value.trim();
+  var password = document.getElementById('tenant-password').value;
+  var password2 = document.getElementById('tenant-password-confirm').value;
+  var industry = document.getElementById('tenant-industry').value;
+  var metaToken = document.getElementById('tenant-meta-token').value.trim();
+  var adAccount = document.getElementById('tenant-ad-account').value.trim();
+  var pageToken = document.getElementById('tenant-page-token').value.trim();
+  var budget = parseInt(document.getElementById('tenant-budget').value) || 50;
+  var paymentUrl = document.getElementById('tenant-payment-url').value.trim();
+  var msgEl = document.getElementById('tenant-create-msg');
+  if (!tid || !name || !password) {
+    msgEl.style.color = '#c0392b';
+    msgEl.textContent = 'Fill in: Client ID, Name, and Password.';
+    return;
+  }
+  if (password !== password2) {
+    msgEl.style.color = '#c0392b';
+    msgEl.textContent = 'Passwords do not match.';
+    return;
+  }
+  if (password.length < 6) {
+    msgEl.style.color = '#c0392b';
+    msgEl.textContent = 'Password must be at least 6 characters.';
+    return;
+  }
+  try {
+    var payload = {
+      tenant_id: tid,
+      name: name,
+      password: password,
+      industry: industry,
+      max_total_daily_budget: budget,
+      auto_budget_increase_enabled: false,
+      demo_mode: !metaToken
+    };
+    if (metaToken) payload.meta_access_token = metaToken;
+    if (adAccount) payload.meta_ad_account_id = adAccount;
+    if (pageToken) payload.meta_page_token = pageToken;
+    if (paymentUrl) payload.payment_url = paymentUrl;
+    var res = await fetch('/api/tenants', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+    var r = await res.json();
+    if (r.success) {
+      msgEl.style.color = '#16a34a';
+      msgEl.textContent = 'Client "' + name + '" created! Login at /?tenant=' + tid;
+      document.getElementById('tenant-id').value = '';
+      document.getElementById('tenant-name').value = '';
+      document.getElementById('tenant-password').value = '';
+      document.getElementById('tenant-meta-token').value = '';
+      document.getElementById('tenant-ad-account').value = '';
+      document.getElementById('tenant-page-token').value = '';
+      document.getElementById('tenant-payment-url').value = '';
+      loadTenants();
+    } else {
+      msgEl.style.color = '#c0392b';
+      msgEl.textContent = r.error || 'Error creating client';
+    }
+  } catch(e) {
+    msgEl.style.color = '#c0392b';
+    msgEl.textContent = 'Connection error: ' + e.message;
+  }
+}
+
+async function setAdminPassword() {
+  var pw = document.getElementById('admin-new-password').value;
+  var pw2 = document.getElementById('admin-new-password-confirm').value;
+  var msgEl = document.getElementById('admin-pw-msg');
+  if (!pw) { msgEl.style.color='#c0392b'; msgEl.textContent='Enter a password'; return; }
+  if (pw !== pw2) { msgEl.style.color='#c0392b'; msgEl.textContent='Passwords do not match'; return; }
+  if (pw.length < 6) { msgEl.style.color='#c0392b'; msgEl.textContent='Password must be at least 6 characters'; return; }
+  try {
+    var res = await fetch('/api/tenants/default', {
+      method:'PUT', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({password: pw})
+    });
+    var r = await res.json();
+    if (r.success) { msgEl.style.color='#16a34a'; msgEl.textContent='Password set! Use it next login.'; document.getElementById('admin-new-password').value=''; document.getElementById('admin-new-password-confirm').value=''; }
+    else { msgEl.style.color='#c0392b'; msgEl.textContent=r.error||'Error'; }
+  } catch(e) { msgEl.style.color='#c0392b'; msgEl.textContent='Error: '+e.message; }
+}
+
+function setPaymentUrl() {
+  var url = document.getElementById('admin-payment-url').value.trim();
+  var msgEl = document.getElementById('admin-pay-msg');
+  if (!url) { msgEl.style.color='#c0392b'; msgEl.textContent='Enter a URL'; return; }
+  try { localStorage.setItem('payment_url', url); } catch(e) {}
+  msgEl.style.color='#16a34a'; msgEl.textContent='Saved! Payment button updated.';
+}
+
+async function deleteTenant(tid) {
+  if (!confirm('Delete client "' + tid + '"? This removes their campaigns and data.')) return;
+  try {
+    var res = await fetch('/api/tenants/' + tid, {method:'DELETE'});
+    var r = await res.json();
+    if (r.success) { showToast('Client deleted'); loadTenants(); }
+    else showToast('Error: ' + (r.error || ''), true);
+  } catch(e) { showToast('Error: ' + e.message, true); }
+}
+
+async function editTenant(tid) {
+  try {
+    var res = await fetch('/api/tenants');
+    var d = await res.json();
+    var t = (d.tenants || {})[tid];
+    if (!t) { showToast('Client not found', true); return; }
+    var newName = prompt('Client Name:', t.name || tid);
+    if (newName === null) return;
+    var newPass = prompt('New Password (leave blank to keep current):', '');
+    var newBudget = prompt('Daily Budget Cap ($):', t.max_total_daily_budget || 50);
+    var newToken = prompt('Meta Access Token (leave blank to keep current):', '');
+    var newAdAccount = prompt('Ad Account ID (leave blank to keep current):', t.meta_ad_account_id || '');
+    var newPaymentUrl = prompt('Payment URL (leave blank to keep current):', t.payment_url || '');
+    var payload = {tenant_id: tid, name: newName};
+    if (newPass) payload.password = newPass;
+    if (newBudget) payload.max_total_daily_budget = parseInt(newBudget) || 50;
+    if (newToken) payload.meta_access_token = newToken;
+    if (newAdAccount) payload.meta_ad_account_id = newAdAccount;
+    if (newPaymentUrl !== null && newPaymentUrl !== '') payload.payment_url = newPaymentUrl;
+    var saveRes = await fetch('/api/tenants/' + tid, {
+      method: 'PUT', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    var sr = await saveRes.json();
+    if (sr.success) { showToast('Client updated'); loadTenants(); }
+    else showToast('Error: ' + (sr.error || ''), true);
+  } catch(e) { showToast('Error: ' + e.message, true); }
+}
+
+async function checkAdminRole() {
+  try {
+    var res = await fetch('/api/whoami');
+    var d = await res.json();
+    var panel = document.getElementById('admin-panel');
+    if (panel) panel.style.display = (d.role === 'admin') ? 'block' : 'none';
+  } catch(e) {}
+}
+
+async function loadSafetyStatus() {
+  try {
+    var res = await fetch('/api/safety-status');
+    var d = await res.json();
+    document.getElementById('safety-max-budget').value = d.max_total_daily_budget;
+    var cb = document.getElementById('safety-auto-budget');
+    cb.checked = d.auto_budget_increase_enabled;
+    var lbl = document.getElementById('auto-budget-label');
+    lbl.textContent = d.auto_budget_increase_enabled ? 'ON' : 'OFF';
+    lbl.style.color = d.auto_budget_increase_enabled ? '#16a34a' : '#65676b';
+    var slider = document.getElementById('auto-budget-slider');
+    slider.style.background = d.auto_budget_increase_enabled ? '#2563eb' : '#ccc';
+    var bar = document.getElementById('safety-status-bar');
+    bar.innerHTML = 'Committed: <strong>$' + d.committed_daily_budget.toFixed(2) + '</strong> / $' + d.max_total_daily_budget.toFixed(2) + ' daily | Remaining: <strong>$' + d.remaining_daily_budget.toFixed(2) + '</strong>';
+  } catch(e) {}
+}
+
+async function updateSafetyBudget() {
+  var val = parseFloat(document.getElementById('safety-max-budget').value);
+  if (!val || val < 1) return;
+  try {
+    var res = await fetch('/api/safety/update-budget', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({max_total_daily_budget:val})});
+    var r = await res.json();
+    if (r.success) { showToast('Budget updated'); loadSafetyStatus(); }
+  } catch(e) {}
+}
+
+async function toggleAutoBudget() {
+  try {
+    var res = await fetch('/api/safety/toggle-auto-budget', {method:'POST'});
+    var r = await res.json();
+    if (r.success) loadSafetyStatus();
+  } catch(e) {}
+}
 async function deleteAccount(id) {
   if (!confirm(_t('confirm_delete_account'))) return;
   const res = await fetch('/api/accounts/delete/' + id, {method:'POST'});
@@ -3570,6 +5294,7 @@ async function submitCampaign() {
     gender: document.getElementById('f-gender').value,
     interests: getSelectedInterestIds(),
     has_children: document.getElementById('f-has-children').value,
+    optimization_goal: document.getElementById('f-optimization-goal').value,
     media_url: document.getElementById('f-media-url').value,
     media_urls: mediaUrls.length > 0 ? mediaUrls : undefined,
     budget: {
@@ -3718,25 +5443,32 @@ function showAlert(msg, type) {
 
 async function checkTokenStatus() {
   try {
+    var who = await fetch('/api/whoami').then(r => r.json());
+    var tResp = await fetch('/api/tenants').then(r => r.json());
+    var tenant = (tResp.tenants || {})[who.tenant_id] || {};
+    const el = document.getElementById('token-status');
+    if (tenant.demo_mode) {
+      el.innerHTML = '<span style="color:#f59e0b;">&#9888; Demo Mode</span>';
+      return;
+    }
     const res = await fetch('/api/token-status');
     const data = await res.json();
-    const el = document.getElementById('token-status');
     if (data.expires_at) {
       const days = Math.floor((data.expires_at * 1000 - Date.now()) / (1000*60*60*24));
       if (days > 365) {
-        el.innerHTML = 'Token: Ilimitado';
+        el.innerHTML = _t('token_unlimited');
       } else if (days < 7) {
-        el.innerHTML = 'Token expira en ' + days + ' dias - RENUEVA';
+        el.innerHTML = _t('token_expiring').replace('{days}', days);
         el.style.color = '#ffcc00';
         el.style.fontWeight = 'bold';
       } else if (days < 30) {
-        el.innerHTML = 'Token: ' + days + ' dias - Renueva pronto';
+        el.innerHTML = _t('token_renew_soon').replace('{days}', days);
         el.style.color = '#ffcc00';
       } else {
-        el.innerHTML = 'Token: ' + days + ' dias';
+        el.innerHTML = _t('token_days').replace('{days}', days);
       }
     } else {
-      el.innerHTML = 'Token: Ilimitado';
+      el.innerHTML = _t('token_unlimited');
     }
   } catch(e) {}
 }
@@ -3760,7 +5492,7 @@ translateDOM();
   // Fix Ads Manager link with actual ad account
   var adsLink = document.getElementById('ads-manager-link');
   if (adsLink) {
-    var actId = (localStorage.getItem('meta_ad_account') || '1392277821202782').replace('act_','');
+    var actId = ((function() { try { return localStorage.getItem('meta_ad_account'); } catch(e) { return null; } })() || '1392277821202782').replace('act_','');
     adsLink.href = 'https://adsmanager.facebook.com/adsmanager/manage/campaigns?act=' + actId;
   }
 
@@ -3834,6 +5566,7 @@ translateDOM();
             actionsHtml = '<button class="btn btn-sm btn-primary" onclick="publishPost(' + "'" + p.id + "'" + ')" style="margin-right:4px;">' + _t('publish_now') + '</button>';
           }
           actionsHtml += '<button class="btn btn-sm" onclick="showPostDetail(' + "'" + p.id + "'" + ')" style="margin-right:4px;background:#e4e6eb;">' + _t('view') + '</button>';
+          actionsHtml += '<button class="btn btn-sm btn-primary" onclick="openRepeatModal(' + "'" + p.id + "'" + ')" style="margin-right:4px;" title="' + _t('repeat') + '">🔁</button>';
           actionsHtml += '<button class="btn btn-sm btn-warn" onclick="deletePost(' + "'" + p.id + "'" + ')">🗑</button>';
         }
         html += '<tr><td>' + typeIcon + '</td><td>' + platformIcon + '</td><td style="cursor:pointer;" onclick="showPostDetail(' + "'" + p.id + "'" + ')">' + _esc(msg) + '</td><td>' + sched + '</td><td>' + statusBadge + '</td><td>' + actionsHtml + '</td></tr>';
@@ -3896,149 +5629,410 @@ translateDOM();
   }
 
   function openCreatePostModal() {
-    document.getElementById('cp-platform').value = 'facebook';
-    document.getElementById('cp-content-type').value = 'image';
-    document.getElementById('cp-message').value = '';
-    document.getElementById('cp-link').value = '';
-    document.getElementById('cp-schedule').value = '';
-    document.getElementById('cp-media').value = '';
-    document.getElementById('cp-media').accept = 'image/*';
-    document.getElementById('cp-media').multiple = false;
-    document.getElementById('cp-media-preview').style.display = 'none';
-    document.getElementById('cp-carousel-thumbs').style.display = 'none';
-    document.getElementById('cp-carousel-thumbs').innerHTML = '';
-    document.getElementById('cp-preview-video').style.display = 'none';
-    document.getElementById('cp-preview-video').src = '';
-    document.getElementById('cp-status').innerHTML = '';
-    document.getElementById('create-post-modal').classList.add('open');
-    toggleCpMedia();
+    try {
+      // Reset platform checkboxes: default Facebook checked, Instagram unchecked
+      var fbCb = document.getElementById('cp-platform-fb');
+      var igCb = document.getElementById('cp-platform-ig');
+      if (fbCb) fbCb.checked = true;
+      if (igCb) igCb.checked = false;
+      var warn = document.getElementById('cp-platform-warning');
+      if (warn) warn.style.display = 'none';
+      document.getElementById('cp-headline').value = '';
+      document.getElementById('cp-message').value = '';
+      document.getElementById('cp-ai-instruction').value = '';
+      document.getElementById('cp-cta').value = 'LEARN_MORE';
+      document.getElementById('cp-link').value = '';
+      document.getElementById('cp-schedule-start-date').value = '';
+      document.getElementById('cp-schedule-hour').value = '12';
+      document.getElementById('cp-schedule-min').value = '00';
+      document.getElementById('cp-schedule-ampm').value = 'AM';
+      document.getElementById('cp-schedule-confirm').style.display = 'none';
+      document.getElementById('cp-schedule-manual-empty').style.display = '';
+      document.getElementById('cp-schedule').value = '';
+      document.getElementById('cp-status').innerHTML = '';
+      resetCpPreview();
+      document.getElementById('create-post-modal').classList.add('open');
+    } catch(e) {
+      console.error('Error in openCreatePostModal:', e);
+      document.getElementById('create-post-modal').classList.add('open');
+    }
   }
 
   function closeCreatePostModal() {
-    document.getElementById('create-post-modal').classList.remove('open');
+    try {
+      document.getElementById('create-post-modal').classList.remove('open');
+    } catch(e) {}
+  }
+
+  // Repeat Schedule functions
+  var _rptTimeIndex = 0;
+  var _rptHourIndex = 0;
+  var _cpRepeatPendingDays = null;
+  function openRepeatModal(sourceId, onReady) {
+    _cpRepeatPendingDays = null;
+    fetch('/api/posts/' + sourceId).then(function(r) { return r.json(); }).then(function(d) {
+      if (!d.post) { showToast(_t('error')); return; }
+      var p = d.post;
+      document.getElementById('rpt-source-id').value = sourceId;
+      document.getElementById('rpt-source-type').value = 'post';
+      document.getElementById('rpt-headline').value = p.headline || '';
+      document.getElementById('rpt-message').value = p.message || '';
+      document.getElementById('rpt-ai-instruction').value = p.ai_instruction || '';
+      document.getElementById('rpt-cta').value = p.cta || 'LEARN_MORE';
+      document.getElementById('rpt-link').value = p.link_url || '';
+      var mediaInfo = '';
+      if (p.media_url || p.media_file) mediaInfo = '📎 ' + _t('media') + ': ' + (p.media_url || p.media_file);
+      else if (p.media_urls && p.media_urls.length) mediaInfo = '📑 ' + p.media_urls.length + ' ' + _t('images');
+      else mediaInfo = _t('no_media');
+      document.getElementById('rpt-media-info').textContent = mediaInfo;
+      resetRptPreview();
+      document.getElementById('rpt-times-list').innerHTML = '';
+      document.getElementById('rpt-times-empty').style.display = '';
+      document.getElementById('rpt-hours-list').innerHTML = '';
+      document.getElementById('rpt-hours-empty').style.display = '';
+      document.getElementById('rpt-start-date').value = '';
+      document.getElementById('rpt-status').innerHTML = '';
+      _rptTimeIndex = 0;
+      _rptHourIndex = 0;
+      document.getElementById('repeat-modal').classList.add('open');
+      if (typeof onReady === 'function') onReady();
+    }).catch(function() { showToast(_t('error')); });
+  }
+
+  function openMultiRepeatModal(itemId) {
+    fetch('/api/multi-scheduler/item/' + itemId).then(function(r) { return r.json(); }).then(function(d) {
+      if (!d.item) { showToast(_t('error')); return; }
+      var item = d.item;
+      document.getElementById('rpt-source-id').value = itemId;
+      document.getElementById('rpt-source-type').value = 'multi';
+      document.getElementById('rpt-headline').value = item.headline || '';
+      document.getElementById('rpt-message').value = item.message || '';
+      document.getElementById('rpt-ai-instruction').value = item.ai_instruction || '';
+      document.getElementById('rpt-cta').value = item.cta || 'LEARN_MORE';
+      document.getElementById('rpt-link').value = item.link_url || '';
+      var mediaInfo = '';
+      if (item.media_file || (item.media_files && item.media_files.length)) mediaInfo = '📎 ' + _t('media');
+      else if (item.media_urls && item.media_urls.length) mediaInfo = '📑 ' + item.media_urls.length + ' ' + _t('images');
+      else mediaInfo = _t('no_media');
+      document.getElementById('rpt-media-info').textContent = mediaInfo;
+      resetRptPreview();
+      document.getElementById('rpt-times-list').innerHTML = '';
+      document.getElementById('rpt-times-empty').style.display = '';
+      document.getElementById('rpt-hours-list').innerHTML = '';
+      document.getElementById('rpt-hours-empty').style.display = '';
+      document.getElementById('rpt-start-date').value = '';
+      document.getElementById('rpt-status').innerHTML = '';
+      _rptTimeIndex = 0;
+      _rptHourIndex = 0;
+      document.getElementById('repeat-modal').classList.add('open');
+    }).catch(function() { showToast(_t('error')); });
+  }
+
+  function closeRepeatModal() {
+    document.getElementById('repeat-modal').classList.remove('open');
+  }
+
+  function addRepeatHour() {
+    var h = parseInt(document.getElementById('rpt-hour-select').value, 10);
+    var m = document.getElementById('rpt-minute-select').value;
+    var ampm = document.getElementById('rpt-ampm-select').value;
+    if (isNaN(h)) { showToast(_t('select_hour_first')); return; }
+    var h24 = (ampm === 'PM' && h !== 12) ? h + 12 : (ampm === 'AM' && h === 12 ? 0 : h);
+    var hour24Str = String(h24).padStart(2, '0');
+    var display = h + ':' + m + ' ' + ampm;
+    document.getElementById('rpt-hours-empty').style.display = 'none';
+    var idx = _rptHourIndex++;
+    var container = document.getElementById('rpt-hours-list');
+    var span = document.createElement('span');
+    span.id = 'rpt-hour-' + idx;
+    span.setAttribute('data-24h', hour24Str + ':' + m);
+    span.style.cssText = 'display:inline-flex;align-items:center;gap:4px;background:#e7f3ff;padding:4px 10px;border-radius:12px;font-size:.85rem;';
+    span.innerHTML = display + ' <span style="cursor:pointer;color:#dc2626;font-weight:700;" onclick="removeRepeatHour(' + idx + ')">x</span>';
+    container.appendChild(span);
+    if (_cpRepeatPendingDays && document.getElementById('rpt-start-date').value) {
+      var pendingDays = _cpRepeatPendingDays;
+      _cpRepeatPendingDays = null;
+      generateRepeatPreset(pendingDays);
+    }
+  }
+
+  function removeRepeatHour(idx) {
+    var el = document.getElementById('rpt-hour-' + idx);
+    if (el) el.remove();
+    var container = document.getElementById('rpt-hours-list');
+    if (container.children.length === 0) {
+      document.getElementById('rpt-hours-empty').style.display = '';
+    }
+  }
+
+  function generateRepeatPreset(totalDays) {
+    var startDate = document.getElementById('rpt-start-date').value;
+    if (!startDate) { showToast(_t('select_start_date')); return; }
+    var hourSpans = document.getElementById('rpt-hours-list').children;
+    if (!hourSpans.length) { showToast(_t('add_hours_first')); return; }
+    var hours = [];
+    for (var i = 0; i < hourSpans.length; i++) {
+      var h24 = hourSpans[i].getAttribute('data-24h');
+      if (h24) hours.push(h24);
+    }
+    if (!hours.length) { showToast(_t('add_hours_first')); return; }
+    var container = document.getElementById('rpt-times-list');
+    document.getElementById('rpt-times-empty').style.display = 'none';
+    var count = 0;
+    for (var d = 0; d < totalDays; d++) {
+      var dateObj = new Date(startDate + 'T00:00:00');
+      dateObj.setDate(dateObj.getDate() + d);
+      var y = dateObj.getFullYear();
+      var m = String(dateObj.getMonth() + 1).padStart(2, '0');
+      var day = String(dateObj.getDate()).padStart(2, '0');
+      var dateStr = y + '-' + m + '-' + day;
+      for (var h = 0; h < hours.length; h++) {
+        var idx = _rptTimeIndex++;
+        var div = document.createElement('div');
+        div.id = 'rpt-time-' + idx;
+        div.style.cssText = 'display:flex;gap:8px;align-items:center;margin-bottom:6px;';
+        div.innerHTML = '<input type="datetime-local" id="rpt-dt-' + idx + '" value="' + dateStr + 'T' + hours[h] + '" style="flex:1;padding:8px;border:1px solid #ddd;border-radius:6px;">' +
+          '<button class="btn btn-sm btn-danger" onclick="removeRepeatTime(' + idx + ')" title="' + _t('remove_time') + '">x</button>';
+        container.appendChild(div);
+        count++;
+      }
+    }
+    showToast(count + ' ' + _t('slots_generated'));
+  }
+
+  function addRepeatTime() {
+    var container = document.getElementById('rpt-times-list');
+    document.getElementById('rpt-times-empty').style.display = 'none';
+    var idx = _rptTimeIndex++;
+    var div = document.createElement('div');
+    div.id = 'rpt-time-' + idx;
+    div.style.cssText = 'display:flex;gap:8px;align-items:center;margin-bottom:6px;';
+    div.innerHTML = '<input type="datetime-local" id="rpt-dt-' + idx + '" style="flex:1;padding:8px;border:1px solid #ddd;border-radius:6px;">' +
+      '<button class="btn btn-sm btn-danger" onclick="removeRepeatTime(' + idx + ')" title="' + _t('remove_time') + '">x</button>';
+    container.appendChild(div);
+  }
+
+  function removeRepeatTime(idx) {
+    var el = document.getElementById('rpt-time-' + idx);
+    if (el) el.remove();
+    var container = document.getElementById('rpt-times-list');
+    if (container.children.length === 0) {
+      document.getElementById('rpt-times-empty').style.display = '';
+    }
+  }
+
+  function getAllRepeatTimes() {
+    var times = [];
+    var container = document.getElementById('rpt-times-list');
+    for (var i = 0; i < container.children.length; i++) {
+      var inputId = container.children[i].querySelector('input[type="datetime-local"]').id;
+      var val = document.getElementById(inputId).value;
+      if (val) times.push(val);
+    }
+    return times;
+  }
+
+  function scheduleRepeatCopies() {
+    var times = getAllRepeatTimes();
+    if (!times.length) { showToast(_t('select_schedule')); return; }
+    var sourceId = document.getElementById('rpt-source-id').value;
+    var sourceType = document.getElementById('rpt-source-type').value;
+    var statusEl = document.getElementById('rpt-status');
+    statusEl.innerHTML = _t('saving') + '...';
+    var payload = {
+      source_id: sourceId,
+      source_type: sourceType,
+      headline: document.getElementById('rpt-headline').value.trim(),
+      message: document.getElementById('rpt-message').value.trim(),
+      ai_instruction: document.getElementById('rpt-ai-instruction').value.trim(),
+      cta: document.getElementById('rpt-cta').value,
+      link_url: document.getElementById('rpt-link').value.trim(),
+      times: times
+    };
+    var url = sourceType === 'multi' ? '/api/multi-scheduler/repeat' : '/api/posts/repeat';
+    fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)})
+      .then(function(r) { return r.json(); }).then(function(d) {
+        if (d.success) {
+          statusEl.innerHTML = _t('scheduled');
+          showToast(times.length + ' ' + _t('posts') + ' ' + _t('scheduled'));
+          setTimeout(function() { closeRepeatModal(); loadPosts(); if (typeof loadMultiQueue === 'function') loadMultiQueue(); }, 1000);
+        } else {
+          statusEl.innerHTML = _t('error') + ': ' + (d.error || '');
+        }
+      }).catch(function(e) { statusEl.innerHTML = 'Error: ' + e.message; });
   }
 
   function toggleCpMedia() {
-    var platform = document.getElementById('cp-platform').value;
+    var fbChecked = document.getElementById('cp-platform-fb') && document.getElementById('cp-platform-fb').checked;
+    var igChecked = document.getElementById('cp-platform-ig') && document.getElementById('cp-platform-ig').checked;
     var linkGroup = document.getElementById('cp-link-group');
-    if (platform === 'instagram') {
-      linkGroup.style.display = 'none';
-    } else {
-      linkGroup.style.display = '';
-    }
-    var ct = document.getElementById('cp-content-type').value;
-    var input = document.getElementById('cp-media');
-    if (ct === 'video') {
-      input.accept = 'video/*';
-      input.multiple = false;
-    } else if (ct === 'carousel') {
-      input.accept = 'image/*';
-      input.multiple = true;
-    } else {
-      input.accept = 'image/*';
-      input.multiple = false;
-    }
-    input.value = '';
-    document.getElementById('cp-media-preview').style.display = 'none';
-    document.getElementById('cp-carousel-thumbs').style.display = 'none';
+    // Hide link URL only if Instagram-only (Instagram doesn't support link in posts)
+    linkGroup.style.display = (igChecked && !fbChecked) ? 'none' : '';
+  }
+  function resetCpPreview() {
+    document.getElementById('cp-upload-preview').style.display = 'none';
+    document.getElementById('cp-upload-placeholder').style.display = '';
     document.getElementById('cp-carousel-thumbs').innerHTML = '';
     document.getElementById('cp-preview-video').style.display = 'none';
     document.getElementById('cp-preview-video').src = '';
+    document.getElementById('cp-preview-filename').textContent = '';
+    document.getElementById('cp-img-count').textContent = '0';
+    _cpUploadedMedia = '';
+    _cpCarouselUrls = [];
   }
 
   var _cpUploadedMedia = '';
   var _cpCarouselUrls = [];
-  document.addEventListener('change', function(e) {
-    if (e.target && e.target.id === 'cp-media') {
-      var files = e.target.files;
-      if (!files || files.length === 0) return;
-      var ct = document.getElementById('cp-content-type').value;
-      var statusEl = document.getElementById('cp-status');
-      if (ct === 'carousel') {
-        _cpUploadedMedia = '';
-        _cpCarouselUrls = [];
-        var uploadNext = function(i) {
-          if (i >= files.length) {
-            document.getElementById('cp-carousel-thumbs').style.display = 'flex';
-            document.getElementById('cp-carousel-thumbs').innerHTML = _cpCarouselUrls.map(function(u, idx) {
-              return '<div style="position:relative;display:inline-block;"><img src="' + u + '" style="width:80px;height:80px;object-fit:cover;border-radius:6px;border:2px solid #ddd;"><button onclick="removeCarouselItem(' + idx + ')" style="position:absolute;top:-6px;right:-6px;background:#e74c3c;color:#fff;border:none;border-radius:50%;width:18px;height:18px;font-size:12px;cursor:pointer;line-height:18px;">x</button></div>';
-            }).join('');
-            statusEl.innerHTML = _cpCarouselUrls.length + ' ' + _t('images_uploaded');
-            return;
-          }
-          var fd = new FormData();
-          fd.append('media', files[i]);
-          fetch('/api/upload-media', {method:'POST', body:fd}).then(function(r) { return r.json(); }).then(function(d) {
-            if (d.success) {
-              _cpCarouselUrls.push(d.url);
-              statusEl.innerHTML = _t('uploaded') + ' ' + (_cpCarouselUrls.length) + '/' + files.length;
-            } else {
-              statusEl.innerHTML = _t('upload_failed') + ' ' + (i+1);
-            }
-            uploadNext(i+1);
-          }).catch(function() { statusEl.innerHTML = _t('upload_error_at') + ' ' + (i+1); uploadNext(i+1); });
-        };
-        uploadNext(0);
-      } else if (ct === 'video') {
-        _cpCarouselUrls = [];
-        var file = files[0];
-        var fd = new FormData();
-        fd.append('media', file);
-        statusEl.innerHTML = _t('uploading_video');
-        fetch('/api/upload-media', {method:'POST', body:fd}).then(function(r) { return r.json(); }).then(function(d) {
-          if (d.success) {
-            _cpUploadedMedia = d.url;
-            document.getElementById('cp-preview-video').src = d.url;
-            document.getElementById('cp-preview-video').style.display = 'block';
-            statusEl.innerHTML = _t('video_uploaded');
-          } else {
-            statusEl.innerHTML = _t('upload_failed');
-          }
-        }).catch(function() { statusEl.innerHTML = _t('upload_error'); });
-      } else {
-        _cpCarouselUrls = [];
-        var file = files[0];
-        var fd = new FormData();
-        fd.append('media', file);
-        statusEl.innerHTML = _t('uploading');
-        fetch('/api/upload-media', {method:'POST', body:fd}).then(function(r) { return r.json(); }).then(function(d) {
-          if (d.success) {
-            _cpUploadedMedia = d.url;
-            document.getElementById('cp-media-preview').style.display = '';
-            document.getElementById('cp-preview-img').src = d.url;
-            statusEl.innerHTML = _t('image_uploaded');
-          } else {
-            statusEl.innerHTML = _t('upload_failed');
-          }
-        }).catch(function() { statusEl.innerHTML = _t('upload_error'); });
-      }
-    }
-  });
 
-  function removeCarouselItem(index) {
-    _cpCarouselUrls.splice(index, 1);
-    var thumbsDiv = document.getElementById('cp-carousel-thumbs');
-    thumbsDiv.innerHTML = _cpCarouselUrls.map(function(u, idx) {
-      return '<div style="position:relative;display:inline-block;"><img src="' + u + '" style="width:80px;height:80px;object-fit:cover;border-radius:6px;border:2px solid #ddd;"><button onclick="removeCarouselItem(' + idx + ')" style="position:absolute;top:-6px;right:-6px;background:#e74c3c;color:#fff;border:none;border-radius:50%;width:18px;height:18px;font-size:12px;cursor:pointer;line-height:18px;">x</button></div>';
-    }).join('');
+  // cp-media-input onchange is handled inline via HTML attribute
+
+  function handleCpMediaUpload(files) {
+    if (!files || files.length === 0) return;
     var statusEl = document.getElementById('cp-status');
-    statusEl.innerHTML = _cpCarouselUrls.length + ' ' + _t('images_selected');
-    if (_cpCarouselUrls.length === 0) {
-      thumbsDiv.style.display = 'none';
+    var isVideo = files[0].type.startsWith('video/');
+    _cpUploadedMedia = '';
+    _cpCarouselUrls = [];
+    if (isVideo) {
+      var fd = new FormData();
+      fd.append('media', files[0]);
+      statusEl.innerHTML = _t('uploading_video');
+      fetch('/api/upload-media', {method:'POST', body:fd}).then(function(r) { return r.json(); }).then(function(d) {
+        if (d.success) {
+          _cpUploadedMedia = d.url;
+          document.getElementById('cp-upload-placeholder').style.display = 'none';
+          document.getElementById('cp-upload-preview').style.display = '';
+          document.getElementById('cp-preview-video').src = d.url;
+          document.getElementById('cp-preview-video').style.display = 'block';
+          document.getElementById('cp-preview-filename').textContent = files[0].name;
+          statusEl.innerHTML = _t('video_uploaded');
+        } else { statusEl.innerHTML = _t('upload_failed'); }
+      }).catch(function() { statusEl.innerHTML = _t('upload_error'); });
+    } else {
+      var uploadNext = function(i) {
+        if (i >= files.length) {
+          document.getElementById('cp-upload-placeholder').style.display = 'none';
+          document.getElementById('cp-upload-preview').style.display = '';
+          document.getElementById('cp-img-count').textContent = files.length;
+          document.getElementById('cp-preview-filename').textContent = files.length + ' ' + _t('selected');
+          var thumbs = document.getElementById('cp-carousel-thumbs');
+          thumbs.innerHTML = _cpCarouselUrls.map(function(u) {
+            return '<div style="position:relative;display:inline-block;"><img src="' + u + '" style="width:80px;height:80px;object-fit:cover;border-radius:6px;border:2px solid #ddd;"></div>';
+          }).join('');
+          statusEl.innerHTML = _cpCarouselUrls.length + ' ' + _t('images_uploaded');
+          return;
+        }
+        var fd = new FormData();
+        fd.append('media', files[i]);
+        statusEl.innerHTML = _t('uploading') + ' ' + (i+1) + '/' + files.length;
+        fetch('/api/upload-media', {method:'POST', body:fd}).then(function(r) { return r.json(); }).then(function(d) {
+          if (d.success) { _cpCarouselUrls.push(d.url); }
+          uploadNext(i+1);
+        }).catch(function() { uploadNext(i+1); });
+      };
+      uploadNext(0);
     }
   }
 
+  var _rptUploadedMedia = '';
+  var _rptCarouselUrls = [];
+
+  function resetRptPreview() {
+    document.getElementById('rpt-upload-preview').style.display = 'none';
+    document.getElementById('rpt-upload-placeholder').style.display = '';
+    document.getElementById('rpt-carousel-thumbs').innerHTML = '';
+    document.getElementById('rpt-preview-video').style.display = 'none';
+    document.getElementById('rpt-preview-video').src = '';
+    document.getElementById('rpt-preview-filename').textContent = '';
+    document.getElementById('rpt-img-count').textContent = '0';
+    _rptUploadedMedia = '';
+    _rptCarouselUrls = [];
+  }
+
+  function handleRptMediaUpload(files) {
+    if (!files || files.length === 0) return;
+    var statusEl = document.getElementById('rpt-status');
+    var isVideo = files[0].type.startsWith('video/');
+    _rptUploadedMedia = '';
+    _rptCarouselUrls = [];
+    if (isVideo) {
+      var fd = new FormData();
+      fd.append('media', files[0]);
+      statusEl.innerHTML = _t('uploading_video');
+      fetch('/api/upload-media', {method:'POST', body:fd}).then(function(r) { return r.json(); }).then(function(d) {
+        if (d.success) {
+          _rptUploadedMedia = d.url;
+          document.getElementById('rpt-upload-placeholder').style.display = 'none';
+          document.getElementById('rpt-upload-preview').style.display = '';
+          document.getElementById('rpt-preview-video').src = d.url;
+          document.getElementById('rpt-preview-video').style.display = 'block';
+          document.getElementById('rpt-preview-filename').textContent = files[0].name;
+          statusEl.innerHTML = _t('video_uploaded');
+        } else { statusEl.innerHTML = _t('upload_failed'); }
+      }).catch(function() { statusEl.innerHTML = _t('upload_error'); });
+    } else {
+      var uploadNext = function(i) {
+        if (i >= files.length) {
+          document.getElementById('rpt-upload-placeholder').style.display = 'none';
+          document.getElementById('rpt-upload-preview').style.display = '';
+          document.getElementById('rpt-img-count').textContent = files.length;
+          document.getElementById('rpt-preview-filename').textContent = files.length + ' ' + _t('selected');
+          var thumbs = document.getElementById('rpt-carousel-thumbs');
+          thumbs.innerHTML = _rptCarouselUrls.map(function(u) {
+            return '<div style="position:relative;display:inline-block;"><img src="' + u + '" style="width:80px;height:80px;object-fit:cover;border-radius:6px;border:2px solid #ddd;"></div>';
+          }).join('');
+          statusEl.innerHTML = _rptCarouselUrls.length + ' ' + _t('images_uploaded');
+          return;
+        }
+        var fd = new FormData();
+        fd.append('media', files[i]);
+        statusEl.innerHTML = _t('uploading') + ' ' + (i+1) + '/' + files.length;
+        fetch('/api/upload-media', {method:'POST', body:fd}).then(function(r) { return r.json(); }).then(function(d) {
+          if (d.success) { _rptCarouselUrls.push(d.url); }
+          uploadNext(i+1);
+        }).catch(function() { uploadNext(i+1); });
+      };
+      uploadNext(0);
+    }
+  }
+
+  function generateCpCopy() {
+    var instruction = document.getElementById('cp-ai-instruction').value.trim() || 'promote a business';
+    document.getElementById('cp-status').innerHTML = _t('generating');
+    fetch('/api/generate-ad-copy', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({instruction: instruction, count: 3})})
+      .then(function(r) { return r.json(); }).then(function(d) {
+        if (d.headlines && d.headlines.length) {
+          document.getElementById('cp-headline').value = d.headlines[0] || '';
+          document.getElementById('cp-message').value = d.messages ? d.messages.join('\\n\\n') : '';
+          document.getElementById('cp-status').innerHTML = _t('ad_copy_generated');
+          setTimeout(function() { document.getElementById('cp-status').innerHTML = ''; }, 3000);
+        } else { document.getElementById('cp-status').innerHTML = _t('generation_failed'); }
+      }).catch(function() { document.getElementById('cp-status').innerHTML = _t('error'); });
+  }
+
+  function getCpPlatforms() {
+    var platforms = [];
+    if (document.getElementById('cp-platform-fb') && document.getElementById('cp-platform-fb').checked) platforms.push('facebook');
+    if (document.getElementById('cp-platform-ig') && document.getElementById('cp-platform-ig').checked) platforms.push('instagram');
+    return platforms;
+  }
+
   function getCpPayload() {
-    var ct = document.getElementById('cp-content-type').value;
+    var isCarousel = _cpCarouselUrls.length > 0;
+    var isVideo = !isCarousel && _cpUploadedMedia && document.getElementById('cp-preview-video').style.display !== 'none' && document.getElementById('cp-preview-video').style.display !== '';
+    var platforms = getCpPlatforms();
     var payload = {
-      platform: document.getElementById('cp-platform').value,
-      content_type: ct,
+      platform: platforms[0] || 'facebook',
+      platforms: platforms,
+      headline: document.getElementById('cp-headline').value.trim(),
       message: document.getElementById('cp-message').value.trim(),
+      ai_instruction: document.getElementById('cp-ai-instruction').value.trim(),
+      cta: document.getElementById('cp-cta').value,
       link_url: document.getElementById('cp-link').value.trim(),
-      media_url: ct === 'carousel' ? '' : _cpUploadedMedia,
-      media_file: ct === 'carousel' ? '' : _cpUploadedMedia,
-      media_urls: ct === 'carousel' ? _cpCarouselUrls : [],
-      media_files: ct === 'carousel' ? _cpCarouselUrls : []
+      content_type: isVideo ? 'video' : (isCarousel ? 'carousel' : 'image'),
+      media_url: isCarousel ? '' : _cpUploadedMedia,
+      media_file: isCarousel ? '' : _cpUploadedMedia,
+      media_urls: _cpCarouselUrls,
+      media_files: _cpCarouselUrls
     };
     return payload;
   }
@@ -4050,8 +6044,65 @@ translateDOM();
     submitPost(payload, _t('draft_saved'));
   }
 
+  function getCpScheduleValue() {
+    var date = document.getElementById('cp-schedule-start-date').value;
+    var hour = document.getElementById('cp-schedule-hour').value;
+    var min = document.getElementById('cp-schedule-min').value;
+    var ampm = document.getElementById('cp-schedule-ampm').value;
+    if (!date || !hour || !min) return '';
+    var h = parseInt(hour, 10);
+    var h24 = (ampm === 'PM' && h !== 12) ? h + 12 : (ampm === 'AM' && h === 12 ? 0 : h);
+    return date + 'T' + String(h24).padStart(2, '0') + ':' + min;
+  }
+
+  function addCpScheduleManualTime() {
+    var sched = getCpScheduleValue();
+    if (!sched) { showToast(_t('select_schedule')); return; }
+    document.getElementById('cp-schedule').value = sched;
+    var dt = new Date(sched);
+    var display = dt.toLocaleDateString() + ' ' + dt.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+    document.getElementById('cp-schedule-confirm-text').textContent = (_t('time_added') || 'Time added') + ': ' + display;
+    document.getElementById('cp-schedule-confirm').style.display = 'flex';
+    document.getElementById('cp-schedule-manual-empty').style.display = 'none';
+  }
+
+  function clearCpScheduleManualTime() {
+    document.getElementById('cp-schedule').value = '';
+    document.getElementById('cp-schedule-confirm').style.display = 'none';
+    document.getElementById('cp-schedule-manual-empty').style.display = '';
+  }
+
+  function sendCpToRepeat(totalDays) {
+    var payload = getCpPayload();
+    if (!payload.message && !payload.media_url && !(payload.media_urls && payload.media_urls.length)) {
+      showToast(_t('add_content_first'));
+      return;
+    }
+    payload.status = 'draft';
+    payload.scheduled_time = null;
+    var statusEl = document.getElementById('cp-status');
+    statusEl.innerHTML = _t('processing');
+    fetch('/api/posts/create', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)})
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        if (d.success && d.post && d.post.id) {
+          closeCreatePostModal();
+          openRepeatModal(d.post.id, function() {
+            var rptStartDate = document.getElementById('rpt-start-date');
+            if (rptStartDate && !rptStartDate.value) {
+              rptStartDate.value = new Date().toISOString().slice(0, 10);
+            }
+            _cpRepeatPendingDays = totalDays;
+            showToast(_t('repeat_setup_hint'));
+          });
+        } else {
+          statusEl.innerHTML = _t('error') + ': ' + (d.error || 'Unknown');
+        }
+      }).catch(function(e) { statusEl.innerHTML = 'Error: ' + e.message; });
+  }
+
   function schedulePost() {
-    var sched = document.getElementById('cp-schedule').value;
+    var sched = document.getElementById('cp-schedule').value || getCpScheduleValue();
     if (!sched) { document.getElementById('cp-status').innerHTML = _t('select_schedule'); return; }
     var payload = getCpPayload();
     payload.status = 'scheduled';
@@ -4067,29 +6118,72 @@ translateDOM();
   }
 
   function submitPost(payload, successMsg) {
+    var platforms = payload.platforms && payload.platforms.length ? payload.platforms : [payload.platform || 'facebook'];
+
+    // Validate at least one platform selected
+    var warn = document.getElementById('cp-platform-warning');
+    if (!platforms.length) {
+      if (warn) warn.style.display = 'block';
+      return;
+    }
+    if (warn) warn.style.display = 'none';
+
     var statusEl = document.getElementById('cp-status');
     statusEl.innerHTML = _t('processing');
-    fetch('/api/posts/create', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)})
-      .then(function(r) { return r.json(); })
-      .then(function(d) {
-        if (d.success) {
-          statusEl.innerHTML = successMsg;
-          if (d.published) {
-            showToast(_t('post_published'));
-          }
-          setTimeout(function() {
-            closeCreatePostModal();
-            loadPosts();
-          }, 1000);
-        } else {
-          statusEl.innerHTML = _t('error') + ': ' + (d.error || 'Unknown');
-        }
-      }).catch(function(e) {
-        statusEl.innerHTML = 'Error: ' + e.message;
-      });
-  }
 
-  function publishPost(postId) {
+    // If only one platform, send as before
+    if (platforms.length === 1) {
+      payload.platform = platforms[0];
+      fetch('/api/posts/create', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)})
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+          if (d.success) {
+            statusEl.innerHTML = successMsg;
+            if (d.published) showToast(_t('post_published'));
+            setTimeout(function() { closeCreatePostModal(); loadPosts(); }, 1000);
+          } else {
+            statusEl.innerHTML = _t('error') + ': ' + (d.error || 'Unknown');
+          }
+        }).catch(function(e) { statusEl.innerHTML = 'Error: ' + e.message; });
+      return;
+    }
+
+    // Both platforms — send one request per platform in sequence
+    var results = [];
+    var errors = [];
+    statusEl.innerHTML = '⏳ Posting to ' + platforms.join(' & ') + '...';
+
+    function postNext(index) {
+      if (index >= platforms.length) {
+        // All done
+        if (errors.length === 0) {
+          statusEl.innerHTML = '✅ Posted to ' + platforms.join(' & ') + '!';
+          showToast('✅ Published to Facebook & Instagram!');
+        } else if (results.length > 0) {
+          statusEl.innerHTML = '⚠️ Partial: ' + results.join(', ') + ' OK. Errors: ' + errors.join(', ');
+        } else {
+          statusEl.innerHTML = _t('error') + ': ' + errors.join(', ');
+        }
+        setTimeout(function() { closeCreatePostModal(); loadPosts(); }, 1500);
+        return;
+      }
+      var pl = platforms[index];
+      var p2 = JSON.parse(JSON.stringify(payload));
+      p2.platform = pl;
+      p2.platforms = [pl];
+      fetch('/api/posts/create', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(p2)})
+        .then(function(r) { return r.json(); })
+        .then(function(d) {
+          if (d.success) { results.push(pl); }
+          else { errors.push(pl + ': ' + (d.error || 'error')); }
+          postNext(index + 1);
+        }).catch(function(e) {
+          errors.push(pl + ': ' + e.message);
+          postNext(index + 1);
+        });
+    }
+    postNext(0);
+  }  function publishPost(postId) {
     if (!confirm(_t('confirm_publish_post'))) return;
     fetch('/api/posts/publish/' + postId, {method:'POST'})
       .then(function(r) { return r.json(); })
@@ -4133,30 +6227,616 @@ translateDOM();
       var posts = d.posts || [];
       var p = posts.find(function(x) { return x.id === postId; });
       if (!p) return;
-      var modal = document.createElement('div');
-      modal.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:9999;display:flex;align-items:center;justify-content:center;';
+
+      function fmtDate(dt) {
+        if (!dt) return '-';
+        var d2 = new Date(dt);
+        return d2.toLocaleDateString() + ' ' + d2.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+      }
       var statuses = {published:_t('published'),scheduled:_t('scheduled'),draft:_t('drafts'),trashed:_t('trash')};
-      function fmtDate(d) { if (!d) return '-'; var dt = new Date(d); return dt.toLocaleDateString() + ' ' + dt.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}); }
-      modal.innerHTML = '<div style="background:#fff;border-radius:12px;max-width:600px;width:90%;max-height:80vh;overflow-y:auto;padding:24px;box-shadow:0 8px 32px rgba(0,0,0,0.2);">' +
-        '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">' +
-        '<h3 style="margin:0;font-size:18px;">📄 ' + _t('details') + '</h3>' +
-        '<button onclick="this.parentElement.parentElement.parentElement.remove()" style="background:none;border:none;font-size:24px;cursor:pointer;color:#65676b;">&times;</button>' +
-        '</div>' +
-        '<table style="width:100%;border-collapse:collapse;">' +
-        '<tr><td style="padding:8px 12px;font-weight:700;color:#65676b;border-bottom:1px solid #e4e6eb;width:120px;">' + _t('platform') + '</td><td style="padding:8px 12px;border-bottom:1px solid #e4e6eb;">' + (p.platform === 'facebook' ? _t('facebook') : _t('instagram')) + '</td></tr>' +
-        '<tr><td style="padding:8px 12px;font-weight:700;color:#65676b;border-bottom:1px solid #e4e6eb;">' + _t('type') + '</td><td style="padding:8px 12px;border-bottom:1px solid #e4e6eb;">' + (p.content_type === 'image' ? _t('image') : p.content_type === 'video' ? _t('video') : p.content_type === 'carousel' ? _t('carousel') : p.content_type) + '</td></tr>' +
-        '<tr><td style="padding:8px 12px;font-weight:700;color:#65676b;border-bottom:1px solid #e4e6eb;">' + _t('status') + '</td><td style="padding:8px 12px;border-bottom:1px solid #e4e6eb;">' + (statuses[p.status] || p.status) + '</td></tr>' +
-        (p.published_at ? '<tr><td style="padding:8px 12px;font-weight:700;color:#65676b;border-bottom:1px solid #e4e6eb;">' + _t('published') + '</td><td style="padding:8px 12px;border-bottom:1px solid #e4e6eb;">' + fmtDate(p.published_at) + '</td></tr>' : '') +
-        (p.scheduled_time ? '<tr><td style="padding:8px 12px;font-weight:700;color:#65676b;border-bottom:1px solid #e4e6eb;">' + _t('scheduled') + '</td><td style="padding:8px 12px;border-bottom:1px solid #e4e6eb;">' + fmtDate(p.scheduled_time) + '</td></tr>' : '') +
-        '<tr><td style="padding:8px 12px;font-weight:700;color:#65676b;border-bottom:1px solid #e4e6eb;">' + _t('created') + '</td><td style="padding:8px 12px;border-bottom:1px solid #e4e6eb;">' + fmtDate(p.created_at) + '</td></tr>' +
-        '</table>' +
-        '<div style="margin-top:16px;"><strong>' + _t('message') + ':</strong></div>' +
-        '<div style="background:#f0f2f5;border-radius:8px;padding:12px;margin-top:8px;white-space:pre-wrap;font-size:14px;line-height:1.5;">' + _esc(p.message || '(' + _t('no_message') + ')') + '</div>' +
-        '</div>';
-      document.body.appendChild(modal);
-      modal.addEventListener('click', function(e) { if (e.target === modal) modal.remove(); });
+
+      // Overlay
+      var overlay = document.createElement('div');
+      overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:9999;display:flex;align-items:center;justify-content:center;';
+
+      // Box
+      var box = document.createElement('div');
+      box.style.cssText = 'background:#fff;border-radius:12px;max-width:620px;width:90%;max-height:85vh;overflow-y:auto;padding:24px;box-shadow:0 8px 32px rgba(0,0,0,0.2);';
+
+      // Header
+      var hdr = document.createElement('div');
+      hdr.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;';
+      var title = document.createElement('h3');
+      title.style.cssText = 'margin:0;font-size:18px;';
+      title.textContent = '📄 ' + _t('details');
+      var closeBtn = document.createElement('button');
+      closeBtn.style.cssText = 'background:none;border:none;font-size:24px;cursor:pointer;color:#65676b;';
+      closeBtn.textContent = '×';
+      closeBtn.onclick = function() { overlay.remove(); };
+      hdr.appendChild(title);
+      hdr.appendChild(closeBtn);
+      box.appendChild(hdr);
+
+      // Media preview
+      var imgSrc = p.media_file || p.media_url || '';
+      var allImgs = (p.media_files && p.media_files.length) ? p.media_files : ((p.media_urls && p.media_urls.length) ? p.media_urls : []);
+
+      if (allImgs.length > 1) {
+        var label = document.createElement('div');
+        label.style.cssText = 'margin-top:16px;margin-bottom:8px;';
+        label.innerHTML = '<strong>📸 Carousel (' + allImgs.length + ' ' + _t('image') + 's):</strong>';
+        box.appendChild(label);
+        var row = document.createElement('div');
+        row.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;';
+        allImgs.forEach(function(src) {
+          var img = document.createElement('img');
+          img.src = src;
+          img.style.cssText = 'max-width:160px;max-height:140px;border-radius:8px;object-fit:cover;border:1px solid #e4e6eb;';
+          img.onerror = function() { this.style.display = 'none'; };
+          row.appendChild(img);
+        });
+        box.appendChild(row);
+      } else if (imgSrc) {
+        var isVideo = /\\.(mp4|mov|avi|webm)$/i.test(imgSrc);
+        var mediaLabel = document.createElement('div');
+        mediaLabel.style.cssText = 'margin-top:16px;margin-bottom:8px;';
+        mediaLabel.innerHTML = '<strong>' + (isVideo ? '🎥 Video' : '📸 ' + _t('image')) + ':</strong>';
+        box.appendChild(mediaLabel);
+        if (isVideo) {
+          var vid = document.createElement('video');
+          vid.src = imgSrc;
+          vid.controls = true;
+          vid.style.cssText = 'max-width:100%;max-height:280px;border-radius:8px;display:block;';
+          box.appendChild(vid);
+        } else {
+          var img = document.createElement('img');
+          img.src = imgSrc;
+          img.style.cssText = 'max-width:100%;max-height:280px;border-radius:8px;object-fit:contain;border:1px solid #e4e6eb;display:block;';
+          img.onerror = function() {
+            var warn = document.createElement('div');
+            warn.style.cssText = 'color:#65676b;padding:12px;background:#f0f2f5;border-radius:8px;';
+            warn.textContent = '⚠️ Image not available';
+            img.parentNode.replaceChild(warn, img);
+          };
+          box.appendChild(img);
+        }
+      }
+
+      // Info table
+      var tableWrap = document.createElement('div');
+      tableWrap.style.marginTop = '16px';
+      var rows = [
+        [_t('platform'), p.platform === 'facebook' ? _t('facebook') : _t('instagram')],
+        [_t('type'), p.content_type === 'image' ? _t('image') : p.content_type === 'video' ? _t('video') : p.content_type === 'carousel' ? _t('carousel') : (p.content_type || '-')],
+        [_t('status'), statuses[p.status] || p.status],
+      ];
+      if (p.published_at) rows.push([_t('published'), fmtDate(p.published_at)]);
+      if (p.scheduled_time) rows.push([_t('scheduled'), fmtDate(p.scheduled_time)]);
+      rows.push([_t('created'), fmtDate(p.created_at)]);
+
+      var tbl = document.createElement('table');
+      tbl.style.cssText = 'width:100%;border-collapse:collapse;';
+      rows.forEach(function(r) {
+        var tr = document.createElement('tr');
+        var td1 = document.createElement('td');
+        td1.style.cssText = 'padding:8px 12px;font-weight:700;color:#65676b;border-bottom:1px solid #e4e6eb;width:120px;';
+        td1.textContent = r[0];
+        var td2 = document.createElement('td');
+        td2.style.cssText = 'padding:8px 12px;border-bottom:1px solid #e4e6eb;';
+        td2.textContent = r[1];
+        tr.appendChild(td1);
+        tr.appendChild(td2);
+        tbl.appendChild(tr);
+      });
+      tableWrap.appendChild(tbl);
+      box.appendChild(tableWrap);
+
+      // Message
+      var msgLabel = document.createElement('div');
+      msgLabel.style.cssText = 'margin-top:16px;margin-bottom:8px;';
+      msgLabel.innerHTML = '<strong>' + _t('message') + ':</strong>';
+      var msgBox = document.createElement('div');
+      msgBox.style.cssText = 'background:#f0f2f5;border-radius:8px;padding:12px;white-space:pre-wrap;font-size:14px;line-height:1.5;';
+      msgBox.textContent = p.message || ('(' + _t('no_message') + ')');
+      box.appendChild(msgLabel);
+      box.appendChild(msgBox);
+
+      overlay.appendChild(box);
+      document.body.appendChild(overlay);
+      overlay.addEventListener('click', function(e) { if (e.target === overlay) overlay.remove(); });
     }).catch(function() {});
   }
+  // ================================================================
+  // LEAD MANAGEMENT FUNCTIONS
+  // ================================================================
+  function loadLeads() {
+    var statusEl = document.getElementById('lead-status-filter');
+    var searchEl = document.getElementById('lead-search');
+    var status = statusEl ? statusEl.value : '';
+    var search = searchEl ? searchEl.value.toLowerCase() : '';
+    var url = '/api/leads-v2?limit=500' + (status ? '&status=' + status : '');
+    fetch(url).then(function(r) { return r.json(); }).then(function(d) {
+      var leads = d.leads || [];
+      if (search) {
+        leads = leads.filter(function(l) {
+          return (l.name || '').toLowerCase().indexOf(search) > -1 ||
+                 (l.email || '').toLowerCase().indexOf(search) > -1 ||
+                 (l.phone || '').indexOf(search) > -1;
+        });
+      }
+      renderLeadsTable(leads);
+      loadLeadStats();
+    }).catch(function() {});
+  }
+
+  function renderLeadsTable(leads) {
+    var tbody = document.getElementById('leads-table');
+    if (!leads.length) {
+      tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#65676b;padding:30px;">' + _t('no_leads') + '</td></tr>';
+      return;
+    }
+    var html = '';
+    leads.forEach(function(l) {
+      var statusClass = l.status === 'converted' ? 'badge badge-success' : l.status === 'trial_booked' ? 'badge badge-warning' : l.status === 'contacted' ? 'badge badge-info' : l.status === 'lost' ? 'badge badge-danger' : 'badge';
+      html += '<tr>' +
+        '<td>' + _esc(l.name || '-') + '</td>' +
+        '<td>' + _esc(l.email || '-') + '</td>' +
+        '<td>' + _esc(l.phone || '-') + '</td>' +
+        '<td><strong>' + (l.score || 0) + '</strong></td>' +
+        '<td><span class="' + statusClass + '">' + _t(l.status || 'new') + '</span></td>' +
+        '<td>' + _esc(l.source || 'meta') + '</td>' +
+        '<td>' +
+        '<button class="btn btn-sm btn-primary" onclick="updateLeadStatus(\\'' + l.lead_id + '\\',\\'contacted\\')" title="' + _t('contacted') + '">' + _t('contacted') + '</button> ' +
+        '<button class="btn btn-sm btn-success" onclick="updateLeadStatus(\\'' + l.lead_id + '\\',\\'converted\\')" title="' + _t('converted') + '">' + _t('converted') + '</button> ' +
+        '<button class="btn btn-sm" style="background:#e4e6eb;" onclick="scoreLead(\\'' + l.lead_id + '\\')" title="' + _t('score') + '">' + _t('score') + '</button> ' +
+        '<button class="btn btn-sm btn-danger" onclick="deleteLead(\\'' + l.lead_id + '\\')" title="' + _t('delete') + '">' + _t('delete') + '</button>' +
+        '</td></tr>';
+    });
+    tbody.innerHTML = html;
+  }
+
+  function loadLeadStats() {
+    fetch('/api/leads-v2/stats').then(function(r) { return r.json(); }).then(function(d) {
+      if (d.total !== undefined) document.getElementById('lead-stat-total').textContent = d.total;
+      if (d.by_status) {
+        document.getElementById('lead-stat-new').textContent = d.by_status.new || 0;
+        document.getElementById('lead-stat-contacted').textContent = d.by_status.contacted || 0;
+        document.getElementById('lead-stat-converted').textContent = d.by_status.converted || 0;
+      }
+      if (d.average_score !== undefined) document.getElementById('lead-stat-avg-score').textContent = d.average_score;
+    }).catch(function() {});
+  }
+
+  function fetchMetaLeads() {
+    showToast(_t('fetching_leads'));
+    fetch('/api/leads-v2/fetch-meta', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
+      .then(function(r) { return r.json(); }).then(function(d) {
+        if (d.success) { showToast('Fetched ' + d.leads_count + ' leads!'); loadLeads(); }
+        else { showToast('Error: ' + (d.error || '')); }
+      }).catch(function() {});
+  }
+
+  function updateLeadStatus(leadId, status) {
+    fetch('/api/leads-v2/status/' + leadId, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({status:status})})
+      .then(function(r) { return r.json(); }).then(function(d) {
+        if (d.success) { showToast('Lead ' + status + '!'); loadLeads(); }
+      }).catch(function() {});
+  }
+
+  function scoreLead(leadId) {
+    fetch('/api/leads-v2/score/' + leadId, {method:'POST'})
+      .then(function(r) { return r.json(); }).then(function(d) {
+        if (d.success) { showToast(_t('score') + ': ' + d.score); loadLeads(); }
+      }).catch(function() {});
+  }
+
+  function deleteLead(leadId) {
+    if (!confirm('Delete this lead?')) return;
+    fetch('/api/leads-v2/delete/' + leadId, {method:'POST'})
+      .then(function(r) { return r.json(); }).then(function(d) {
+        if (d.success) { showToast(_t('lead_deleted')); loadLeads(); }
+      }).catch(function() {});
+  }
+
+  function openAddLeadModal() {
+    document.getElementById('add-lead-modal').classList.add('open');
+  }
+
+  function closeAddLeadModal() {
+    document.getElementById('add-lead-modal').classList.remove('open');
+  }
+
+  function saveLead() {
+    var name = document.getElementById('lead-name').value;
+    var email = document.getElementById('lead-email').value;
+    var phone = document.getElementById('lead-phone').value;
+    var notes = document.getElementById('lead-notes').value;
+    if (!name) { showToast(_t('name_required')); return; }
+    fetch('/api/leads-v2/add', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name:name, email:email, phone:phone, notes:notes})})
+      .then(function(r) { return r.json(); }).then(function(d) {
+        if (d.success) { showToast(_t('lead_added')); closeAddLeadModal(); loadLeads(); }
+        else { showToast('Error: ' + (d.error || '')); }
+      }).catch(function() {});
+  }
+
+  function loadWorkflows() {
+    fetch('/api/leads-v2/workflows').then(function(r) { return r.json(); }).then(function(d) {
+      var wfs = d.workflows || [];
+      var container = document.getElementById('workflows-list');
+      if (!wfs.length) {
+        container.innerHTML = '<p style="color:#65676b;">' + _t('no_leads') + '</p>';
+        return;
+      }
+      var html = '';
+      wfs.forEach(function(w) {
+        html += '<div style="padding:10px 14px;background:#f0f2f5;border-radius:8px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;">' +
+          '<div><strong>' + _esc(w.name) + '</strong> <span style="font-size:12px;color:#65676b;">(' + (w.steps || []).length + ' steps)</span></div>' +
+          '<button class="btn btn-sm btn-danger" onclick="deleteWorkflow(\\'' + w.id + '\\')">' + _t('delete') + '</button></div>';
+      });
+      container.innerHTML = html;
+    }).catch(function() {});
+  }
+
+  function openCreateWorkflowModal() {
+    document.getElementById('create-workflow-modal').classList.add('open');
+  }
+
+  function closeCreateWorkflowModal() {
+    document.getElementById('create-workflow-modal').classList.remove('open');
+  }
+
+  function saveWorkflow() {
+    var name = document.getElementById('wf-name').value;
+    var stepsStr = document.getElementById('wf-steps').value;
+    var steps = [];
+    try { steps = JSON.parse(stepsStr); } catch(e) { showToast(_t('invalid_json_steps')); return; }
+    if (!name) { showToast(_t('name_required')); return; }
+    fetch('/api/leads-v2/workflows/create', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name:name, steps:steps})})
+      .then(function(r) { return r.json(); }).then(function(d) {
+        if (d.success) { showToast(_t('workflow_created')); closeCreateWorkflowModal(); loadWorkflows(); }
+      }).catch(function() {});
+  }
+
+  function deleteWorkflow(wfId) {
+    if (!confirm('Delete this workflow?')) return;
+    fetch('/api/leads-v2/workflows/delete/' + wfId, {method:'POST'})
+      .then(function(r) { return r.json(); }).then(function(d) {
+        if (d.success) { showToast(_t('workflow_deleted')); loadWorkflows(); }
+      }).catch(function() {});
+  }
+
+  // ================================================================
+  // MULTI-PLATFORM SCHEDULER FUNCTIONS
+  // ================================================================
+  function loadMultiQueue() {
+    fetch('/api/multi-scheduler/queue').then(function(r) { return r.json(); }).then(function(d) {
+      var items = d.items || [];
+      var tbody = document.getElementById('multi-queue-table');
+      if (!items.length) {
+        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#65676b;padding:30px;">' + _t('no_scheduled_posts') + '</td></tr>';
+        return;
+      }
+      var html = '';
+      items.forEach(function(item) {
+        var platforms = (item.platforms || []).join(', ');
+        var sched = item.scheduled_time ? new Date(item.scheduled_time).toLocaleString() : 'Now';
+        var statusClass = item.status === 'published' ? 'badge badge-success' : item.status === 'partial' ? 'badge badge-warning' : 'badge';
+        var ctype = item.content_type || 'image';
+        var hasMedia = (item.media_file || item.media_files || []).length > 0;
+        html += '<tr>' +
+          '<td>' + _esc(platforms) + '</td>' +
+          '<td>' + _esc((item.message || '').substring(0, 50)) + '</td>' +
+          '<td>' + (ctype === 'video' ? _t('video') : ctype === 'carousel' ? _t('carousel') : _t('image')) + (hasMedia ? ' 📎' : '') + '</td>' +
+          '<td>' + sched + '</td>' +
+          '<td><span class="' + statusClass + '">' + _esc(item.status) + '</span></td>' +
+          '<td>' +
+          (item.status === 'pending' ? '<button class="btn btn-sm btn-primary" onclick="publishMultiItem(\\'' + item.id + '\\')">' + _t('publish') + '</button> ' : '') +
+          (item.results && item.results.facebook ? '<span style="font-size:11px;color:#65676b;">FB:' + (item.results.facebook.error || 'OK') + '</span> ' : '') +
+          (item.results && item.results.instagram ? '<span style="font-size:11px;color:#65676b;">IG:' + (item.results.instagram.error || 'OK') + '</span>' : '') +
+          '<button class="btn btn-sm btn-primary" onclick="openMultiRepeatModal(\\'' + item.id + '\\')" style="margin-left:4px;" title="' + _t('repeat') + '">🔁</button>' +
+          '<button class="btn btn-sm btn-danger" onclick="deleteMultiItem(\\'' + item.id + '\\')" style="margin-left:4px;">' + _t('delete') + '</button>' +
+          '</td></tr>';
+      });
+      tbody.innerHTML = html;
+    }).catch(function() {});
+  }
+
+  function publishMultiItem(itemId) {
+    fetch('/api/multi-scheduler/publish/' + itemId, {method:'POST'})
+      .then(function(r) { return r.json(); }).then(function(d) {
+        if (d.success) { showToast(_t('published')); loadMultiQueue(); }
+        else { showToast(_t('error')); }
+      }).catch(function() {});
+  }
+
+  function deleteMultiItem(itemId) {
+    if (!confirm('Delete this scheduled post?')) return;
+    fetch('/api/multi-scheduler/delete/' + itemId, {method:'POST'})
+      .then(function(r) { return r.json(); }).then(function(d) {
+        if (d.success) { showToast(_t('deleted')); loadMultiQueue(); }
+      }).catch(function() {});
+  }
+
+  var _mpUploadedMedia = '';
+  var _mpCarouselUrls = [];
+
+  function resetMpModal() {
+    document.getElementById('mp-headline').value = '';
+    document.getElementById('mp-message').value = '';
+    document.getElementById('mp-ai-instruction').value = '';
+    document.getElementById('mp-cta').value = 'LEARN_MORE';
+    document.getElementById('mp-link').value = '';
+    document.getElementById('mp-schedule-date').value = '';
+    document.getElementById('mp-schedule-hour').value = '';
+    document.getElementById('mp-schedule-min').value = '';
+    document.getElementById('mp-schedule-ampm').value = 'AM';
+    document.getElementById('mp-schedule').value = '';
+    document.getElementById('mp-status').innerHTML = '';
+    resetMpPreview();
+  }
+
+  function openMultiScheduleModal() {
+    try {
+      resetMpModal();
+      document.getElementById('multi-schedule-modal').classList.add('open');
+    } catch(e) {
+      console.error('Error in openMultiScheduleModal:', e);
+      document.getElementById('multi-schedule-modal').classList.add('open');
+    }
+  }
+  
+    function closeMultiScheduleModal() {
+      document.getElementById('multi-schedule-modal').classList.remove('open');
+    }
+
+  function resetMpPreview() {
+    document.getElementById('mp-upload-preview').style.display = 'none';
+    document.getElementById('mp-upload-placeholder').style.display = '';
+    document.getElementById('mp-carousel-thumbs').innerHTML = '';
+    document.getElementById('mp-preview-video').style.display = 'none';
+    document.getElementById('mp-preview-video').src = '';
+    document.getElementById('mp-preview-filename').textContent = '';
+    document.getElementById('mp-img-count').textContent = '0';
+    _mpUploadedMedia = '';
+    _mpCarouselUrls = [];
+  }
+
+  // mp-media-input onchange is handled inline via HTML attribute
+
+  function handleMpMediaUpload(files) {
+    if (!files || files.length === 0) return;
+    var statusEl = document.getElementById('mp-status');
+    var isVideo = files[0].type.startsWith('video/');
+    _mpUploadedMedia = '';
+    _mpCarouselUrls = [];
+    if (isVideo) {
+      var fd = new FormData();
+      fd.append('media', files[0]);
+      statusEl.innerHTML = _t('uploading_video');
+      fetch('/api/upload-media', {method:'POST', body:fd}).then(function(r) { return r.json(); }).then(function(d) {
+        if (d.success) {
+          _mpUploadedMedia = d.url;
+          document.getElementById('mp-upload-placeholder').style.display = 'none';
+          document.getElementById('mp-upload-preview').style.display = '';
+          document.getElementById('mp-preview-video').src = d.url;
+          document.getElementById('mp-preview-video').style.display = 'block';
+          document.getElementById('mp-preview-filename').textContent = files[0].name;
+          statusEl.innerHTML = _t('video_uploaded');
+        } else { statusEl.innerHTML = _t('upload_failed'); }
+      }).catch(function() { statusEl.innerHTML = _t('upload_error'); });
+    } else {
+      var uploadNext = function(i) {
+        if (i >= files.length) {
+          document.getElementById('mp-upload-placeholder').style.display = 'none';
+          document.getElementById('mp-upload-preview').style.display = '';
+          document.getElementById('mp-img-count').textContent = files.length;
+          document.getElementById('mp-preview-filename').textContent = files.length + ' ' + _t('selected');
+          var thumbs = document.getElementById('mp-carousel-thumbs');
+          thumbs.innerHTML = _mpCarouselUrls.map(function(u) {
+            return '<div style="position:relative;display:inline-block;"><img src="' + u + '" style="width:80px;height:80px;object-fit:cover;border-radius:6px;border:2px solid #ddd;"></div>';
+          }).join('');
+          statusEl.innerHTML = _mpCarouselUrls.length + ' ' + _t('images_uploaded');
+          return;
+        }
+        var fd = new FormData();
+        fd.append('media', files[i]);
+        statusEl.innerHTML = _t('uploading') + ' ' + (i+1) + '/' + files.length;
+        fetch('/api/upload-media', {method:'POST', body:fd}).then(function(r) { return r.json(); }).then(function(d) {
+          if (d.success) { _mpCarouselUrls.push(d.url); }
+          uploadNext(i+1);
+        }).catch(function() { uploadNext(i+1); });
+      };
+      uploadNext(0);
+    }
+  }
+
+  function generateMpCopy() {
+    var instruction = document.getElementById('mp-ai-instruction').value.trim() || 'promote a business';
+    document.getElementById('mp-status').innerHTML = _t('generating');
+    fetch('/api/generate-ad-copy', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({instruction: instruction, count: 3})})
+      .then(function(r) { return r.json(); }).then(function(d) {
+        if (d.headlines && d.headlines.length) {
+          document.getElementById('mp-headline').value = d.headlines[0] || '';
+          document.getElementById('mp-message').value = d.messages ? d.messages.join('\\n\\n') : '';
+          document.getElementById('mp-status').innerHTML = _t('ad_copy_generated');
+          setTimeout(function() { document.getElementById('mp-status').innerHTML = ''; }, 3000);
+        } else { document.getElementById('mp-status').innerHTML = _t('generation_failed'); }
+      }).catch(function() { document.getElementById('mp-status').innerHTML = _t('error'); });
+  }
+
+  function generateRptCopy() {
+    var instruction = document.getElementById('rpt-ai-instruction').value.trim() || 'promote a business';
+    document.getElementById('rpt-status').innerHTML = _t('generating');
+    fetch('/api/generate-ad-copy', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({instruction: instruction, count: 3})})
+      .then(function(r) { return r.json(); }).then(function(d) {
+        if (d.headlines && d.headlines.length) {
+          document.getElementById('rpt-headline').value = d.headlines[0] || '';
+          document.getElementById('rpt-message').value = d.messages ? d.messages.join('\\n\\n') : '';
+          document.getElementById('rpt-status').innerHTML = _t('ad_copy_generated');
+          setTimeout(function() { document.getElementById('rpt-status').innerHTML = ''; }, 3000);
+        } else { document.getElementById('rpt-status').innerHTML = _t('generation_failed'); }
+      }).catch(function() { document.getElementById('rpt-status').innerHTML = _t('error'); });
+  }
+
+  function submitMultiPost(statusOverride) {
+    var platforms = [];
+    document.querySelectorAll('.mp-platform:checked').forEach(function(cb) { platforms.push(cb.value); });
+    if (!platforms.length) { showToast(_t('select_platform')); return; }
+    var headline = document.getElementById('mp-headline').value.trim();
+    var message = document.getElementById('mp-message').value.trim();
+    var aiInstruction = document.getElementById('mp-ai-instruction').value.trim();
+    var cta = document.getElementById('mp-cta').value;
+    var linkUrl = document.getElementById('mp-link').value.trim();
+    var schedule = document.getElementById('mp-schedule').value;
+    var isCarousel = _mpCarouselUrls.length > 0;
+    var isVideo = !isCarousel && _mpUploadedMedia && document.getElementById('mp-preview-video').style.display !== 'none' && document.getElementById('mp-preview-video').style.display !== '';
+    var payload = {
+      platforms: platforms,
+      headline: headline,
+      message: message,
+      ai_instruction: aiInstruction,
+      cta: cta,
+      link_url: linkUrl,
+      content_type: isVideo ? 'video' : (isCarousel ? 'carousel' : 'image'),
+      media_file: isCarousel ? '' : _mpUploadedMedia,
+      media_files: _mpCarouselUrls,
+      scheduled_time: schedule || null
+    };
+    if (statusOverride === 'draft') {
+      payload.scheduled_time = null;
+    }
+    var statusEl = document.getElementById('mp-status');
+    statusEl.innerHTML = _t('saving');
+    var url = '/api/multi-scheduler/schedule';
+    fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)})
+      .then(function(r) { return r.json(); }).then(function(d) {
+        if (d.success) {
+          statusEl.innerHTML = _t('saved');
+          showToast(_t('post_scheduled'));
+          setTimeout(function() { closeMultiScheduleModal(); loadMultiQueue(); }, 800);
+        } else { statusEl.innerHTML = _t('error') + ': ' + (d.error || ''); }
+      }).catch(function(e) { statusEl.innerHTML = 'Error: ' + e.message; });
+  }
+
+  function saveMultiDraft() { submitMultiPost('draft'); }
+  function saveMultiSchedule() { submitMultiPost(null); }
+
+  function publishMultiNow() {
+    var scheduleEl = document.getElementById('mp-schedule');
+    scheduleEl.value = '';
+    submitMultiPost(null);
+  }  // AUTO RESPONDER FUNCTIONS
+  // ================================================================
+  function loadResponder() {
+    fetch('/api/responder/status').then(function(r) { return r.json(); }).then(function(d) {
+      document.getElementById('responder-enabled').checked = d.enabled;
+      document.getElementById('responder-use-ai').checked = d.use_ai;
+      document.getElementById('responder-default').value = d.rules.default_response || '';
+    }).catch(function() {});
+    loadResponderRules();
+    loadResponderLog();
+  }
+
+  function loadResponderRules() {
+    fetch('/api/responder/rules').then(function(r) { return r.json(); }).then(function(d) {
+      var rules = d.rules || [];
+      var container = document.getElementById('responder-rules');
+      if (!rules.length) {
+        container.innerHTML = '<p style="color:#65676b;">' + _t('no_leads') + '</p>';
+        return;
+      }
+      var html = '';
+      rules.forEach(function(rule) {
+        html += '<div style="padding:10px 14px;background:#f0f2f5;border-radius:8px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center;">' +
+          '<div><strong>' + _esc(rule.keyword) + '</strong> &rarr; ' + _esc(rule.response_template) + ' <span style="font-size:12px;color:#65676b;">(' + rule.platform + ')</span></div>' +
+          '<button class="btn btn-sm btn-danger" onclick="deleteRule(\\'' + rule.id + '\\')">' + _t('delete') + '</button></div>';
+      });
+      container.innerHTML = html;
+    }).catch(function() {});
+  }
+
+  function loadResponderLog() {
+    fetch('/api/responder/log?limit=20').then(function(r) { return r.json(); }).then(function(d) {
+      var logs = d.responses || [];
+      var tbody = document.getElementById('responder-log-table');
+      if (!logs.length) {
+        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#65676b;padding:30px;">' + _t('no_responses') + '</td></tr>';
+        return;
+      }
+      var html = '';
+      logs.forEach(function(log) {
+        var statusClass = log.success ? 'badge badge-success' : 'badge badge-danger';
+        html += '<tr>' +
+          '<td>' + (log.timestamp || '-') + '</td>' +
+          '<td>' + _esc(log.from_name || '-') + '</td>' +
+          '<td>' + _esc((log.original_message || '').substring(0, 50)) + '</td>' +
+          '<td>' + _esc((log.response || '').substring(0, 50)) + '</td>' +
+          '<td><span class="' + statusClass + '">' + (log.success ? 'OK' : 'FAIL') + '</span></td></tr>';
+      });
+      tbody.innerHTML = html;
+    }).catch(function() {});
+  }
+
+  function toggleResponder() {
+    var enabled = document.getElementById('responder-enabled').checked;
+    fetch('/api/responder/toggle', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled:enabled})})
+      .then(function(r) { return r.json(); }).then(function(d) {
+        if (d.success) showToast(enabled ? 'Responder enabled' : 'Responder disabled');
+      }).catch(function() {});
+  }
+
+  function toggleResponderAI() {
+    var enabled = document.getElementById('responder-use-ai').checked;
+    fetch('/api/responder/ai-mode', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled:enabled})})
+      .then(function(r) { return r.json(); }).then(function(d) {
+        if (d.success) showToast('AI mode ' + (enabled ? 'on' : 'off'));
+      }).catch(function() {});
+  }
+
+  function saveDefaultResponse() {
+    var text = document.getElementById('responder-default').value;
+    fetch('/api/responder/default-response', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text:text})})
+      .then(function(r) { return r.json(); }).then(function(d) {
+        if (d.success) showToast(_t('default_response_saved'));
+      }).catch(function() {});
+  }
+
+  function openAddRuleModal() {
+    document.getElementById('add-rule-modal').classList.add('open');
+  }
+
+  function closeAddRuleModal() {
+    document.getElementById('add-rule-modal').classList.remove('open');
+  }
+
+  function saveRule() {
+    var keyword = document.getElementById('rule-keyword').value;
+    var response = document.getElementById('rule-response').value;
+    var platform = document.getElementById('rule-platform').value;
+    if (!keyword || !response) { showToast(_t('keyword_response_required')); return; }
+    fetch('/api/responder/rules/add', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({keyword:keyword, response_template:response, platform:platform})})
+      .then(function(r) { return r.json(); }).then(function(d) {
+        if (d.success) { showToast(_t('rule_added')); closeAddRuleModal(); loadResponderRules(); }
+      }).catch(function() {});
+  }
+
+  function deleteRule(ruleId) {
+    if (!confirm('Delete this rule?')) return;
+    fetch('/api/responder/rules/delete/' + ruleId, {method:'POST'})
+      .then(function(r) { return r.json(); }).then(function(d) {
+        if (d.success) { showToast(_t('rule_deleted')); loadResponderRules(); }
+      }).catch(function() {});
+  }
+
+  function scanComments() {
+    showToast(_t('scanning_comments'));
+    fetch('/api/responder/scan', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({limit:20})})
+      .then(function(r) { return r.json(); }).then(function(d) {
+        if (d.success) { showToast('Responded to ' + (d.results || []).length + ' comments!'); loadResponderLog(); }
+        else { showToast(_t('error_scanning')); }
+      }).catch(function() {});
+  }
+
   // ================================================================
 
   // Inject Meta Pixel if configured
@@ -4173,27 +6853,1102 @@ translateDOM();
     }
   }).catch(function() {});
 </script>
+
+<!-- ===== PAGE: LEADS ===== -->
+<div class="page" id="page-leads">
+  <div class="section">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+      <h2 data-i18n="lead_management">Lead Management</h2>
+      <div style="display:flex;gap:8px;">
+        <button class="btn btn-primary" onclick="fetchMetaLeads()" data-i18n="fetch_leads">Fetch from Meta</button>
+        <button class="btn" onclick="openAddLeadModal()" data-i18n="add_lead">+ Add Lead</button>
+        <button class="btn" onclick="loadLeads()" style="background:#e4e6eb;" data-i18n="refresh">Refresh</button>
+      </div>
+    </div>
+  </div>
+  <div class="grid" id="lead-stats-row" style="margin-bottom:16px;">
+    <div class="stat-card"><div class="num" id="lead-stat-total">0</div><div class="label" data-i18n="total_leads">Total Leads</div></div>
+    <div class="stat-card"><div class="num" id="lead-stat-new">0</div><div class="label" data-i18n="new_leads">New</div></div>
+    <div class="stat-card"><div class="num" id="lead-stat-contacted">0</div><div class="label" data-i18n="contacted">Contacted</div></div>
+    <div class="stat-card"><div class="num" id="lead-stat-converted">0</div><div class="label" data-i18n="converted">Converted</div></div>
+    <div class="stat-card"><div class="num" id="lead-stat-avg-score">0</div><div class="label" data-i18n="avg_score">Avg Score</div></div>
+  </div>
+  <div class="section">
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+      <select id="lead-status-filter" onchange="loadLeads()" style="padding:6px;border:1px solid #ddd;border-radius:6px;">
+        <option value="" data-i18n="all">All</option>
+        <option value="new" data-i18n="new">New</option>
+        <option value="contacted" data-i18n="contacted">Contacted</option>
+        <option value="trial_booked" data-i18n="trial_booked">Trial Booked</option>
+        <option value="converted" data-i18n="converted">Converted (Enrolled)</option>
+        <option value="lost" data-i18n="lost">Lost</option>
+      </select>
+      <input type="text" id="lead-search" data-i18n-placeholder="search_leads" placeholder="Search leads..." oninput="loadLeads()" style="padding:6px;border:1px solid #ddd;border-radius:6px;flex:1;min-width:150px;">
+    </div>
+    <table>
+      <thead><tr><th data-i18n="name">Name</th><th data-i18n="email">Email</th><th data-i18n="phone">Phone</th><th data-i18n="score">Score</th><th data-i18n="status">Status</th><th data-i18n="source">Source</th><th data-i18n="actions">Actions</th></tr></thead>
+      <tbody id="leads-table">
+        <tr><td colspan="7" style="text-align:center;color:#65676b;padding:30px;" data-i18n="no_leads">No leads yet.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="section">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <h3 data-i18n="workflows">Workflows</h3>
+      <button class="btn btn-sm btn-primary" onclick="openCreateWorkflowModal()" data-i18n="create_workflow">+ Create Workflow</button>
+    </div>
+    <div id="workflows-list" style="margin-top:12px;"></div>
+  </div>
+</div>
+
+<!-- Add Lead Modal -->
+<div class="modal-bg" id="add-lead-modal">
+  <div class="modal" style="max-width:460px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
+      <h3 data-i18n="add_lead">Add Lead</h3>
+      <button onclick="closeAddLeadModal()" style="background:none;border:none;font-size:1.4rem;cursor:pointer;">x</button>
+    </div>
+    <div class="form-group"><label data-i18n="name">Name</label><input type="text" id="lead-name" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;"></div>
+    <div class="form-group"><label data-i18n="email">Email</label><input type="email" id="lead-email" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;"></div>
+    <div class="form-group"><label data-i18n="phone">Phone</label><input type="text" id="lead-phone" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;"></div>
+    <div class="form-group"><label data-i18n="notes">Notes</label><textarea id="lead-notes" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;min-height:60px;"></textarea></div>
+    <button class="btn btn-primary" onclick="saveLead()" data-i18n="save_lead">Save Lead</button>
+  </div>
+</div>
+
+<!-- Create Workflow Modal -->
+<div class="modal-bg" id="create-workflow-modal">
+  <div class="modal" style="max-width:500px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
+      <h3 data-i18n="create_workflow">Create Workflow</h3>
+      <button onclick="closeCreateWorkflowModal()" style="background:none;border:none;font-size:1.4rem;cursor:pointer;">x</button>
+    </div>
+    <div class="form-group"><label data-i18n="workflow_name">Workflow Name</label><input type="text" id="wf-name" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;"></div>
+    <div class="form-group"><label data-i18n="workflow_steps">Steps (JSON array)</label><textarea id="wf-steps" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;min-height:100px;" placeholder='[{"type":"email","template":"Hello {{name}}..."},{"type":"wait","duration":"1d"},{"type":"update_status","status":"contacted"}]'></textarea></div>
+    <button class="btn btn-primary" onclick="saveWorkflow()" data-i18n="save_workflow">Save Workflow</button>
+  </div>
+</div>
+
+<!-- ===== PAGE: MULTI-PLATFORM ===== -->
+<div class="page" id="page-multiplatform">
+  <div class="section">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+      <h2 data-i18n="multi_platform_scheduler">Multi-Platform Scheduler</h2>
+      <div style="display:flex;gap:8px;">
+        <button class="btn btn-primary" onclick="openMultiScheduleModal()" data-i18n="schedule_post">+ Schedule Post</button>
+        <button class="btn" onclick="loadMultiQueue()" style="background:#e4e6eb;" data-i18n="refresh">Refresh</button>
+      </div>
+    </div>
+  </div>
+  <div class="section" style="overflow-x:auto;">
+    <table>
+      <thead><tr><th data-i18n="platforms">Platforms</th><th data-i18n="message">Message</th><th data-i18n="type">Type</th><th data-i18n="scheduled">Scheduled</th><th data-i18n="status">Status</th><th data-i18n="actions">Actions</th></tr></thead>
+      <tbody id="multi-queue-table">
+        <tr><td colspan="6" style="text-align:center;color:#65676b;padding:30px;" data-i18n="no_scheduled_posts">No scheduled posts.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Multi-Platform Schedule Modal -->
+<div class="modal-bg" id="multi-schedule-modal">
+  <div class="modal" style="max-width:560px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
+      <h3 data-i18n="schedule_post">Schedule Post</h3>
+      <button onclick="closeMultiScheduleModal()" style="background:none;border:none;font-size:1.4rem;cursor:pointer;">x</button>
+    </div>
+    <div class="form-group">
+      <label data-i18n="platforms">Platforms</label>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;">
+        <label><input type="checkbox" class="mp-platform" value="facebook" checked> <span data-i18n="facebook">Facebook</span></label>
+        <label><input type="checkbox" class="mp-platform" value="instagram"> <span data-i18n="instagram">Instagram</span></label>
+      </div>
+    </div>
+    <div class="form-group">
+      <label data-i18n="headline">Headline</label>
+      <div style="display:flex;gap:6px;">
+        <input type="text" id="mp-headline" placeholder="e.g. Special Offer!" maxlength="40" style="flex:1;padding:8px;border:1px solid #ddd;border-radius:6px;">
+        <button class="btn btn-sm btn-outline" onclick="generateMpCopy()" style="white-space:nowrap;flex-shrink:0;" data-i18n="gen_ai">Gen AI</button>
+        <a href="https://chat.openai.com" target="_blank" class="btn btn-sm btn-outline" style="white-space:nowrap;flex-shrink:0;text-decoration:none;background:#10a37f;color:#fff;border-color:#10a37f;" data-i18n="chatgpt" title="Open ChatGPT">ChatGPT</a>
+      </div>
+    </div>
+    <div class="form-group">
+      <label data-i18n="primary_text">Primary Text</label>
+      <div style="display:flex;gap:6px;align-items:flex-start;">
+        <textarea id="mp-message" style="flex:1;padding:8px;border:1px solid #ddd;border-radius:6px;min-height:60px;" data-i18n-placeholder="write_post" placeholder="Write your post..."></textarea>
+        <button class="btn btn-sm btn-outline" onclick="generateMpCopy()" style="white-space:nowrap;flex-shrink:0;" data-i18n="gen_ai">Gen AI</button>
+      </div>
+    </div>
+    <div class="form-group">
+      <label data-i18n="ai_instruction">AI Instruction</label>
+      <textarea id="mp-ai-instruction" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;resize:vertical;min-height:50px;" data-i18n-placeholder="ai_instruction_placeholder" placeholder="Describe what to promote. AI will use this to generate unique headlines and text."></textarea>
+    </div>
+    <div class="form-group">
+      <label data-i18n="cta">Call to Action</label>
+      <select id="mp-cta" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;">
+        <option value="LEARN_MORE" data-i18n="cta_learn_more">Learn More</option>
+        <option value="SIGN_UP" data-i18n="cta_sign_up">Sign Up</option>
+        <option value="CONTACT_US" data-i18n="cta_contact_us">Contact Us</option>
+        <option value="BOOK_NOW" data-i18n="cta_book_now">Book Now</option>
+        <option value="GET_OFFER" data-i18n="cta_get_offer">Get Offer</option>
+        <option value="SUBSCRIBE" data-i18n="cta_subscribe">Subscribe</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label data-i18n="dest_url">Destination URL</label>
+      <input type="url" id="mp-link" placeholder="https://your-site.com/page" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;">
+    </div>
+    <div class="form-group">
+      <label data-i18n="upload_media">Media</label>
+      <div class="upload-zone" onclick="document.getElementById('mp-media-input').click()" style="border:2px dashed #ddd;border-radius:8px;padding:20px;text-align:center;cursor:pointer;">
+        <div id="mp-upload-placeholder" style="color:#65676b;">
+          <div style="font-size:2rem;margin-bottom:8px;">+</div>
+          <div data-i18n="click_to_upload">Click to upload images (multiple allowed)</div>
+          <div style="font-size:.75rem;margin-top:4px;" data-i18n="media_hint">Select multiple images for carousel, or one video</div>
+        </div>
+        <div id="mp-upload-preview" style="display:none;">
+          <div id="mp-carousel-thumbs" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px;"></div>
+          <video id="mp-preview-video" style="max-height:120px;border-radius:6px;display:none;" controls></video>
+          <div id="mp-preview-filename" style="font-size:.85rem;margin-top:6px;font-weight:600;"></div>
+        </div>
+      </div>
+      <input type="file" id="mp-media-input" accept="image/*,video/*" style="display:none" multiple onchange="handleMpMediaUpload(this.files)">
+      <div style="margin-top:6px;font-size:.8rem;color:#65676b;">
+        <span><span data-i18n="images">Images</span>: <span id="mp-img-count">0</span> | </span>
+        <a href="#" onclick="event.preventDefault();document.getElementById('mp-media-input').click();return false;" style="color:#1877f2;" data-i18n="add_more">Add more</a>
+      </div>
+    </div>
+    <div class="form-group">
+      <label data-i18n="schedule_label">Schedule (optional — leave empty for draft)</label>
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
+        <input type="date" id="mp-schedule-date" style="flex:1;min-width:140px;padding:8px;border:1px solid #ddd;border-radius:6px;">
+        <select id="mp-schedule-hour" style="padding:8px;border:1px solid #ddd;border-radius:6px;width:70px;">
+          <option value="">HH</option><option>12</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option><option>10</option><option>11</option>
+        </select>
+        <span style="font-weight:700;">:</span>
+        <select id="mp-schedule-min" style="padding:8px;border:1px solid #ddd;border-radius:6px;width:70px;">
+          <option value="">MM</option><option>00</option><option>15</option><option>30</option><option>45</option>
+        </select>
+        <select id="mp-schedule-ampm" style="padding:8px;border:1px solid #ddd;border-radius:6px;width:75px;">
+          <option value="AM">AM</option><option value="PM">PM</option>
+        </select>
+      </div>
+      <input type="hidden" id="mp-schedule" value="">
+    </div>
+    <div class="form-group" style="display:flex;gap:8px;flex-wrap:wrap;">
+      <button class="btn btn-primary" onclick="saveMultiDraft()" style="flex:1;" data-i18n="save_draft">Save as Draft</button>
+      <button class="btn btn-success" onclick="saveMultiSchedule()" style="flex:1;" data-i18n="schedule_post">Schedule</button>
+      <button class="btn btn-warn" onclick="publishMultiNow()" style="flex:1;" data-i18n="publish_post">Publish Now</button>
+    </div>
+    <div id="mp-status" style="margin-top:12px;font-size:.85rem;text-align:center;"></div>
+  </div>
+</div>
+
+<!-- ===== PAGE: AUTO RESPONDER ===== -->
+<div class="page" id="page-responder">
+  <div class="section">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+      <h2 data-i18n="auto_responder">Social Media Auto Responder</h2>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <label style="display:flex;align-items:center;gap:6px;font-size:14px;">
+          <span data-i18n="enabled">Enabled</span>
+          <input type="checkbox" id="responder-enabled" onchange="toggleResponder()" checked>
+        </label>
+        <button class="btn btn-primary" onclick="openAddRuleModal()" data-i18n="add_rule">+ Add Rule</button>
+        <button class="btn" onclick="scanComments()" data-i18n="scan_comments">Scan & Respond</button>
+        <button class="btn" onclick="loadResponder()" style="background:#e4e6eb;" data-i18n="refresh">Refresh</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="grid" style="margin-bottom:16px;">
+    <div class="section">
+      <h3 style="margin-bottom:8px;" data-i18n="settings">Settings</h3>
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+        <label style="display:flex;align-items:center;gap:6px;font-size:14px;">
+          <span data-i18n="use_ai">Use AI Responses</span>
+          <input type="checkbox" id="responder-use-ai" onchange="toggleResponderAI()">
+        </label>
+        <div style="display:flex;gap:6px;align-items:center;flex:1;">
+          <span style="font-size:13px;" data-i18n="default_response">Default:</span>
+          <input type="text" id="responder-default" style="flex:1;padding:6px;border:1px solid #ddd;border-radius:6px;font-size:13px;" placeholder="Thank you for your comment!">
+          <button class="btn btn-sm btn-primary" onclick="saveDefaultResponse()" data-i18n="save">Save</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="section" style="overflow-x:auto;">
+    <h3 style="margin-bottom:8px;" data-i18n="auto_reply_rules">Auto-Reply Rules</h3>
+    <div id="responder-rules"></div>
+  </div>
+
+  <div class="section" style="overflow-x:auto;">
+    <h3 style="margin-bottom:8px;" data-i18n="response_log">Response Log</h3>
+    <table>
+      <thead><tr><th data-i18n="date">Date</th><th data-i18n="from">From</th><th data-i18n="comment">Comment</th><th data-i18n="response">Response</th><th data-i18n="status">Status</th></tr></thead>
+      <tbody id="responder-log-table">
+        <tr><td colspan="5" style="text-align:center;color:#65676b;padding:30px;" data-i18n="no_responses">No responses yet.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Add Rule Modal -->
+<div class="modal-bg" id="add-rule-modal">
+  <div class="modal" style="max-width:460px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
+      <h3 data-i18n="add_rule">Add Rule</h3>
+      <button onclick="closeAddRuleModal()" style="background:none;border:none;font-size:1.4rem;cursor:pointer;">x</button>
+    </div>
+    <div class="form-group"><label data-i18n="keyword">Keyword</label><input type="text" id="rule-keyword" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;" placeholder="e.g. price, help, thanks"></div>
+    <div class="form-group"><label data-i18n="response">Response</label><textarea id="rule-response" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;min-height:60px;" placeholder="Thank you for your question!"></textarea></div>
+    <div class="form-group"><label data-i18n="platform">Platform</label>
+      <select id="rule-platform" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;">
+        <option value="all" data-i18n="all">All</option>
+        <option value="facebook">Facebook</option>
+        <option value="instagram">Instagram</option>
+      </select>
+    </div>
+    <button class="btn btn-primary" onclick="saveRule()" data-i18n="save_rule">Save Rule</button>
+  </div>
+</div>
+
+<!-- ===== Multi-tenant login overlay ===== -->
+<!-- Hidden by default. Only appears if the backend says this browser needs to
+     log in (i.e. more than one tenant exists and this session isn't authenticated
+     for the one being requested). Single-studio setups never see this. -->
+<div id="tenant-login-overlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:99999; align-items:center; justify-content:center;">
+  <div style="background:#fff; border-radius:12px; padding:32px; width:340px; max-width:90vw; box-shadow:0 10px 40px rgba(0,0,0,0.3);">
+    <h2 style="margin:0 0 4px; font-size:20px;" data-i18n="login_title">Sign In</h2>
+    <p style="margin:0 0 20px; color:#666; font-size:13px;" data-i18n="login_desc">This dashboard has multiple clients configured. Enter your credentials.</p>
+    <div style="margin-bottom:12px;">
+      <label style="display:block; font-size:12px; color:#444; margin-bottom:4px;" data-i18n="login_client_id">Client</label>
+      <select id="tenant-login-id" style="width:100%; padding:8px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;"></select>
+    </div>
+    <div style="margin-bottom:16px;">
+      <label style="display:block; font-size:12px; color:#444; margin-bottom:4px;" data-i18n="password">Password</label>
+      <input id="tenant-login-pw" type="password" style="width:100%; padding:8px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;" onkeydown="if(event.key==='Enter') tenantLogin()">
+    </div>
+    <div id="tenant-login-error" style="color:#c0392b; font-size:12px; margin-bottom:12px; display:none;"></div>
+    <button onclick="tenantLogin()" style="width:100%; padding:10px; background:#2563eb; color:#fff; border:none; border-radius:6px; font-weight:600; cursor:pointer;" data-i18n="sign_in">Sign In</button>
+  </div>
+</div>
+
+<!-- Small badge showing which studio you're logged in as, top-right corner -->
+<div id="tenant-badge" style="display:none; position:fixed; top:10px; right:10px; background:#111827; color:#fff; padding:6px 12px; border-radius:20px; font-size:12px; z-index:9999; align-items:center; gap:8px;">
+  <span id="tenant-badge-name"></span>
+  <a href="#" onclick="tenantLogout(); return false;" style="color:#93c5fd; text-decoration:none;" data-i18n="logout">logout</a>
+</div>
+
+<!-- Demo mode banner + connect form -->
+<div id="demo-banner" style="display:none; position:fixed; top:0; left:0; right:0; background:linear-gradient(135deg,#f59e0b,#d97706); color:#fff; padding:12px 20px; z-index:99998; box-shadow:0 2px 8px rgba(0,0,0,0.2);">
+  <div style="display:flex; align-items:center; justify-content:space-between; max-width:800px; margin:0 auto; flex-wrap:wrap; gap:8px;">
+    <div>
+      <strong>Demo Mode</strong> — Connect your Facebook account to start running ads.
+    </div>
+    <button onclick="document.getElementById('connect-facebook-modal').style.display='flex'" style="background:#fff; color:#d97706; border:none; padding:8px 16px; border-radius:6px; font-weight:700; cursor:pointer; font-size:13px;">
+      Connect Facebook
+    </button>
+  </div>
+</div>
+
+<!-- Connect Facebook modal for demo clients -->
+<div id="connect-facebook-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:100000; align-items:center; justify-content:center;">
+  <div style="background:#fff; border-radius:12px; padding:28px; width:420px; max-width:90vw; box-shadow:0 10px 40px rgba(0,0,0,0.3);">
+    <h3 style="margin:0 0 4px; font-size:18px;">Connect Your Facebook</h3>
+    <p style="margin:0 0 16px; color:#666; font-size:13px;">Enter your Meta credentials to activate your account and start running ads.</p>
+    <div style="margin-bottom:10px;">
+      <label style="display:block; font-size:12px; color:#444; margin-bottom:4px;">Meta Access Token</label>
+      <input id="connect-meta-token" type="password" placeholder="EAAb9eZAR2Z..." style="width:100%; padding:8px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box; font-size:12px;">
+    </div>
+    <div style="margin-bottom:10px;">
+      <label style="display:block; font-size:12px; color:#444; margin-bottom:4px;">Ad Account ID</label>
+      <input id="connect-ad-account" type="text" placeholder="act_123456789" style="width:100%; padding:8px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;">
+    </div>
+    <div style="margin-bottom:10px;">
+      <label style="display:block; font-size:12px; color:#444; margin-bottom:4px;">Page Token (optional)</label>
+      <input id="connect-page-token" type="password" placeholder="EAAb9e..." style="width:100%; padding:8px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box; font-size:12px;">
+    </div>
+    <div id="connect-msg" style="color:#c0392b; font-size:12px; margin-bottom:10px; display:none;"></div>
+    <div style="display:flex; gap:8px;">
+      <button onclick="connectFacebook()" style="flex:1; padding:10px; background:#2563eb; color:#fff; border:none; border-radius:6px; font-weight:600; cursor:pointer;">Connect & Activate</button>
+      <button onclick="document.getElementById('connect-facebook-modal').style.display='none'" style="padding:10px; background:#e4e6eb; border:none; border-radius:6px; cursor:pointer;">Cancel</button>
+    </div>
+    <p style="margin:12px 0 0; color:#666; font-size:11px;">Don't have these? <a href="https://developers.facebook.com/tools/explorer/" target="_blank" style="color:#2563eb;">Learn how to get them</a></p>
+  </div>
+</div>
+
+<!-- Trial countdown banner -->
+<div id="trial-banner" style="display:none; position:fixed; top:0; left:0; right:0; background:linear-gradient(135deg,#3b82f6,#1d4ed8); color:#fff; padding:12px 20px; z-index:99998; box-shadow:0 2px 8px rgba(0,0,0,0.2);">
+  <div style="display:flex; align-items:center; justify-content:space-between; max-width:800px; margin:0 auto; flex-wrap:wrap; gap:8px;">
+    <div>
+      <span data-i18n="trial_remaining">Your trial ends in</span> <strong id="trial-days-num">0</strong> <span data-i18n="trial_days_label">days</span>.
+    </div>
+    <button onclick="openTrialActivate()" style="background:#fff; color:#1d4ed8; border:none; padding:8px 16px; border-radius:6px; font-weight:700; cursor:pointer; font-size:13px;" data-i18n="trial_activate_now">Activate Now</button>
+  </div>
+</div>
+
+<!-- Suspension overlay for expired trials -->
+<div id="trial-suspended-overlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:200000; align-items:center; justify-content:center;">
+  <div style="background:#fff; border-radius:16px; padding:40px; width:480px; max-width:90vw; box-shadow:0 10px 60px rgba(0,0,0,0.5); text-align:center;">
+    <div style="font-size:48px; margin-bottom:12px;">&#x1f534;</div>
+    <h2 style="margin:0 0 8px; font-size:22px; color:#111827;" data-i18n="trial_expired_title">Trial Expired</h2>
+    <p style="margin:0 0 20px; color:#6b7280; font-size:14px; line-height:1.5;" data-i18n="trial_expired_msg">Your 30-day trial has ended. Activate your account to keep using the dashboard.</p>
+    <button onclick="openTrialActivate()" style="padding:12px 32px; background:#2563eb; color:#fff; border:none; border-radius:8px; font-weight:700; cursor:pointer; font-size:15px; margin-bottom:12px;" data-i18n="trial_activate_btn">Activate Account</button>
+    <br>
+    <a href="#" onclick="tenantLogout(); return false;" style="color:#6b7280; font-size:12px; text-decoration:underline;" data-i18n="logout">logout</a>
+  </div>
+</div>
+
+<!-- Payment agreement modal -->
+<div id="agreement-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:200001; align-items:center; justify-content:center;">
+  <div style="background:#fff; border-radius:12px; padding:0; width:600px; max-width:90vw; max-height:85vh; box-shadow:0 10px 60px rgba(0,0,0,0.4); display:flex; flex-direction:column;">
+    <div style="padding:20px 24px 12px; border-bottom:1px solid #e5e7eb; flex-shrink:0;">
+      <h2 style="margin:0; font-size:18px;" data-i18n="agreement_title">Payment & Service Agreement</h2>
+    </div>
+    <div style="padding:20px 24px; overflow-y:auto; flex:1; font-size:13px; line-height:1.6; color:#374151;" id="agreement-content">
+    </div>
+    <div style="padding:16px 24px; border-top:1px solid #e5e7eb; flex-shrink:0;">
+      <label style="display:flex; align-items:flex-start; gap:8px; cursor:pointer; font-size:13px; margin-bottom:12px;">
+        <input type="checkbox" id="agreement-checkbox" style="margin-top:3px; width:16px; height:16px;">
+        <span data-i18n="agreement_accept_label">I have read and agree to the Payment & Service Agreement</span>
+      </label>
+      <div id="agreement-error" style="color:#c0392b; font-size:12px; margin-bottom:8px; display:none;"></div>
+      <button id="agreement-confirm-btn" onclick="confirmAgreement()" disabled style="width:100%; padding:10px; background:#2563eb; color:#fff; border:none; border-radius:6px; font-weight:600; cursor:not-allowed; opacity:0.5; font-size:14px;" data-i18n="agreement_confirm">I Accept</button>
+    </div>
+  </div>
+</div>
+
+<!-- Botón de pago configurable (solo admin) -->
+<div id="payment-link-widget" style="position:fixed; bottom:10px; right:10px; z-index:9999; display:none;">
+  <button id="payment-link-btn" onclick="openPaymentLink()" style="background:#2ca01c; color:#fff; border:none; padding:8px 14px; border-radius:6px; font-size:12px; cursor:pointer; box-shadow:0 2px 8px rgba(0,0,0,0.2);">
+    Payment
+  </button>
+</div>
+
+<script>
+async function openPaymentLink() {
+  var who = await fetch('/api/whoami').then(r => r.json());
+  if (who.role !== 'admin') return;
+  var url = prompt('Enter payment URL (Stripe, PayPal, QuickBooks, etc.):');
+  if (!url) return;
+  try { localStorage.setItem('payment_url', url); } catch(e) {}
+  window.open(url, '_blank');
+}
+async function showPaymentButton() {
+  var who = await fetch('/api/whoami').then(r => r.json());
+  if (who.role === 'admin') {
+    document.getElementById('payment-link-widget').style.display = 'block';
+    var savedUrl = '';
+    try { savedUrl = localStorage.getItem('payment_url') || ''; } catch(e) {}
+    if (savedUrl) {
+      document.getElementById('payment-link-btn').onclick = function() { window.open(savedUrl, '_blank'); };
+    }
+  }
+}
+document.addEventListener('DOMContentLoaded', showPaymentButton);
+async function checkDemoMode() {
+  try {
+    var who = await fetch('/api/whoami').then(r => r.json());
+    var tResp = await fetch('/api/tenants').then(r => r.json());
+    var tenant = (tResp.tenants || {})[who.tenant_id] || {};
+    if (tenant.demo_mode && who.role !== 'admin') {
+      document.getElementById('demo-banner').style.display = 'block';
+    }
+  } catch(e) {}
+}
+document.addEventListener('DOMContentLoaded', checkDemoMode);
+
+window.openTrialActivate = function() {
+  var who_cached = null;
+  fetch('/api/whoami').then(r => r.json()).then(function(who) {
+    who_cached = who;
+    return fetch('/api/tenants');
+  }).then(r => r.json()).then(function(tResp) {
+    var tenant = (tResp.tenants || {})[who_cached.tenant_id] || {};
+    var paymentUrl = tenant.payment_url || '';
+    if (paymentUrl) {
+      window.open(paymentUrl, '_blank');
+    } else {
+      alert(lang === 'es' ? 'No hay enlace de pago configurado. Contacte al administrador.' : 'No payment link configured. Please contact your administrator.');
+    }
+  }).catch(function() {
+    alert(lang === 'es' ? 'Error al obtener informacion.' : 'Error fetching information.');
+  });
+};
+
+async function checkTrialStatus() {
+  try {
+    var resp = await fetch('/api/trial-status').then(r => r.json());
+    if (!resp.success || resp.is_admin || resp.no_trial) return;
+    var banner = document.getElementById('trial-banner');
+    var overlay = document.getElementById('trial-suspended-overlay');
+    if (resp.trial_expired) {
+      overlay.style.display = 'flex';
+      document.body.style.overflow = 'hidden';
+    } else if (resp.trial_days_remaining <= 10) {
+      document.getElementById('trial-days-num').textContent = resp.trial_days_remaining;
+      banner.style.display = 'block';
+    }
+    var demoBanner = document.getElementById('demo-banner');
+    var topPadding = 0;
+    if (demoBanner && demoBanner.style.display !== 'none') topPadding += 50;
+    if (banner && banner.style.display !== 'none') topPadding += 50;
+    if (topPadding > 0) document.body.style.paddingTop = topPadding + 'px';
+  } catch(e) {}
+}
+document.addEventListener('DOMContentLoaded', checkTrialStatus);
+
+var agreementTexts = {
+  en: `<h3 style="margin:0 0 12px; font-size:15px;">1. Service Description</h3>
+<p>This platform provides automated Meta (Facebook &amp; Instagram) advertising management services, including campaign creation, optimization, lead tracking, and performance reporting.</p>
+<h3 style="margin:16px 0 12px; font-size:15px;">2. Payment Terms</h3>
+<ul style="margin:0 0 12px; padding-left:20px;">
+  <li>A <strong>3.50% platform fee</strong> is charged on top of your total ad spend for platform maintenance, support, and automation services.</li>
+  <li>Ad spend is billed directly by Meta (Facebook) to your ad account. The 3.50% fee is billed separately by us.</li>
+  <li>Payment is due monthly. Failure to pay may result in account suspension.</li>
+</ul>
+<h3 style="margin:16px 0 12px; font-size:15px;">3. Additional Accounts</h3>
+<p>A <strong>3.50% surcharge</strong> applies to each additional ad account connected to the platform, calculated on the ad spend of each additional account.</p>
+<h3 style="margin:16px 0 12px; font-size:15px;">4. Trial Period</h3>
+<p>New accounts receive a <strong>30-day free trial</strong>. After the trial period, an active payment method or subscription is required to continue using the service.</p>
+<h3 style="margin:16px 0 12px; font-size:15px;">5. Cancellation</h3>
+<p>You may cancel your account at any time. Upon cancellation, your access will be revoked at the end of the current billing period. No refunds are issued for partial months.</p>
+<h3 style="margin:16px 0 12px; font-size:15px;">6. Data &amp; Privacy</h3>
+<p>Your Meta credentials and campaign data are stored securely and are never shared with third parties. We comply with Meta's platform terms and data policies.</p>
+<h3 style="margin:16px 0 12px; font-size:15px;">7. Limitation of Liability</h3>
+<p>The platform is provided "as is." We are not responsible for Meta's ad delivery, algorithm changes, or account suspensions imposed by Meta.</p>`,
+  es: `<h3 style="margin:0 0 12px; font-size:15px;">1. Descripcion del Servicio</h3>
+<p>Esta plataforma proporciona servicios automatizados de gestion de publicidad en Meta (Facebook e Instagram), incluyendo creacion de campanas, optimizacion, seguimiento de leads y reportes de rendimiento.</p>
+<h3 style="margin:16px 0 12px; font-size:15px;">2. Terminos de Pago</h3>
+<ul style="margin:0 0 12px; padding-left:20px;">
+  <li>Se cobra una <strong>tarifa de plataforma del 3.50%</strong> sobre el gasto total en anuncios para mantenimiento, soporte y servicios de automatizacion.</li>
+  <li>El gasto en anuncios es facturado directamente por Meta (Facebook) a tu cuenta de anuncios. La tarifa del 3.50% es facturada por separado por nosotros.</li>
+  <li>El pago es mensual. El no pago puede resultar en la suspension de la cuenta.</li>
+</ul>
+<h3 style="margin:16px 0 12px; font-size:15px;">3. Cuentas Adicionales</h3>
+<p>Se aplica un <strong>recargo del 3.50%</strong> por cada cuenta de anuncios adicional conectada a la plataforma, calculado sobre el gasto de cada cuenta adicional.</p>
+<h3 style="margin:16px 0 12px; font-size:15px;">4. Periodo de Prueba</h3>
+<p>Las cuentas nuevas reciben una <strong>prueba gratuita de 30 dias</strong>. Despues del periodo de prueba, se requiere un metodo de pago activo o una suscripcion para continuar usando el servicio.</p>
+<h3 style="margin:16px 0 12px; font-size:15px;">5. Cancelacion</h3>
+<p>Puedes cancelar tu cuenta en cualquier momento. Al cancelar, tu acceso sera revocado al final del periodo de facturacion actual. No se emiten reembolsos por meses parciales.</p>
+<h3 style="margin:16px 0 12px; font-size:15px;">6. Datos y Privacidad</h3>
+<p>Tus credenciales de Meta y datos de campanas se almacenan de forma segura y nunca se comparten con terceros. Cumplimos con los terminos de plataforma y politicas de datos de Meta.</p>
+<h3 style="margin:16px 0 12px; font-size:15px;">7. Limitacion de Responsabilidad</h3>
+<p>La plataforma se proporciona "tal cual". No somos responsables por la entrega de anuncios de Meta, cambios en algoritmos o suspensiones de cuenta impuestas por Meta.</p>`
+};
+
+var agreementCheckbox = document.getElementById('agreement-checkbox');
+var agreementConfirmBtn = document.getElementById('agreement-confirm-btn');
+if (agreementCheckbox) {
+  agreementCheckbox.addEventListener('change', function() {
+    agreementConfirmBtn.disabled = !this.checked;
+    agreementConfirmBtn.style.cursor = this.checked ? 'pointer' : 'not-allowed';
+    agreementConfirmBtn.style.opacity = this.checked ? '1' : '0.5';
+  });
+}
+
+window.confirmAgreement = async function() {
+  if (!document.getElementById('agreement-checkbox').checked) return;
+  try {
+    var resp = await fetch('/api/accept-agreement', {method: 'POST'});
+    var data = await resp.json();
+    if (data.success) {
+      document.getElementById('agreement-modal').style.display = 'none';
+      document.body.style.overflow = '';
+    } else {
+      document.getElementById('agreement-error').textContent = data.error || 'Error';
+      document.getElementById('agreement-error').style.display = 'block';
+    }
+  } catch(e) {
+    document.getElementById('agreement-error').textContent = 'Error: ' + e.message;
+    document.getElementById('agreement-error').style.display = 'block';
+  }
+};
+
+async function checkAgreementStatus() {
+  try {
+    var resp = await fetch('/api/agreement-status').then(r => r.json());
+    if (!resp.success || resp.is_admin) return;
+    var section = document.getElementById('agreement-settings-section');
+    if (section) section.style.display = 'block';
+    if (resp.accepted) return;
+    var modal = document.getElementById('agreement-modal');
+    var content = document.getElementById('agreement-content');
+    content.innerHTML = agreementTexts[lang] || agreementTexts.en;
+    modal.style.display = 'flex';
+    document.body.style.overflow = 'hidden';
+  } catch(e) {}
+}
+document.addEventListener('DOMContentLoaded', checkAgreementStatus);
+async function connectFacebook() {
+  var token = document.getElementById('connect-meta-token').value.trim();
+  var adAccount = document.getElementById('connect-ad-account').value.trim();
+  var pageToken = document.getElementById('connect-page-token').value.trim();
+  var msgEl = document.getElementById('connect-msg');
+  msgEl.style.display = 'none';
+  if (!token || !adAccount) {
+    msgEl.textContent = 'Token and Ad Account ID are required.';
+    msgEl.style.display = 'block';
+    return;
+  }
+  try {
+    var payload = {meta_access_token: token, meta_ad_account_id: adAccount};
+    if (pageToken) payload.meta_page_token = pageToken;
+    var res = await fetch('/api/connect', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    var r = await res.json();
+    if (r.success) {
+      msgEl.style.color = '#16a34a';
+      msgEl.textContent = 'Connected! Reloading...';
+      msgEl.style.display = 'block';
+      setTimeout(function() { window.location.reload(); }, 1500);
+    } else {
+      msgEl.style.color = '#c0392b';
+      msgEl.textContent = r.error || 'Error connecting';
+      msgEl.style.display = 'block';
+    }
+  } catch(e) {
+    msgEl.style.color = '#c0392b';
+    msgEl.textContent = 'Error: ' + e.message;
+    msgEl.style.display = 'block';
+  }
+}
+</script>
+
+<script>
+(function() {
+  async function checkAuth() {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const requestedTenant = params.get('tenant') || '';
+      const who = await fetch('/api/whoami').then(r => r.json());
+      const tenantsResp = await fetch('/api/tenants').then(r => r.json());
+      const tenants = tenantsResp.tenants || {};
+      const tenantCount = Object.keys(tenants).length;
+
+      var needsLogin = tenantCount > 1 || who.password_required;
+
+      if (!needsLogin) {
+        return;
+      }
+      var sel = document.getElementById('tenant-login-id');
+      sel.innerHTML = '';
+      Object.keys(tenants).forEach(function(tid) {
+        var opt = document.createElement('option');
+        opt.value = tid;
+        opt.textContent = tenants[tid].name || tid;
+        sel.appendChild(opt);
+      });
+      if (!who.has_session) {
+        if (requestedTenant) sel.value = requestedTenant;
+        document.getElementById('tenant-login-overlay').style.display = 'flex';
+        return;
+      }
+      document.getElementById('tenant-badge').style.display = 'flex';
+      document.getElementById('tenant-badge-name').textContent = who.tenant_id;
+      document.getElementById('logout-btn').style.display = 'inline-block';
+    } catch (e) {
+      console.warn('Auth check failed', e);
+    }
+  }
+
+  window.tenantLogin = async function() {
+    const tenant_id = document.getElementById('tenant-login-id').value.trim() || 'default';
+    const password = document.getElementById('tenant-login-pw').value;
+    const errEl = document.getElementById('tenant-login-error');
+    errEl.style.display = 'none';
+    try {
+      const resp = await fetch('/api/login', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({tenant_id, password})
+      });
+      const data = await resp.json();
+      if (data.success) {
+        const url = new URL(window.location);
+        url.searchParams.set('tenant', tenant_id);
+        window.location = url.toString();
+      } else {
+        errEl.textContent = data.error || 'Login failed';
+        errEl.style.display = 'block';
+      }
+    } catch (e) {
+      errEl.textContent = 'Could not connect to server';
+      errEl.style.display = 'block';
+    }
+  };
+
+  window.tenantLogout = async function() {
+    await fetch('/api/logout', {method: 'POST'});
+    const url = new URL(window.location);
+    url.searchParams.delete('tenant');
+    window.location = url.toString();
+  };
+
+  document.addEventListener('DOMContentLoaded', checkAuth);
+})();
+</script>
+
+<!-- Panel de los 3 numeros que importan: costo por lead, % que agenda, % que se inscribe -->
+<div id="kpi-panel-widget" style="position:fixed; bottom:55px; right:10px; z-index:9998; background:#fff; border-radius:10px; box-shadow:0 2px 12px rgba(0,0,0,0.15); padding:14px 18px; font-size:12px; min-width:280px;">
+  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+    <strong style="font-size:13px;" data-i18n="kpi_title">&#x1f4ca; Is it working?</strong>
+    <a href="#" onclick="loadKpiPanel(); return false;" style="font-size:11px; color:#2563eb; text-decoration:none;" data-i18n="kpi_refresh">&#x21bb; refresh</a>
+  </div>
+  <div id="kpi-panel-body" style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; text-align:center;">
+    <div><div id="kpi-cpl" style="font-size:18px; font-weight:700; color:#111827;">--</div><div style="color:#6b7280;" data-i18n="kpi_cost_per_lead">cost/lead</div></div>
+    <div><div id="kpi-booking" style="font-size:18px; font-weight:700; color:#111827;">--</div><div style="color:#6b7280;" data-i18n="kpi_booked">booked</div></div>
+    <div><div id="kpi-enroll" style="font-size:18px; font-weight:700; color:#111827;">--</div><div style="color:#6b7280;" data-i18n="kpi_enrolled">enrolled</div></div>
+  </div>
+  <div id="kpi-confidence-note" style="margin-top:10px; padding-top:8px; border-top:1px solid #eee; color:#6b7280; font-size:11px;"></div>
+</div>
+
+<script>
+async function loadKpiPanel() {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const tenant = params.get('tenant');
+    let url = '/api/kpi-panel';
+    if (tenant) url += '?tenant=' + encodeURIComponent(tenant);
+    const resp = await fetch(url);
+    const d = await resp.json();
+    document.getElementById('kpi-cpl').textContent = d.cost_per_lead != null ? ('$' + d.cost_per_lead) : '--';
+    document.getElementById('kpi-booking').textContent = d.booking_rate_pct != null ? (d.booking_rate_pct + '%') : '--';
+    document.getElementById('kpi-enroll').textContent = d.enrollment_rate_pct != null ? (d.enrollment_rate_pct + '%') : '--';
+    document.getElementById('kpi-confidence-note').textContent = _t('confidence_' + d.confidence) || d.confidence_note || '';
+  } catch (e) {
+    console.warn('Could not load KPI panel', e);
+  }
+}
+document.addEventListener('DOMContentLoaded', loadKpiPanel);
+</script>
+
 </body>
 </html>
 """
 
-def create_web_interface(ads_agent):
+# ==================== QUICKBOOKS CONNECTOR (Intuit OAuth2) ====================
+# Just what Esteban asked for: a real "Connect to QuickBooks" link, using
+# Intuit's actual OAuth2 endpoints (verified against Intuit's own docs, 2026).
+# No billing logic here -- he uses QuickBooks itself for that. This only
+# handles the connection handshake and stores the resulting tokens.
+
+QB_AUTH_URL = "https://appcenter.intuit.com/connect/oauth2"
+QB_TOKEN_URL = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
+QB_SCOPE = "com.intuit.quickbooks.accounting"
+
+
+class QuickBooksConnector:
+    def __init__(self, connections_path='quickbooks_connections.json'):
+        self.client_id = os.environ.get('QB_CLIENT_ID', '')
+        self.client_secret = os.environ.get('QB_CLIENT_SECRET', '')
+        self.redirect_uri = os.environ.get('QB_REDIRECT_URI', '')
+        self.environment = os.environ.get('QB_ENVIRONMENT', 'sandbox')  # 'sandbox' or 'production'
+        self.connections_path = connections_path
+
+    def is_configured(self):
+        return bool(self.client_id and self.client_secret and self.redirect_uri)
+
+    def build_auth_url(self, state):
+        """This is the URL Esteban asked for -- send the user's browser here to connect."""
+        from urllib.parse import urlencode
+        params = {
+            'client_id': self.client_id,
+            'redirect_uri': self.redirect_uri,
+            'response_type': 'code',
+            'scope': QB_SCOPE,
+            'state': state,
+        }
+        return f"{QB_AUTH_URL}?{urlencode(params)}"
+
+    def exchange_code_for_tokens(self, code, realm_id):
+        import base64
+        auth_header = base64.b64encode(f"{self.client_id}:{self.client_secret}".encode()).decode()
+        resp = requests.post(
+            QB_TOKEN_URL,
+            headers={
+                'Authorization': f'Basic {auth_header}',
+                'Accept': 'application/json',
+                'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            data={
+                'grant_type': 'authorization_code',
+                'code': code,
+                'redirect_uri': self.redirect_uri,
+            }
+        )
+        data = resp.json() if resp.content else {}
+        if resp.status_code != 200:
+            return None, data.get('error_description', f'HTTP {resp.status_code}')
+        data['realm_id'] = realm_id
+        data['connected_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        data['environment'] = self.environment
+        return data, None
+
+    def save_connection(self, tenant_id, token_data):
+        connections = {}
+        if os.path.exists(self.connections_path):
+            try:
+                with open(self.connections_path, 'r', encoding='utf-8') as f:
+                    connections = json.load(f)
+            except Exception:
+                pass
+        connections[tenant_id] = token_data
+        try:
+            with open(self.connections_path, 'w', encoding='utf-8') as f:
+                json.dump(connections, f, indent=2, ensure_ascii=False)
+            return True
+        except Exception as e:
+            print(f"[QuickBooksConnector] WARNING: could not save connection: {e}")
+            return False
+
+    def get_connection(self, tenant_id):
+        if os.path.exists(self.connections_path):
+            try:
+                with open(self.connections_path, 'r', encoding='utf-8') as f:
+                    return json.load(f).get(tenant_id)
+            except Exception:
+                pass
+        return None
+
+
+quickbooks_connector = QuickBooksConnector()
+
+# ==================== TENANT MANAGER (multi-studio support) ====================
+# Lets this run for more than one studio at once, each fully isolated:
+# its own Meta credentials, its own spend cap, its own campaigns, its own
+# audit log. The original single-studio setup keeps working unchanged as
+# the 'default' tenant -- nothing breaks for an existing install.
+
+class TenantManager:
+    def __init__(self, config_path='tenants.json', default_agent=None):
+        self.config_path = config_path
+        self._agents = {}
+        if default_agent is not None:
+            self._agents['default'] = default_agent  # reuse the already-running single-tenant agent
+        self.tenants = self._load()
+
+    def _load(self):
+        if os.path.exists(self.config_path):
+            try:
+                with open(self.config_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                for tid, cfg in data.items():
+                    cfg.setdefault('role', 'admin' if tid == 'default' else 'client')
+                return data
+            except Exception as e:
+                print(f"[TenantManager] WARNING: could not read {self.config_path}: {e}")
+        # Seed with just 'default' -- it uses whatever is already in .env.txt,
+        # nothing to configure here for a single-studio setup.
+        seed = {'default': {'name': 'Default Studio', 'industry': 'martialarts', 'role': 'admin', 'uses_env_credentials': True}}
+        self._save(seed)
+        return seed
+
+    def _save(self, data=None):
+        try:
+            with open(self.config_path, 'w', encoding='utf-8') as f:
+                json.dump(data if data is not None else self.tenants, f, indent=2, ensure_ascii=False)
+            return True
+        except Exception as e:
+            print(f"[TenantManager] WARNING: could not save {self.config_path}: {e}")
+            return False
+
+    def list_tenants(self):
+        # Never expose secrets in a listing
+        hidden = ('token', 'secret', 'password')
+        return {tid: {k: v for k, v in cfg.items() if not any(h in k.lower() for h in hidden)}
+                for tid, cfg in self.tenants.items()}
+
+    def create_tenant(self, tenant_id, config):
+        if tenant_id in self.tenants:
+            return False, "A tenant with this ID already exists"
+        required = ['password']
+        missing = [f for f in required if not config.get(f)]
+        if missing:
+            return False, f"Missing required fields: {', '.join(missing)}"
+        password = config.pop('password')
+        if len(password) < 6:
+            return False, "Password must be at least 6 characters"
+        config['password_hash'] = generate_password_hash(password)
+        config.setdefault('name', tenant_id)
+        config.setdefault('industry', 'service')
+        config.setdefault('role', 'client')
+        config.setdefault('max_total_daily_budget', 50)
+        config.setdefault('auto_budget_increase_enabled', False)
+        if not config.get('meta_access_token') or not config.get('meta_ad_account_id'):
+            config.setdefault('demo_mode', True)
+        if config.get('role') != 'admin':
+            config.setdefault('created_at', int(time.time()))
+            config.setdefault('trial_days', 30)
+        self.tenants[tenant_id] = config
+        self._save()
+        safety_guard.log('create_tenant', allowed=True, reason=f"New tenant '{tenant_id}' created", tenant_id=tenant_id)
+        return True, "OK"
+
+    def verify_login(self, tenant_id, password):
+        cfg = self.tenants.get(tenant_id)
+        if not cfg:
+            return False
+        if not cfg.get('password_hash'):
+            return tenant_id == 'default'
+        return check_password_hash(cfg['password_hash'], password)
+
+    def get_agent(self, tenant_id='default'):
+        if tenant_id in self._agents:
+            return self._agents[tenant_id]
+        if tenant_id not in self.tenants:
+            tenant_id = 'default'
+        cfg = self.tenants.get(tenant_id, {})
+
+        if cfg.get('uses_env_credentials'):
+            meta_credentials = {
+                'access_token': os.environ.get('META_ACCESS_TOKEN', ''),
+                'ad_account_id': os.environ.get('META_AD_ACCOUNT_ID', ''),
+                'app_id': os.environ.get('META_APP_ID'),
+                'app_secret': os.environ.get('META_APP_SECRET'),
+                'page_token': os.environ.get('META_PAGE_TOKEN'),
+            }
+            ai_key = os.environ.get('GROQ_API_KEY') or os.environ.get('GEMINI_API_KEY')
+        else:
+            meta_credentials = {
+                'access_token': cfg.get('meta_access_token', ''),
+                'ad_account_id': cfg.get('meta_ad_account_id', ''),
+                'app_id': cfg.get('meta_app_id'),
+                'app_secret': cfg.get('meta_app_secret'),
+                'page_token': cfg.get('meta_page_token'),
+            }
+            ai_key = cfg.get('ai_api_key')
+
+        tenant_safety_guard = SafetyGuard(audit_log_path=f'audit_log_{tenant_id}.jsonl')
+        tenant_safety_guard.max_total_daily_budget = float(cfg.get('max_total_daily_budget', 50))
+        tenant_safety_guard.auto_budget_increase_enabled = bool(cfg.get('auto_budget_increase_enabled', False))
+
+        agent = UniversalMetaAdsAgent(
+            meta_credentials, ai_api_key=ai_key,
+            tenant_id=tenant_id, safety_guard_instance=tenant_safety_guard,
+            campaigns_file=f'campaigns_{tenant_id}.json' if tenant_id != 'default' else None
+        )
+        self._agents[tenant_id] = agent
+        return agent
+
+
+def create_web_interface(ads_agent, tenant_manager=None):
     app = Flask(__name__)
-    app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'meta-ads-secret-key-2025')
+    secret = os.environ.get('SECRET_KEY', '')
+    if not secret or secret in ('meta-ads-secret-key-2025', 'cambia-esto-por-algo-unico'):
+        secret_file = os.path.join(os.path.dirname(__file__), '.secret_key')
+        if os.path.exists(secret_file):
+            with open(secret_file) as f:
+                secret = f.read().strip()
+        else:
+            import secrets
+            secret = secrets.token_hex(32)
+            with open(secret_file, 'w') as f:
+                f.write(secret)
+    app.config['SECRET_KEY'] = secret
+    app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB upload limit
+
+    _rate_limits = {}
+    RATE_LIMIT_WINDOW = 60
+    RATE_LIMIT_MAX = 60
+
+    def _check_rate_limit(ip, window=RATE_LIMIT_WINDOW, max_req=RATE_LIMIT_MAX):
+        now = time.time()
+        if ip not in _rate_limits:
+            _rate_limits[ip] = []
+        _rate_limits[ip] = [t for t in _rate_limits[ip] if now - t < window]
+        if len(_rate_limits[ip]) >= max_req:
+            return False
+        _rate_limits[ip].append(now)
+        return True
+
+    @app.before_request
+    def rate_limit():
+        if request.method in ('POST', 'DELETE'):
+            ip = request.headers.get('X-Forwarded-For', request.remote_addr or 'unknown').split(',')[0].strip()
+            if not _check_rate_limit(ip):
+                return jsonify({'success': False, 'error': 'Rate limit exceeded. Try again later.'}), 429
+
+    if os.environ.get('PRODUCTION'):
+        app.config['SESSION_COOKIE_SECURE'] = True
+        app.config['SESSION_COOKIE_HTTPONLY'] = True
+        app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+
+        @app.before_request
+        def redirect_to_https():
+            if request.headers.get('X-Forwarded-Proto') == 'http':
+                url = request.url.replace('http://', 'https://', 1)
+                return redirect(url, code=301)
+
+    def resolve_agent():
+        """Which studio's agent this request is for. ?tenant=<id> or header X-Tenant-Id.
+        No tenant specified -> the original single-studio agent, unchanged behavior."""
+        tid = request.args.get('tenant') or request.headers.get('X-Tenant-Id') or 'default'
+        if tenant_manager is None or tid == 'default':
+            return ads_agent
+        return tenant_manager.get_agent(tid)
+
+    def current_session_tenant():
+        return session.get('tenant_id')
+
+    def require_tenant_auth(view_func):
+        """Blocks a request for tenant X unless the browser is logged in as tenant X.
+        The 'default' studio (classic single-studio setup, no other tenants ever
+        created) keeps working with zero login friction -- this only kicks in
+        once real multi-tenant accounts exist."""
+        from functools import wraps
+
+        @wraps(view_func)
+        def wrapped(*args, **kwargs):
+            tid = request.args.get('tenant') or request.headers.get('X-Tenant-Id') or 'default'
+            cfg = (tenant_manager.tenants.get(tid) if tenant_manager else None) or {}
+            has_password = bool(cfg.get('password_hash'))
+            if tid == 'default' and not has_password and (tenant_manager is None or len(tenant_manager.tenants) <= 1):
+                return view_func(*args, **kwargs)
+            if current_session_tenant() != tid:
+                return jsonify({'success': False, 'error': f"Not authenticated for tenant '{tid}'. Please log in first."}), 401
+            return view_func(*args, **kwargs)
+        return wrapped
+
+    def admin_required(view_func):
+        """Only allows access if the logged-in tenant has role='admin'."""
+        from functools import wraps
+
+        @wraps(view_func)
+        def wrapped(*args, **kwargs):
+            tid = current_session_tenant() or 'default'
+            if tenant_manager and tid in tenant_manager.tenants:
+                role = tenant_manager.tenants[tid].get('role', 'client')
+                if role == 'admin':
+                    return view_func(*args, **kwargs)
+            cfg = (tenant_manager.tenants.get(tid) if tenant_manager else None) or {}
+            has_password = bool(cfg.get('password_hash'))
+            if tid == 'default' and not has_password and (tenant_manager is None or len(tenant_manager.tenants) <= 1):
+                return view_func(*args, **kwargs)
+            return jsonify({'success': False, 'error': 'Admin access required'}), 403
+        return wrapped
+
+    @app.route('/api/login', methods=['POST'])
+    def api_login():
+        data = request.get_json() or {}
+        tenant_id = data.get('tenant_id', 'default')
+        password = data.get('password', '')
+        if tenant_manager is None:
+            return jsonify({'success': False, 'error': 'Tenant manager not initialized'})
+        if tenant_manager.verify_login(tenant_id, password):
+            session['tenant_id'] = tenant_id
+            safety_guard.log('login', allowed=True, reason='Login successful', tenant_id=tenant_id)
+            return jsonify({'success': True, 'tenant_id': tenant_id})
+        safety_guard.log('login', allowed=False, reason='Invalid password or tenant not found', tenant_id=tenant_id)
+        return jsonify({'success': False, 'error': 'Invalid username or password'}), 401
+
+    @app.route('/api/logout', methods=['POST'])
+    def api_logout():
+        session.pop('tenant_id', None)
+        return jsonify({'success': True})
+
+    @app.route('/api/health')
+    def api_health():
+        try:
+            token_valid = resolve_agent().meta_api.validate_token()
+            expires_at = getattr(resolve_agent().meta_api, 'token_expires_at', None)
+            return jsonify({
+                'status': 'ok',
+                'token_valid': token_valid,
+                'token_expires_at': expires_at,
+                'campaigns_loaded': len(resolve_agent().campaigns),
+                'tenants_count': len(tenant_manager.tenants) if tenant_manager else 1,
+            })
+        except Exception as e:
+            return jsonify({'status': 'error', 'error': str(e)}), 500
+
+    @app.route('/api/whoami')
+    def api_whoami():
+        raw_tid = current_session_tenant()
+        has_session = raw_tid is not None
+        tid = raw_tid or 'default'
+        role = 'client'
+        if tenant_manager and tid in tenant_manager.tenants:
+            role = tenant_manager.tenants[tid].get('role', 'client')
+        pw_required = bool((tenant_manager.tenants.get(tid) if tenant_manager else {}).get('password_hash'))
+        token_valid = resolve_agent().meta_api.validate_token()
+        expires_at = getattr(resolve_agent().meta_api, 'token_expires_at', None)
+        cfg_t = (tenant_manager.tenants.get(tid) if tenant_manager else None) or {}
+        trial_expired = False
+        if cfg_t.get('role', 'client') != 'admin' and cfg_t.get('created_at'):
+            trial_days = cfg_t.get('trial_days', 30)
+            trial_end = cfg_t['created_at'] + (trial_days * 86400)
+            trial_expired = int(time.time()) > trial_end
+        return jsonify({
+            'success': True, 'tenant_id': tid, 'role': role,
+            'has_session': has_session, 'password_required': pw_required,
+            'token_valid': token_valid, 'token_expires_at': expires_at,
+            'trial_expired': trial_expired
+        })
+
+    @app.route('/api/trial-status')
+    def api_trial_status():
+        tid = current_session_tenant() or 'default'
+        cfg = (tenant_manager.tenants.get(tid) if tenant_manager else None) or {}
+        role = cfg.get('role', 'client')
+        if role == 'admin':
+            return jsonify({'success': True, 'trial_active': True, 'trial_days_remaining': None, 'trial_expired': False, 'is_admin': True})
+        created_at = cfg.get('created_at')
+        if not created_at:
+            return jsonify({'success': True, 'trial_active': True, 'trial_days_remaining': None, 'trial_expired': False, 'no_trial': True})
+        trial_days = cfg.get('trial_days', 30)
+        trial_end = created_at + (trial_days * 86400)
+        now = int(time.time())
+        days_remaining = max(0, int((trial_end - now) / 86400))
+        trial_expired = now > trial_end
+        return jsonify({
+            'success': True, 'trial_active': not trial_expired,
+            'trial_days_remaining': days_remaining, 'trial_expired': trial_expired,
+            'created_at': created_at, 'trial_end': trial_end, 'is_admin': False
+        })
+
+    @app.route('/api/accept-agreement', methods=['POST'])
+    def api_accept_agreement():
+        tid = current_session_tenant() or 'default'
+        cfg = (tenant_manager.tenants.get(tid) if tenant_manager else None) or {}
+        if not cfg or tid == 'default':
+            return jsonify({'success': False, 'error': 'Invalid tenant'}), 400
+        tenant_manager.tenants[tid]['agreement_accepted'] = True
+        tenant_manager.tenants[tid]['agreement_accepted_at'] = int(time.time())
+        tenant_manager._save()
+        safety_guard.log('agreement_accepted', allowed=True, reason=f"Terms accepted by '{tid}'", tenant_id=tid)
+        return jsonify({'success': True})
+
+    @app.route('/api/agreement-status')
+    def api_agreement_status():
+        tid = current_session_tenant() or 'default'
+        cfg = (tenant_manager.tenants.get(tid) if tenant_manager else None) or {}
+        role = cfg.get('role', 'client')
+        if role == 'admin':
+            return jsonify({'success': True, 'accepted': True, 'is_admin': True})
+        accepted = bool(cfg.get('agreement_accepted'))
+        return jsonify({'success': True, 'accepted': accepted, 'is_admin': False})
 
     scheduler = ContentScheduler(ads_agent.meta_api)
 
     @app.route('/')
     def home():
-        return HTML_TEMPLATE
+        resp = app.response_class(HTML_TEMPLATE, content_type='text/html; charset=utf-8')
+        resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+        resp.headers['Pragma'] = 'no-cache'
+        resp.headers['Expires'] = '0'
+        return resp
 
     @app.route('/api/campaigns')
     def api_campaigns():
-        return jsonify(ads_agent.get_all_campaigns())
+        return jsonify(resolve_agent().get_all_campaigns())
 
     @app.route('/api/campaign/<campaign_id>/performance')
     def api_campaign_performance(campaign_id):
-        perf = ads_agent.get_campaign_performance(campaign_id)
+        perf = resolve_agent().get_campaign_performance(campaign_id)
         if not perf:
             return jsonify({'error': 'Campaign not found'}), 404
         return jsonify(perf)
@@ -4206,7 +7961,9 @@ def create_web_interface(ads_agent):
         return send_from_directory(UPLOAD_FOLDER, filename)
 
     @app.route('/api/upload-media', methods=['POST'])
+    @require_tenant_auth
     def api_upload_media():
+        from werkzeug.utils import secure_filename as _secure_fn
         if 'media' not in request.files:
             return jsonify({'success': False, 'error': 'No file provided'})
         file = request.files['media']
@@ -4217,7 +7974,8 @@ def create_web_interface(ads_agent):
         allowed_videos = {'mp4', 'mov', 'avi', 'webm'}
         if ext not in allowed_images and ext not in allowed_videos:
             return jsonify({'success': False, 'error': f'File type .{ext} not supported'})
-        filename = f"{int(time.time())}_{file.filename}"
+        safe_name = _secure_fn(file.filename) or f"upload.{ext}"
+        filename = f"{int(time.time())}_{safe_name}"
         filepath = os.path.join(UPLOAD_FOLDER, filename)
         file.save(filepath)
         is_video = ext in allowed_videos
@@ -4229,75 +7987,321 @@ def create_web_interface(ads_agent):
         })
 
     @app.route('/api/create-campaign', methods=['POST'])
+    @require_tenant_auth
     def api_create_campaign():
         data = request.get_json()
         if not data:
             return jsonify({'success': False, 'error': 'No data received'})
         try:
-            result = ads_agent.create_campaign_for_business(data)
+            result = resolve_agent().create_campaign_for_business(data)
             return jsonify({'success': True, 'result': result})
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)})
 
     @app.route('/api/delete-campaign/<campaign_id>', methods=['POST'])
+    @require_tenant_auth
     def api_delete_campaign(campaign_id):
         try:
-            if campaign_id in ads_agent.campaigns:
-                ads_agent.campaigns[campaign_id]['status'] = 'TRASHED'
-                ads_agent._save_campaigns()
+            agent = resolve_agent()
+            if campaign_id in agent.campaigns:
+                agent.campaigns[campaign_id]['status'] = 'TRASHED'
+                agent._save_campaigns()
             return jsonify({'success': True})
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)})
 
     @app.route('/api/restore-campaign/<campaign_id>', methods=['POST'])
+    @require_tenant_auth
     def api_restore_campaign(campaign_id):
         try:
-            if campaign_id in ads_agent.campaigns:
-                ads_agent.campaigns[campaign_id]['status'] = 'ARCHIVED'
-                ads_agent._save_campaigns()
+            agent = resolve_agent()
+            if campaign_id in agent.campaigns:
+                agent.campaigns[campaign_id]['status'] = 'ARCHIVED'
+                agent._save_campaigns()
             return jsonify({'success': True})
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)})
 
     @app.route('/api/delete-campaign-forever/<campaign_id>', methods=['POST'])
+    @require_tenant_auth
     def api_delete_campaign_forever(campaign_id):
         try:
-            if campaign_id in ads_agent.campaigns:
-                del ads_agent.campaigns[campaign_id]
-                ads_agent._save_campaigns()
+            agent = resolve_agent()
+            if campaign_id in agent.campaigns:
+                del agent.campaigns[campaign_id]
+                agent._save_campaigns()
             return jsonify({'success': True})
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)})
 
     @app.route('/api/optimize/<campaign_id>', methods=['GET', 'POST'])
+    @require_tenant_auth
     def api_optimize(campaign_id):
-        perf = ads_agent.get_campaign_performance(campaign_id)
+        agent = resolve_agent()
+        perf = agent.get_campaign_performance(campaign_id)
         if not perf:
             return jsonify({'success': False, 'error': 'Campaign not found'})
-        opts = ads_agent.performance_optimizer.generate_optimizations(perf['analysis'])
+        opts = agent.performance_optimizer.generate_optimizations(perf['analysis'])
         if request.method == 'GET':
             return jsonify({'success': True, 'optimizations': opts, 'preview': True})
-        results = ads_agent.performance_optimizer.apply_optimizations(opts, campaign_id)
+        results = agent.performance_optimizer.apply_optimizations(opts, campaign_id)
         return jsonify({'success': True, 'optimizations': opts, 'results': results})
 
     @app.route('/api/optimize-all', methods=['POST'])
+    @require_tenant_auth
     def api_optimize_all():
-        ads_agent.optimize_campaigns()
+        resolve_agent().optimize_campaigns()
         return jsonify({'success': True})
 
     @app.route('/api/token-status')
     def api_token_status():
-        expires_at = getattr(ads_agent.meta_api, 'token_expires_at', None)
+        expires_at = getattr(resolve_agent().meta_api, 'token_expires_at', None)
         return jsonify({'expires_at': expires_at})
 
+    @app.route('/api/token-refresh', methods=['POST'])
+    @require_tenant_auth
+    def api_token_refresh():
+        agent = resolve_agent()
+        ok = agent.meta_api.refresh_access_token()
+        if ok:
+            safety_guard.log('token_refresh', allowed=True, reason='Token refreshed successfully')
+            return jsonify({'success': True, 'message': 'Token refreshed'})
+        return jsonify({'success': False, 'error': 'Token refresh failed. Update token manually in Settings.'}), 400
+
+    @app.route('/api/safety-status')
+    def api_safety_status():
+        agent = resolve_agent()
+        sg = agent.safety_guard
+        committed = sg.current_committed_budget(agent.campaigns)
+        return jsonify({
+            'success': True,
+            'tenant_id': getattr(agent, 'tenant_id', 'default'),
+            'max_total_daily_budget': sg.max_total_daily_budget,
+            'committed_daily_budget': committed,
+            'remaining_daily_budget': max(sg.max_total_daily_budget - committed, 0),
+            'auto_budget_increase_enabled': sg.auto_budget_increase_enabled
+        })
+
+    @app.route('/api/safety/toggle-auto-budget', methods=['POST'])
+    @require_tenant_auth
+    def api_toggle_auto_budget():
+        agent = resolve_agent()
+        sg = agent.safety_guard
+        sg.auto_budget_increase_enabled = not sg.auto_budget_increase_enabled
+        return jsonify({'success': True, 'auto_budget_increase_enabled': sg.auto_budget_increase_enabled})
+
+    @app.route('/api/safety/update-budget', methods=['POST'])
+    @require_tenant_auth
+    def api_update_budget():
+        data = request.get_json()
+        new_max = data.get('max_total_daily_budget')
+        if not new_max or not isinstance(new_max, (int, float)) or new_max < 1:
+            return jsonify({'success': False, 'error': 'Invalid budget amount'})
+        agent = resolve_agent()
+        agent.safety_guard.max_total_daily_budget = float(new_max)
+        return jsonify({'success': True, 'max_total_daily_budget': float(new_max)})
+
+    @app.route('/api/industry-config')
+    def api_industry_config_list():
+        return jsonify({'success': True, 'industries': config_store.list_industries(), 'config': config_store.data})
+
+    @app.route('/api/industry-config/<industry>', methods=['GET'])
+    def api_industry_config_get(industry):
+        return jsonify({'success': True, 'industry': industry, 'config': config_store.get(industry)})
+
+    @app.route('/api/industry-config/<industry>', methods=['POST'])
+    @require_tenant_auth
+    def api_industry_config_update(industry):
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'error': 'No data received'})
+        ok = config_store.update(industry, data)
+        safety_guard.log('update_industry_config', allowed=ok, reason=f"Edited targeting/budget rules for '{industry}'", industry=industry, changes=data)
+        return jsonify({'success': ok, 'industry': industry, 'config': config_store.get(industry)})
+
+    @app.route('/api/audit-log')
+    def api_audit_log():
+        agent = resolve_agent()
+        sg = agent.safety_guard
+        limit = int(request.args.get('limit', 100))
+        entries = []
+        try:
+            if os.path.exists(sg.audit_log_path):
+                with open(sg.audit_log_path, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+                for line in lines[-limit:]:
+                    line = line.strip()
+                    if line:
+                        try:
+                            entries.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            pass
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)})
+        entries.reverse()  # most recent first
+        return jsonify({'success': True, 'entries': entries})
+
+    @app.route('/api/tenants')
+    def api_tenants_list():
+        if tenant_manager is None:
+            return jsonify({'success': True, 'tenants': {'default': {'name': 'Default Studio'}}})
+        return jsonify({'success': True, 'tenants': tenant_manager.list_tenants()})
+
+    @app.route('/api/tenants', methods=['POST'])
+    @admin_required
+    def api_tenants_create():
+        if tenant_manager is None:
+            return jsonify({'success': False, 'error': 'Tenant manager not initialized'})
+        data = request.get_json()
+        if not data or not data.get('tenant_id'):
+            return jsonify({'success': False, 'error': 'tenant_id is required'})
+        tenant_id = data.pop('tenant_id')
+        ok, msg = tenant_manager.create_tenant(tenant_id, data)
+        return jsonify({'success': ok, 'message': msg, 'tenant_id': tenant_id if ok else None})
+
+    @app.route('/api/tenants/<tenant_id>', methods=['PUT'])
+    @admin_required
+    def api_tenants_update(tenant_id):
+        if tenant_manager is None:
+            return jsonify({'success': False, 'error': 'Tenant manager not initialized'})
+        if tenant_id not in tenant_manager.tenants:
+            return jsonify({'success': False, 'error': 'Tenant not found'})
+        data = request.get_json() or {}
+        t = tenant_manager.tenants[tenant_id]
+        if 'name' in data:
+            t['name'] = data['name']
+        if 'max_total_daily_budget' in data:
+            t['max_total_daily_budget'] = int(data['max_total_daily_budget'])
+        if 'meta_access_token' in data:
+            t['meta_access_token'] = data['meta_access_token']
+        if 'meta_ad_account_id' in data:
+            t['meta_ad_account_id'] = data['meta_ad_account_id']
+        if data.get('password'):
+            from werkzeug.security import generate_password_hash
+            t['password_hash'] = generate_password_hash(data['password'])
+        if data.get('reset_trial'):
+            t['created_at'] = int(time.time())
+            t['trial_days'] = 30
+            t.pop('agreement_accepted', None)
+            t.pop('agreement_accepted_at', None)
+        if 'payment_url' in data:
+            t['payment_url'] = data['payment_url']
+        tenant_manager._save()
+        tenant_manager._agents.pop(tenant_id, None)
+        return jsonify({'success': True})
+
+    @app.route('/api/connect', methods=['POST'])
+    def api_connect_facebook():
+        tid = current_session_tenant()
+        if not tid or tid not in (tenant_manager.tenants if tenant_manager else {}):
+            return jsonify({'success': False, 'error': 'Not authenticated. Please log in first.'}), 401
+        data = request.get_json() or {}
+        token = data.get('meta_access_token', '').strip()
+        ad_account = data.get('meta_ad_account_id', '').strip()
+        if not token or not ad_account:
+            return jsonify({'success': False, 'error': 'Token and Ad Account ID required'})
+        if not ad_account.startswith('act_'):
+            ad_account = 'act_' + ad_account
+        t = tenant_manager.tenants[tid]
+        t['meta_access_token'] = token
+        t['meta_ad_account_id'] = ad_account
+        t['demo_mode'] = False
+        if data.get('meta_page_token'):
+            t['meta_page_token'] = data['meta_page_token'].strip()
+        tenant_manager._save()
+        tenant_manager._agents.pop(tid, None)
+        return jsonify({'success': True})
+
+    @app.route('/api/tenants/<tenant_id>', methods=['DELETE'])
+    @admin_required
+    def api_tenants_delete(tenant_id):
+        if tenant_manager is None:
+            return jsonify({'success': False, 'error': 'Tenant manager not initialized'})
+        if tenant_id == 'default':
+            return jsonify({'success': False, 'error': 'Cannot delete the default admin tenant'})
+        if tenant_id not in tenant_manager.tenants:
+            return jsonify({'success': False, 'error': 'Tenant not found'})
+        del tenant_manager.tenants[tenant_id]
+        tenant_manager._save()
+        campaigns_file = os.path.join(os.path.dirname(__file__), f'campaigns_{tenant_id}.json')
+        if os.path.exists(campaigns_file):
+            try: os.remove(campaigns_file)
+            except: pass
+        return jsonify({'success': True})
+
+    # ==================== QuickBooks (Intuit) connect ====================
+
+    @app.route('/api/quickbooks/connect-url')
+    def api_quickbooks_connect_url():
+        """The URL to connect directly to Intuit -- send the user's browser here."""
+        if not quickbooks_connector.is_configured():
+            return jsonify({
+                'success': False,
+                'error': 'QB_CLIENT_ID, QB_CLIENT_SECRET, or QB_REDIRECT_URI missing from .env.txt. '
+                          'Create an app at https://developer.intuit.com/ to get credentials.'
+            })
+        tenant_id = request.args.get('tenant', 'default')
+        state = f"{tenant_id}:{os.urandom(8).hex()}"
+        session['qb_oauth_state'] = state
+        return jsonify({'success': True, 'connect_url': quickbooks_connector.build_auth_url(state)})
+
+    @app.route('/quickbooks/callback')
+    def quickbooks_callback():
+        """Intuit redirects here after the user approves the connection."""
+        error = request.args.get('error')
+        if error:
+            return f"<h2>QuickBooks connection cancelled</h2><p>{error}</p><a href='/'>Back</a>", 400
+
+        code = request.args.get('code')
+        realm_id = request.args.get('realmId')
+        state = request.args.get('state', '')
+
+        if not code or not realm_id:
+            return "<h2>Missing parameters in Intuit response</h2><a href='/'>Back</a>", 400
+        if state != session.get('qb_oauth_state'):
+            safety_guard.log('quickbooks_connect', allowed=False, reason='state mismatch (posible CSRF)')
+            return "<h2>Invalid security token, please try connecting again</h2><a href='/'>Back</a>", 400
+
+        tenant_id = state.split(':', 1)[0] if ':' in state else 'default'
+        token_data, err = quickbooks_connector.exchange_code_for_tokens(code, realm_id)
+        if err:
+            safety_guard.log('quickbooks_connect', allowed=False, reason=err, tenant_id=tenant_id)
+            return f"<h2>Could not complete QuickBooks connection</h2><p>{err}</p><a href='/'>Back</a>", 400
+
+        quickbooks_connector.save_connection(tenant_id, token_data)
+        safety_guard.log('quickbooks_connect', allowed=True, reason='Connected successfully', tenant_id=tenant_id, realm_id=realm_id)
+        return f"""
+        <html><body style="font-family:sans-serif; text-align:center; padding:60px;">
+        <h2>✅ QuickBooks connected successfully</h2>
+        <p>Company (realm ID): {realm_id}</p>
+        <p><a href="/">Back to dashboard</a></p>
+        </body></html>
+        """
+
+    @app.route('/api/quickbooks/status')
+    def api_quickbooks_status():
+        tenant_id = request.args.get('tenant', 'default')
+        conn = quickbooks_connector.get_connection(tenant_id)
+        if not conn:
+            return jsonify({'success': True, 'connected': False})
+        return jsonify({
+            'success': True,
+            'connected': True,
+            'realm_id': conn.get('realm_id'),
+            'connected_at': conn.get('connected_at'),
+            'environment': conn.get('environment')
+        })
+
+
     @app.route('/api/generate-ad-copy', methods=['POST'])
+    @require_tenant_auth
     def api_generate_ad_copy():
         data = request.get_json()
         if not data:
             return jsonify({'success': False, 'error': 'No data'})
         language = data.get('language', 'en')
-        data['ai_api_key'] = getattr(ads_agent, 'ai_api_key', '')
-        data['ai_provider'] = getattr(ads_agent, 'ai_provider', 'groq')
+        data['ai_api_key'] = getattr(resolve_agent(), 'ai_api_key', '')
+        data['ai_provider'] = getattr(resolve_agent(), 'ai_provider', 'groq')
         engine = AIStrategyEngine()
         engine.ai_api_key = data['ai_api_key']
         engine.ai_provider = data['ai_provider']
@@ -4306,36 +8310,141 @@ def create_web_interface(ads_agent):
 
     @app.route('/api/lead-forms')
     def api_lead_forms():
-        page_id = getattr(ads_agent.meta_api, 'page_id', '117339024950778')
-        forms = ads_agent.meta_api.get_lead_forms(page_id)
+        page_id = getattr(resolve_agent().meta_api, 'page_id', '117339024950778')
+        forms = resolve_agent().meta_api.get_lead_forms(page_id)
         return jsonify({'success': True, 'forms': forms})
 
     @app.route('/api/leads/<form_id>')
     def api_leads(form_id):
-        leads = ads_agent.meta_api.get_leads(form_id)
+        leads = resolve_agent().meta_api.get_leads(form_id)
         return jsonify({'success': True, 'leads': leads})
+
+    @app.route('/api/audiences')
+    def api_audiences_list():
+        try:
+            url = f"{resolve_agent().meta_api.base_url}/{resolve_agent().meta_api.ad_account_id}/customaudiences"
+            params = {'access_token': resolve_agent().meta_api.access_token, 'fields': 'id,name,description,tag', 'limit': 100}
+            r = requests.get(url, params=params)
+            data = r.json().get('data', [])
+            return jsonify({'success': True, 'audiences': data})
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e), 'audiences': []})
+
+    @app.route('/api/audiences/create', methods=['POST'])
+    @require_tenant_auth
+    def api_audiences_create():
+        data = request.get_json()
+        if not data or not data.get('name'):
+            return jsonify({'success': False, 'error': 'Audience name is required'})
+        try:
+            agent = resolve_agent()
+            payload = {
+                'name': data['name'],
+                'subtype': data.get('subtype', 'CUSTOM'),
+                'description': data.get('description', ''),
+                'prefill': data.get('prefill', 'NONE'),
+            }
+            url = f"{agent.meta_api.base_url}/{agent.meta_api.ad_account_id}/customaudiences"
+            r = requests.post(url, json=payload, params={'access_token': agent.meta_api.access_token})
+            result = r.json()
+            if 'id' in result:
+                return jsonify({'success': True, 'audience_id': result['id'], 'name': data['name']})
+            return jsonify({'success': False, 'error': result.get('error', {}).get('message', 'Unknown error')})
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)})
+
+    @app.route('/api/audiences/lookalike', methods=['POST'])
+    @require_tenant_auth
+    def api_audiences_lookalike():
+        data = request.get_json()
+        if not data or not data.get('name') or not data.get('source_audience_id'):
+            return jsonify({'success': False, 'error': 'Name and source audience ID are required'})
+        try:
+            agent = resolve_agent()
+            payload = {
+                'name': data['name'],
+                'origin': [{'id': data['source_audience_id'], 'type': 'custom_audience'}],
+                'target_spec': {
+                    'geo_locations': {'countries': [data.get('country', 'US')]},
+                    'start': data.get('start', 1),
+                    'end': data.get('end', 10),
+                },
+            }
+            url = f"{agent.meta_api.base_url}/{agent.meta_api.ad_account_id}/customaudiences"
+            r = requests.post(url, json=payload, params={'access_token': agent.meta_api.access_token})
+            result = r.json()
+            if 'id' in result:
+                return jsonify({'success': True, 'audience_id': result['id'], 'name': data['name']})
+            return jsonify({'success': False, 'error': result.get('error', {}).get('message', 'Unknown error')})
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)})
+
+    @app.route('/api/audiences/delete/<audience_id>', methods=['POST', 'DELETE'])
+    @require_tenant_auth
+    def api_audiences_delete(audience_id):
+        try:
+            agent = resolve_agent()
+            url = f"{agent.meta_api.base_url}/{audience_id}"
+            r = requests.delete(url, params={'access_token': agent.meta_api.access_token})
+            return jsonify({'success': r.json().get('success', True)})
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)})
+
+    @app.route('/api/lead-forms/create', methods=['POST'])
+    @require_tenant_auth
+    def api_lead_forms_create():
+        data = request.get_json()
+        if not data or not data.get('name'):
+            return jsonify({'success': False, 'error': 'Form name is required'})
+        try:
+            agent = resolve_agent()
+            page_id = data.get('page_id') or getattr(agent.meta_api, 'page_id', None)
+            if not page_id:
+                page_id = agent.meta_api.get_page_id()
+            url = f"{agent.meta_api.base_url}/{page_id}/leadgen_forms"
+            payload = {
+                'name': data['name'],
+                'qualifiers': data.get('qualifiers', ['FULL_NAME', 'EMAIL', 'PHONE_NUMBER']),
+                'questions': data.get('questions', []),
+                'privacy_policy': data.get('privacy_policy', {'url': 'https://example.com/privacy'}),
+                'follow_up_action_url': data.get('follow_up_action_url', ''),
+            }
+            r = requests.post(url, json=payload, params={'access_token': agent.meta_api.access_token})
+            result = r.json()
+            if 'id' in result:
+                return jsonify({'success': True, 'form_id': result['id'], 'name': data['name']})
+            return jsonify({'success': False, 'error': result.get('error', {}).get('message', 'Unknown error')})
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)})
 
     @app.route('/api/accounts')
     def api_accounts():
-        return jsonify({'accounts': ads_agent.get_accounts(), 'current': ads_agent.meta_api.ad_account_id})
+        sensitive = ('token', 'secret', 'password', 'access_token', 'app_secret', 'page_token')
+        raw = resolve_agent().get_accounts()
+        safe = {}
+        for aid, cfg in raw.items():
+            safe[aid] = {k: ('***' if any(s in k.lower() for s in sensitive) else v) for k, v in cfg.items()}
+        return jsonify({'accounts': safe, 'current': resolve_agent().meta_api.ad_account_id})
 
     @app.route('/api/accounts/save', methods=['POST'])
+    @require_tenant_auth
     def api_save_account():
         data = request.get_json()
-        aid = ads_agent.save_account(data)
+        aid = resolve_agent().save_account(data)
         if aid:
             return jsonify({'success': True, 'id': aid})
         return jsonify({'success': False, 'error': 'Could not save account'}), 400
 
     @app.route('/api/accounts/delete/<account_id>', methods=['POST'])
+    @require_tenant_auth
     def api_delete_account(account_id):
-        if ads_agent.delete_account(account_id):
+        if resolve_agent().delete_account(account_id):
             return jsonify({'success': True})
         return jsonify({'success': False, 'error': 'Account not found'}), 404
 
     @app.route('/api/reports')
     def api_reports():
-        campaigns = ads_agent.get_all_campaigns()
+        campaigns = resolve_agent().get_all_campaigns()
         total_spend = 0
         total_leads = 0
         total_clicks = 0
@@ -4359,6 +8468,7 @@ def create_web_interface(ads_agent):
         })
 
     @app.route('/api/pixel', methods=['GET', 'POST'])
+    @require_tenant_auth
     def api_pixel():
         pixel_file = os.path.join(os.path.dirname(__file__), 'pixel_config.json')
         if request.method == 'POST':
@@ -4380,7 +8490,45 @@ def create_web_interface(ads_agent):
     def api_posts():
         return jsonify({'posts': scheduler.get_all_posts()})
 
+    @app.route('/api/posts/<post_id>')
+    def api_post_detail(post_id):
+        post = scheduler.get_post(post_id)
+        if not post:
+            return jsonify({'error': 'Not found'}), 404
+        return jsonify({'post': post})
+
+    @app.route('/api/posts/repeat', methods=['POST'])
+    @require_tenant_auth
+    def api_repeat_post():
+        data = request.get_json()
+        if not data or not data.get('source_id') or not data.get('times'):
+            return jsonify({'success': False, 'error': 'Missing data'}), 400
+        times = data['times']
+        created = []
+        for i, t in enumerate(times):
+            post_data = {
+                'platform': data.get('platform', 'facebook'),
+                'content_type': data.get('content_type', 'image'),
+                'headline': data.get('headline', ''),
+                'message': data.get('message', ''),
+                'ai_instruction': data.get('ai_instruction', ''),
+                'cta': data.get('cta', ''),
+                'link_url': data.get('link_url', ''),
+                'media_file': '',
+                'media_url': '',
+                'media_urls': [],
+                'media_files': [],
+                'scheduled_time': t,
+                'status': 'scheduled'
+            }
+            if i > 0:
+                time.sleep(0.01)
+            post = scheduler.create_post(post_data)
+            created.append(post)
+        return jsonify({'success': True, 'count': len(created), 'posts': created})
+
     @app.route('/api/posts/create', methods=['POST'])
+    @require_tenant_auth
     def api_create_post():
         data = request.get_json()
         if not data:
@@ -4393,7 +8541,10 @@ def create_web_interface(ads_agent):
         post_data = {
             'platform': platform,
             'content_type': data.get('content_type', 'image'),
+            'headline': data.get('headline', ''),
             'message': message,
+            'ai_instruction': data.get('ai_instruction', ''),
+            'cta': data.get('cta', ''),
             'media_file': data.get('media_file', ''),
             'media_url': data.get('media_url', ''),
             'media_urls': data.get('media_urls', []),
@@ -4419,6 +8570,7 @@ def create_web_interface(ads_agent):
         return jsonify({'success': True, 'post': post, 'published': published})
 
     @app.route('/api/posts/publish/<post_id>', methods=['POST'])
+    @require_tenant_auth
     def api_publish_post(post_id):
         result = scheduler.publish_now(post_id)
         if 'error' in result:
@@ -4429,22 +8581,346 @@ def create_web_interface(ads_agent):
         return jsonify({'success': True, 'result': result})
 
     @app.route('/api/posts/delete/<post_id>', methods=['POST'])
+    @require_tenant_auth
     def api_delete_post(post_id):
         if scheduler.delete_post(post_id):
             return jsonify({'success': True})
         return jsonify({'success': False, 'error': 'Post not found'}), 404
 
     @app.route('/api/posts/restore/<post_id>', methods=['POST'])
+    @require_tenant_auth
     def api_restore_post(post_id):
         if scheduler.restore_post(post_id):
             return jsonify({'success': True})
         return jsonify({'success': False, 'error': 'Post not found'}), 404
 
     @app.route('/api/posts/delete-forever/<post_id>', methods=['POST'])
+    @require_tenant_auth
     def api_delete_forever(post_id):
         if scheduler.delete_forever(post_id):
             return jsonify({'success': True})
         return jsonify({'success': False, 'error': 'Post not found'}), 404
+
+    # Auto Responder routes
+    responder = SocialMediaAutoResponder(ads_agent.meta_api)
+
+    @app.route('/api/responder/status')
+    def api_responder_status():
+        return jsonify({
+            'enabled': responder.enabled,
+            'rules': responder.rules,
+            'use_ai': responder.rules.get('use_ai', True)
+        })
+
+    @app.route('/api/responder/toggle', methods=['POST'])
+    @require_tenant_auth
+    def api_responder_toggle():
+        data = request.get_json()
+        responder.enabled = data.get('enabled', True)
+        return jsonify({'success': True})
+
+    @app.route('/api/responder/rules')
+    def api_responder_rules():
+        return jsonify({'rules': responder.rules.get('rules', [])})
+
+    @app.route('/api/responder/rules/add', methods=['POST'])
+    @require_tenant_auth
+    def api_responder_add_rule():
+        data = request.get_json()
+        rule = responder.add_rule(
+            data.get('keyword', ''),
+            data.get('response_template', ''),
+            data.get('platform', 'all'),
+            data.get('sentiment')
+        )
+        return jsonify({'success': True, 'rule': rule})
+
+    @app.route('/api/responder/rules/delete/<rule_id>', methods=['POST'])
+    @require_tenant_auth
+    def api_responder_delete_rule(rule_id):
+        responder.delete_rule(rule_id)
+        return jsonify({'success': True})
+
+    @app.route('/api/responder/default-response', methods=['POST'])
+    @require_tenant_auth
+    def api_responder_default():
+        data = request.get_json()
+        responder.set_default_response(data.get('text', ''))
+        return jsonify({'success': True})
+
+    @app.route('/api/responder/ai-mode', methods=['POST'])
+    @require_tenant_auth
+    def api_responder_ai_mode():
+        data = request.get_json()
+        responder.set_ai_mode(data.get('enabled', True))
+        return jsonify({'success': True})
+
+    @app.route('/api/responder/log')
+    def api_responder_log():
+        limit = request.args.get('limit', 50, type=int)
+        return jsonify({'responses': responder.get_log(limit)})
+
+    @app.route('/api/responder/scan', methods=['POST'])
+    @require_tenant_auth
+    def api_responder_scan():
+        data = request.get_json()
+        results = responder.auto_respond_all(data.get('page_id'), data.get('limit', 20))
+        return jsonify({'success': True, 'results': results})
+
+    # Multi-Platform Scheduler routes
+    multi_scheduler = MultiPlatformScheduler(ads_agent.meta_api)
+    multi_scheduler.start_auto_publish()
+
+    @app.route('/api/multi-scheduler/queue')
+    def api_multi_queue():
+        return jsonify({'items': multi_scheduler.get_queue()})
+
+    @app.route('/api/multi-scheduler/item/<item_id>')
+    def api_multi_item(item_id):
+        item = multi_scheduler.get_item(item_id)
+        if not item:
+            return jsonify({'error': 'Not found'}), 404
+        return jsonify({'item': item})
+
+    @app.route('/api/multi-scheduler/repeat', methods=['POST'])
+    @require_tenant_auth
+    def api_multi_repeat():
+        data = request.get_json()
+        if not data or not data.get('source_id') or not data.get('times'):
+            return jsonify({'success': False, 'error': 'Missing data'}), 400
+        times = data['times']
+        source = multi_scheduler.get_item(data['source_id'])
+        if not source:
+            return jsonify({'success': False, 'error': 'Source not found'}), 404
+        platforms = source.get('platforms', ['facebook'])
+        created = []
+        for i, t in enumerate(times):
+            if i > 0:
+                time.sleep(0.01)
+            item = multi_scheduler.schedule_post(
+                platforms,
+                data.get('message', ''),
+                scheduled_time=t,
+                content_type=source.get('content_type', 'image'),
+                link_url=data.get('link_url', ''),
+                headline=data.get('headline', ''),
+                ai_instruction=data.get('ai_instruction', ''),
+                cta=data.get('cta', '')
+            )
+            created.append(item)
+        return jsonify({'success': True, 'count': len(created), 'items': created})
+
+    @app.route('/api/multi-scheduler/schedule', methods=['POST'])
+    @require_tenant_auth
+    def api_multi_schedule():
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'error': 'No data'}), 400
+        platforms = data.get('platforms', ['facebook'])
+        message = data.get('message', '')
+        media_urls = data.get('media_urls', [])
+        scheduled_time = data.get('scheduled_time')
+        content_type = data.get('content_type', 'image')
+        link_url = data.get('link_url', '')
+        media_file = data.get('media_file', '')
+        media_files = data.get('media_files', [])
+        headline = data.get('headline', '')
+        ai_instruction = data.get('ai_instruction', '')
+        cta = data.get('cta', '')
+        item = multi_scheduler.schedule_post(platforms, message, media_urls, scheduled_time, content_type=content_type, link_url=link_url, media_file=media_file, media_files=media_files, headline=headline, ai_instruction=ai_instruction, cta=cta)
+        return jsonify({'success': True, 'item': item})
+
+    @app.route('/api/multi-scheduler/publish/<item_id>', methods=['POST'])
+    @require_tenant_auth
+    def api_multi_publish(item_id):
+        results = multi_scheduler.publish_item(item_id)
+        return jsonify({'success': True, 'results': results})
+
+    @app.route('/api/multi-scheduler/publish-pending', methods=['POST'])
+    @require_tenant_auth
+    def api_multi_publish_pending():
+        results = multi_scheduler.publish_pending()
+        return jsonify({'success': True, 'results': results})
+
+    @app.route('/api/multi-scheduler/delete/<item_id>', methods=['POST'])
+    @require_tenant_auth
+    def api_multi_delete(item_id):
+        multi_scheduler.delete_item(item_id)
+        return jsonify({'success': True})
+
+    # Lead Management routes
+    lead_mgmt = AdvancedLeadManagement(ads_agent.meta_api)
+
+    @app.route('/api/leads-v2')
+    def api_leads_v2():
+        status = request.args.get('status')
+        limit = request.args.get('limit', 100, type=int)
+        return jsonify({'leads': lead_mgmt.get_leads(status, limit)})
+
+    @app.route('/api/leads-v2/stats')
+    def api_leads_v2_stats():
+        return jsonify(lead_mgmt.get_lead_stats())
+
+    @app.route('/api/kpi-panel')
+    def api_kpi_panel():
+        """The 3 numbers that actually answer 'is this working': cost per lead,
+        % that book a trial class, % that enroll. Real ad spend comes straight
+        from Meta's Insights API (not the daily_budget setting -- actual money
+        spent). Optionally filter by date range and/or a specific campaign."""
+        agent = resolve_agent()
+        date_from = request.args.get('from')  # 'YYYY-MM-DD', optional
+        date_to = request.args.get('to')
+        campaign_id_filter = request.args.get('campaign_id')
+
+        # 1) Real spend, straight from Meta -- sum across the relevant campaigns
+        total_spend = 0.0
+        campaigns_included = []
+        for cid, c in agent.campaigns.items():
+            if c.get('status') in ('TRASHED',):
+                continue
+            if campaign_id_filter and cid != campaign_id_filter:
+                continue
+            try:
+                metrics = agent.performance_optimizer.get_campaign_metrics(cid)
+                total_spend += metrics.get('spend', 0) or 0
+                campaigns_included.append(cid)
+            except Exception as e:
+                print(f"[kpi-panel] could not fetch metrics for {cid}: {e}")
+
+        # 2) Leads, filtered by date range if given (using imported_at / created_time)
+        def in_range(lead):
+            if not date_from and not date_to:
+                return True
+            ts = (lead.get('imported_at') or lead.get('created_time') or '')[:10]
+            if date_from and ts < date_from:
+                return False
+            if date_to and ts > date_to:
+                return False
+            return True
+
+        leads = [l for l in lead_mgmt.leads.get('leads', []) if in_range(l)]
+        total_leads = len(leads)
+        trial_booked = sum(1 for l in leads if l.get('status') in ('trial_booked', 'converted'))
+        enrolled = sum(1 for l in leads if l.get('status') == 'converted')
+        lost = sum(1 for l in leads if l.get('status') == 'lost')
+
+        cost_per_lead = round(total_spend / total_leads, 2) if total_leads else None
+        booking_rate = round(trial_booked / total_leads * 100, 1) if total_leads else None
+        enrollment_rate = round(enrolled / total_leads * 100, 1) if total_leads else None
+        close_rate_from_trial = round(enrolled / trial_booked * 100, 1) if trial_booked else None
+        cost_per_enrollment = round(total_spend / enrolled, 2) if enrolled else None
+
+        # Simple confidence flag -- so the number isn't mistaken for a verdict
+        # before there's enough data to mean anything (per Meta's own guidance:
+        # ~50 conversions/week is 'fully learned'; we flag well below that too).
+        if total_leads == 0:
+            confidence = 'sin_datos'
+        elif total_leads < 10:
+            confidence = 'muy_bajo'
+        elif total_leads < 30:
+            confidence = 'bajo'
+        else:
+            confidence = 'aceptable'
+
+        return jsonify({
+            'success': True,
+            'tenant_id': getattr(agent, 'tenant_id', 'default'),
+            'period': {'from': date_from, 'to': date_to},
+            'campaigns_included': campaigns_included,
+            'total_spend': round(total_spend, 2),
+            'total_leads': total_leads,
+            'cost_per_lead': cost_per_lead,
+            'trial_booked_count': trial_booked,
+            'booking_rate_pct': booking_rate,
+            'enrolled_count': enrolled,
+            'enrollment_rate_pct': enrollment_rate,
+            'close_rate_from_trial_pct': close_rate_from_trial,
+            'cost_per_enrollment': cost_per_enrollment,
+            'lost_count': lost,
+            'confidence': confidence,
+            'confidence_note': {
+                'sin_datos': 'No leads recorded for this period yet.',
+                'muy_bajo': 'Fewer than 10 leads \u2014 just an initial sample, don\'t draw conclusions yet.',
+                'bajo': 'Between 10 and 30 leads \u2014 starting to be useful, but wait for more before making big changes.',
+                'aceptable': '30+ leads \u2014 enough to start trusting these numbers.'
+            }[confidence]
+        })
+
+    @app.route('/api/leads-v2/fetch-meta', methods=['POST'])
+    @require_tenant_auth
+    def api_leads_v2_fetch():
+        data = request.get_json() or {}
+        ads = lead_mgmt.fetch_meta_leads(data.get('ad_id'), data.get('limit', 50))
+        return jsonify({'success': True, 'leads_count': len(ads)})
+
+    @app.route('/api/leads-v2/add', methods=['POST'])
+    @require_tenant_auth
+    def api_leads_v2_add():
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'error': 'No data'}), 400
+        lead = lead_mgmt.add_lead_manual(
+            data.get('name', ''),
+            data.get('email', ''),
+            data.get('phone', ''),
+            data.get('source', 'manual'),
+            data.get('notes', ''),
+            data.get('field_data', {})
+        )
+        return jsonify({'success': True, 'lead': lead})
+
+    @app.route('/api/leads-v2/score/<lead_id>', methods=['POST'])
+    @require_tenant_auth
+    def api_leads_v2_score(lead_id):
+        score = lead_mgmt.score_lead(lead_id)
+        return jsonify({'success': True, 'score': score})
+
+    @app.route('/api/leads-v2/status/<lead_id>', methods=['POST'])
+    @require_tenant_auth
+    def api_leads_v2_status(lead_id):
+        data = request.get_json()
+        lead = lead_mgmt.update_lead_status(lead_id, data.get('status', ''), data.get('notes'))
+        if lead:
+            return jsonify({'success': True, 'lead': lead})
+        return jsonify({'success': False, 'error': 'Lead not found'}), 404
+
+    @app.route('/api/leads-v2/delete/<lead_id>', methods=['POST'])
+    @require_tenant_auth
+    def api_leads_v2_delete(lead_id):
+        lead_mgmt.delete_lead(lead_id)
+        return jsonify({'success': True})
+
+    @app.route('/api/leads-v2/workflows')
+    def api_workflows():
+        return jsonify({'workflows': lead_mgmt.workflows.get('workflows', [])})
+
+    @app.route('/api/leads-v2/workflows/create', methods=['POST'])
+    @require_tenant_auth
+    def api_create_workflow():
+        data = request.get_json()
+        wf = lead_mgmt.create_workflow(data.get('name', ''), data.get('steps', []))
+        return jsonify({'success': True, 'workflow': wf})
+
+    @app.route('/api/leads-v2/workflows/delete/<workflow_id>', methods=['POST'])
+    @require_tenant_auth
+    def api_delete_workflow(workflow_id):
+        lead_mgmt.delete_workflow(workflow_id)
+        return jsonify({'success': True})
+
+    @app.route('/api/leads-v2/assign-workflow', methods=['POST'])
+    @require_tenant_auth
+    def api_assign_workflow():
+        data = request.get_json()
+        lead = lead_mgmt.assign_workflow(data.get('lead_id'), data.get('workflow_id'))
+        if lead:
+            return jsonify({'success': True, 'lead': lead})
+        return jsonify({'success': False, 'error': 'Lead not found'}), 404
+
+    @app.route('/api/leads-v2/run-workflows', methods=['POST'])
+    @require_tenant_auth
+    def api_run_workflows():
+        results = lead_mgmt.run_workflows()
+        return jsonify({'success': True, 'results': results})
 
     return app
 
@@ -4480,7 +8956,7 @@ def main():
 
     # Page token loaded from META_PAGE_TOKEN (long-lived, has pages_manage_posts)
 
-    app = create_web_interface(agent)
+    app = create_web_interface(agent, tenant_manager=TenantManager(default_agent=agent))
 
     print("[OK] Agent initialized!")
     print("[WEB] Dashboard: http://localhost:5000")
@@ -4494,10 +8970,60 @@ def main():
                 print(f"[AUTO] Optimization check at {time.strftime('%H:%M')}")
             except: pass
 
+    def token_expiry_check():
+        import smtplib
+        from email.mime.text import MIMEText
+        smtp_host = os.environ.get('SMTP_HOST')
+        smtp_port = int(os.environ.get('SMTP_PORT', 587))
+        smtp_user = os.environ.get('SMTP_USER')
+        smtp_pass = os.environ.get('SMTP_PASS')
+        alert_email = os.environ.get('ALERT_EMAIL')
+        if not all([smtp_host, smtp_user, smtp_pass, alert_email]):
+            return
+        warned = False
+        while True:
+            time.sleep(86400)
+            try:
+                expires_at = getattr(agent.meta_api, 'token_expires_at', None)
+                if expires_at and not warned:
+                    remaining = expires_at - time.time()
+                    if remaining < 7 * 86400:
+                        msg = MIMEText(
+                            f"Your Meta Access Token expires in {int(remaining/86400)} days.\n"
+                            f"Please refresh it in the dashboard Settings page."
+                        )
+                        msg['Subject'] = '[Meta Ads] Token Expiring Soon'
+                        msg['From'] = smtp_user
+                        msg['To'] = alert_email
+                        with smtplib.SMTP(smtp_host, smtp_port) as s:
+                            s.starttls()
+                            s.login(smtp_user, smtp_pass)
+                            s.send_message(msg)
+                        warned = True
+                        print(f"[ALERT] Token expiry email sent to {alert_email}")
+                    elif remaining < 0:
+                        warned = False
+            except Exception as e:
+                print(f"[WARN] Token check failed: {e}")
+
     t = threading.Thread(target=auto_optimize_loop, daemon=True)
     t.start()
+    te = threading.Thread(target=token_expiry_check, daemon=True)
+    te.start()
 
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    host = os.environ.get('HOST', '0.0.0.0')
+    port = int(os.environ.get('PORT', 5000))
+
+    if os.environ.get('PRODUCTION'):
+        try:
+            from waitress import serve
+            print(f"Starting production server on {host}:{port}...")
+            serve(app, host=host, port=port, threads=4)
+        except ImportError:
+            print("waitress not installed, falling back to Flask dev server")
+            app.run(host=host, port=port, debug=False)
+    else:
+        app.run(host=host, port=port, debug=False)
 
 if __name__ == '__main__':
     main()
