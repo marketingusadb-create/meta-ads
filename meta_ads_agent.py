@@ -7096,7 +7096,9 @@ document.addEventListener('DOMContentLoaded', showPaymentButton);
       const tenants = tenantsResp.tenants || {};
       const tenantCount = Object.keys(tenants).length;
 
-      if (tenantCount <= 1) {
+      var needsLogin = tenantCount > 1 || who.password_required;
+
+      if (!needsLogin) {
         return;
       }
       var sel = document.getElementById('tenant-login-id');
@@ -7460,7 +7462,9 @@ def create_web_interface(ads_agent, tenant_manager=None):
         @wraps(view_func)
         def wrapped(*args, **kwargs):
             tid = request.args.get('tenant') or request.headers.get('X-Tenant-Id') or 'default'
-            if tid == 'default' and (tenant_manager is None or len(tenant_manager.tenants) <= 1):
+            cfg = (tenant_manager.tenants.get(tid) if tenant_manager else None) or {}
+            has_password = bool(cfg.get('password_hash'))
+            if tid == 'default' and not has_password and (tenant_manager is None or len(tenant_manager.tenants) <= 1):
                 return view_func(*args, **kwargs)
             if current_session_tenant() != tid:
                 return jsonify({'success': False, 'error': f"Not authenticated for tenant '{tid}'. Please log in first."}), 401
@@ -7478,7 +7482,9 @@ def create_web_interface(ads_agent, tenant_manager=None):
                 role = tenant_manager.tenants[tid].get('role', 'client')
                 if role == 'admin':
                     return view_func(*args, **kwargs)
-            elif tid == 'default' and (tenant_manager is None or len(tenant_manager.tenants) <= 1):
+            cfg = (tenant_manager.tenants.get(tid) if tenant_manager else None) or {}
+            has_password = bool(cfg.get('password_hash'))
+            if tid == 'default' and not has_password and (tenant_manager is None or len(tenant_manager.tenants) <= 1):
                 return view_func(*args, **kwargs)
             return jsonify({'success': False, 'error': 'Admin access required'}), 403
         return wrapped
@@ -7525,11 +7531,12 @@ def create_web_interface(ads_agent, tenant_manager=None):
         role = 'client'
         if tenant_manager and tid in tenant_manager.tenants:
             role = tenant_manager.tenants[tid].get('role', 'client')
+        pw_required = bool((tenant_manager.tenants.get(tid) if tenant_manager else {}).get('password_hash'))
         token_valid = resolve_agent().meta_api.validate_token()
         expires_at = getattr(resolve_agent().meta_api, 'token_expires_at', None)
         return jsonify({
             'success': True, 'tenant_id': tid, 'role': role,
-            'has_session': has_session,
+            'has_session': has_session, 'password_required': pw_required,
             'token_valid': token_valid, 'token_expires_at': expires_at
         })
 
