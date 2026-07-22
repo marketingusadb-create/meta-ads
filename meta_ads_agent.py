@@ -2766,8 +2766,8 @@ HTML_TEMPLATE = """
           <option value="ecommerce">E-commerce</option>
           <option value="medical">Medical</option>
         </select>
-        <input type="text" id="tenant-meta-token" placeholder="Meta Access Token" style="grid-column:span 2;padding:8px;border:1px solid #ddd;border-radius:6px;">
-        <input type="text" id="tenant-ad-account" placeholder="Ad Account ID (act_...)" style="padding:8px;border:1px solid #ddd;border-radius:6px;">
+        <input type="text" id="tenant-meta-token" placeholder="Meta Access Token (optional - client connects later)" style="grid-column:span 2;padding:8px;border:1px solid #ddd;border-radius:6px;">
+        <input type="text" id="tenant-ad-account" placeholder="Ad Account ID (optional - client connects later)" style="padding:8px;border:1px solid #ddd;border-radius:6px;">
         <input type="text" id="tenant-page-token" placeholder="Page Token (optional)" style="padding:8px;border:1px solid #ddd;border-radius:6px;">
         <input type="number" id="tenant-budget" placeholder="Daily Budget Cap ($)" value="50" min="1" style="padding:8px;border:1px solid #ddd;border-radius:6px;">
       </div>
@@ -4998,9 +4998,9 @@ async function createTenant() {
   var pageToken = document.getElementById('tenant-page-token').value.trim();
   var budget = parseInt(document.getElementById('tenant-budget').value) || 50;
   var msgEl = document.getElementById('tenant-create-msg');
-  if (!tid || !name || !password || !metaToken || !adAccount) {
+  if (!tid || !name || !password) {
     msgEl.style.color = '#c0392b';
-    msgEl.textContent = 'Fill in: Client ID, Name, Password, Meta Token, and Ad Account ID.';
+    msgEl.textContent = 'Fill in: Client ID, Name, and Password.';
     return;
   }
   try {
@@ -5009,11 +5009,12 @@ async function createTenant() {
       name: name,
       password: password,
       industry: industry,
-      meta_access_token: metaToken,
-      meta_ad_account_id: adAccount,
       max_total_daily_budget: budget,
-      auto_budget_increase_enabled: false
+      auto_budget_increase_enabled: false,
+      demo_mode: !metaToken
     };
+    if (metaToken) payload.meta_access_token = metaToken;
+    if (adAccount) payload.meta_ad_account_id = adAccount;
     if (pageToken) payload.meta_page_token = pageToken;
     var res = await fetch('/api/tenants', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
     var r = await res.json();
@@ -7055,6 +7056,44 @@ translateDOM();
   <a href="#" onclick="tenantLogout(); return false;" style="color:#93c5fd; text-decoration:none;" data-i18n="logout">logout</a>
 </div>
 
+<!-- Demo mode banner + connect form -->
+<div id="demo-banner" style="display:none; position:fixed; top:0; left:0; right:0; background:linear-gradient(135deg,#f59e0b,#d97706); color:#fff; padding:12px 20px; z-index:99998; box-shadow:0 2px 8px rgba(0,0,0,0.2);">
+  <div style="display:flex; align-items:center; justify-content:space-between; max-width:800px; margin:0 auto; flex-wrap:wrap; gap:8px;">
+    <div>
+      <strong>Demo Mode</strong> — Connect your Facebook account to start running ads.
+    </div>
+    <button onclick="document.getElementById('connect-facebook-modal').style.display='flex'" style="background:#fff; color:#d97706; border:none; padding:8px 16px; border-radius:6px; font-weight:700; cursor:pointer; font-size:13px;">
+      Connect Facebook
+    </button>
+  </div>
+</div>
+
+<!-- Connect Facebook modal for demo clients -->
+<div id="connect-facebook-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:100000; align-items:center; justify-content:center;">
+  <div style="background:#fff; border-radius:12px; padding:28px; width:420px; max-width:90vw; box-shadow:0 10px 40px rgba(0,0,0,0.3);">
+    <h3 style="margin:0 0 4px; font-size:18px;">Connect Your Facebook</h3>
+    <p style="margin:0 0 16px; color:#666; font-size:13px;">Enter your Meta credentials to activate your account and start running ads.</p>
+    <div style="margin-bottom:10px;">
+      <label style="display:block; font-size:12px; color:#444; margin-bottom:4px;">Meta Access Token</label>
+      <input id="connect-meta-token" type="password" placeholder="EAAb9eZAR2Z..." style="width:100%; padding:8px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box; font-size:12px;">
+    </div>
+    <div style="margin-bottom:10px;">
+      <label style="display:block; font-size:12px; color:#444; margin-bottom:4px;">Ad Account ID</label>
+      <input id="connect-ad-account" type="text" placeholder="act_123456789" style="width:100%; padding:8px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;">
+    </div>
+    <div style="margin-bottom:10px;">
+      <label style="display:block; font-size:12px; color:#444; margin-bottom:4px;">Page Token (optional)</label>
+      <input id="connect-page-token" type="password" placeholder="EAAb9e..." style="width:100%; padding:8px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box; font-size:12px;">
+    </div>
+    <div id="connect-msg" style="color:#c0392b; font-size:12px; margin-bottom:10px; display:none;"></div>
+    <div style="display:flex; gap:8px;">
+      <button onclick="connectFacebook()" style="flex:1; padding:10px; background:#2563eb; color:#fff; border:none; border-radius:6px; font-weight:600; cursor:pointer;">Connect & Activate</button>
+      <button onclick="document.getElementById('connect-facebook-modal').style.display='none'" style="padding:10px; background:#e4e6eb; border:none; border-radius:6px; cursor:pointer;">Cancel</button>
+    </div>
+    <p style="margin:12px 0 0; color:#666; font-size:11px;">Don't have these? <a href="https://developers.facebook.com/tools/explorer/" target="_blank" style="color:#2563eb;">Learn how to get them</a></p>
+  </div>
+</div>
+
 <!-- Botón de pago configurable (solo admin) -->
 <div id="payment-link-widget" style="position:fixed; bottom:10px; right:10px; z-index:9999; display:none;">
   <button id="payment-link-btn" onclick="openPaymentLink()" style="background:#2ca01c; color:#fff; border:none; padding:8px 14px; border-radius:6px; font-size:12px; cursor:pointer; box-shadow:0 2px 8px rgba(0,0,0,0.2);">
@@ -7083,6 +7122,53 @@ async function showPaymentButton() {
   }
 }
 document.addEventListener('DOMContentLoaded', showPaymentButton);
+async function checkDemoMode() {
+  try {
+    var who = await fetch('/api/whoami').then(r => r.json());
+    var tResp = await fetch('/api/tenants').then(r => r.json());
+    var tenant = (tResp.tenants || {})[who.tenant_id] || {};
+    if (tenant.demo_mode && who.role !== 'admin') {
+      document.getElementById('demo-banner').style.display = 'block';
+      document.body.style.paddingTop = '50px';
+    }
+  } catch(e) {}
+}
+document.addEventListener('DOMContentLoaded', checkDemoMode);
+async function connectFacebook() {
+  var token = document.getElementById('connect-meta-token').value.trim();
+  var adAccount = document.getElementById('connect-ad-account').value.trim();
+  var pageToken = document.getElementById('connect-page-token').value.trim();
+  var msgEl = document.getElementById('connect-msg');
+  msgEl.style.display = 'none';
+  if (!token || !adAccount) {
+    msgEl.textContent = 'Token and Ad Account ID are required.';
+    msgEl.style.display = 'block';
+    return;
+  }
+  try {
+    var payload = {meta_access_token: token, meta_ad_account_id: adAccount};
+    if (pageToken) payload.meta_page_token = pageToken;
+    var res = await fetch('/api/connect', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    var r = await res.json();
+    if (r.success) {
+      msgEl.style.color = '#16a34a';
+      msgEl.textContent = 'Connected! Reloading...';
+      msgEl.style.display = 'block';
+      setTimeout(function() { window.location.reload(); }, 1500);
+    } else {
+      msgEl.style.color = '#c0392b';
+      msgEl.textContent = r.error || 'Error connecting';
+      msgEl.style.display = 'block';
+    }
+  } catch(e) {
+    msgEl.style.color = '#c0392b';
+    msgEl.textContent = 'Error: ' + e.message;
+    msgEl.style.display = 'block';
+  }
+}
 </script>
 
 <script>
@@ -7330,7 +7416,7 @@ class TenantManager:
     def create_tenant(self, tenant_id, config):
         if tenant_id in self.tenants:
             return False, "A tenant with this ID already exists"
-        required = ['meta_access_token', 'meta_ad_account_id', 'password']
+        required = ['password']
         missing = [f for f in required if not config.get(f)]
         if missing:
             return False, f"Missing required fields: {', '.join(missing)}"
@@ -7341,6 +7427,8 @@ class TenantManager:
         config.setdefault('role', 'client')
         config.setdefault('max_total_daily_budget', 50)
         config.setdefault('auto_budget_increase_enabled', False)
+        if not config.get('meta_access_token') or not config.get('meta_ad_account_id'):
+            config.setdefault('demo_mode', True)
         self.tenants[tenant_id] = config
         self._save()
         safety_guard.log('create_tenant', allowed=True, reason=f"New tenant '{tenant_id}' created", tenant_id=tenant_id)
@@ -7789,6 +7877,28 @@ def create_web_interface(ads_agent, tenant_manager=None):
             t['password_hash'] = generate_password_hash(data['password'])
         tenant_manager._save()
         tenant_manager._agents.pop(tenant_id, None)
+        return jsonify({'success': True})
+
+    @app.route('/api/connect', methods=['POST'])
+    def api_connect_facebook():
+        tid = current_session_tenant()
+        if not tid or tid not in (tenant_manager.tenants if tenant_manager else {}):
+            return jsonify({'success': False, 'error': 'Not authenticated. Please log in first.'}), 401
+        data = request.get_json() or {}
+        token = data.get('meta_access_token', '').strip()
+        ad_account = data.get('meta_ad_account_id', '').strip()
+        if not token or not ad_account:
+            return jsonify({'success': False, 'error': 'Token and Ad Account ID required'})
+        if not ad_account.startswith('act_'):
+            ad_account = 'act_' + ad_account
+        t = tenant_manager.tenants[tid]
+        t['meta_access_token'] = token
+        t['meta_ad_account_id'] = ad_account
+        t['demo_mode'] = False
+        if data.get('meta_page_token'):
+            t['meta_page_token'] = data['meta_page_token'].strip()
+        tenant_manager._save()
+        tenant_manager._agents.pop(tid, None)
         return jsonify({'success': True})
 
     @app.route('/api/tenants/<tenant_id>', methods=['DELETE'])
