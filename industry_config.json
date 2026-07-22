@@ -1,0 +1,250 @@
+{
+  "restaurant": {
+    "primary_offering": "Food and Dining",
+    "peak_hours": "lunch and dinner",
+    "target_demographics": "families and young professionals",
+    "conversion_factors": [
+      "ambiance",
+      "price",
+      "location",
+      "reviews"
+    ],
+    "primary_interests": [
+      "food",
+      "dining",
+      "cooking",
+      "restaurants"
+    ],
+    "secondary_interests": [
+      "travel",
+      "entertainment",
+      "socializing"
+    ],
+    "age_groups": [
+      "25-44",
+      "45-64"
+    ],
+    "budget_split": {
+      "facebook": 40,
+      "instagram": 30,
+      "messenger": 20,
+      "whatsapp": 10
+    },
+    "estimated_roas": 3.5,
+    "objectives": [
+      "OUTCOME_LEADS",
+      "OUTCOME_TRAFFIC",
+      "OUTCOME_SALES"
+    ],
+    "ad_types": [
+      "image carousel",
+      "video ads",
+      "collection"
+    ]
+  },
+  "retail": {
+    "primary_offering": "Retail Products",
+    "peak_hours": "weekends and evenings",
+    "target_demographics": "all age groups",
+    "conversion_factors": [
+      "price",
+      "quality",
+      "convenience",
+      "brand"
+    ],
+    "primary_interests": [
+      "shopping",
+      "fashion",
+      "deals",
+      "products"
+    ],
+    "secondary_interests": [
+      "travel",
+      "entertainment",
+      "home improvement"
+    ],
+    "age_groups": [
+      "18-34",
+      "35-54"
+    ],
+    "budget_split": {
+      "facebook_feed": 50,
+      "instagram_feed": 30,
+      "facebook_marketplace": 20
+    },
+    "estimated_roas": 4.2,
+    "objectives": [
+      "OUTCOME_SALES",
+      "OUTCOME_LEADS",
+      "OUTCOME_AWARENESS"
+    ],
+    "ad_types": [
+      "carousel ads",
+      "video ads",
+      "story ads"
+    ]
+  },
+  "service": {
+    "primary_offering": "Professional Services",
+    "peak_hours": "business hours",
+    "target_demographics": "adults and businesses",
+    "conversion_factors": [
+      "reputation",
+      "expertise",
+      "cost",
+      "convenience"
+    ],
+    "primary_interests": [
+      "professional services",
+      "expertise",
+      "advice"
+    ],
+    "secondary_interests": [
+      "finance",
+      "insurance",
+      "real estate"
+    ],
+    "age_groups": [
+      "35-54",
+      "55+"
+    ],
+    "budget_split": {
+      "facebook": 50,
+      "instagram": 30,
+      "messenger": 20
+    },
+    "estimated_roas": 5.1,
+    "objectives": [
+      "OUTCOME_LEADS",
+      "OUTCOME_TRAFFIC",
+      "OUTCOME_SALES"
+    ],
+    "ad_types": [
+      "image ads",
+      "text ads",
+      "video ads"
+    ]
+  },
+  "ecommerce": {
+    "primary_offering": "E-commerce",
+    "peak_hours": "weekends and holidays",
+    "target_demographics": "tech-savvy shoppers",
+    "conversion_factors": [
+      "price",
+      "reviews",
+      "shipping",
+      "return policy"
+    ],
+    "primary_interests": [
+      "online shopping",
+      "deals",
+      "reviews",
+      "products"
+    ],
+    "secondary_interests": [
+      "technology",
+      "finance",
+      "travel"
+    ],
+    "age_groups": [
+      "18-34",
+      "35-54"
+    ],
+    "budget_split": {
+      "facebook": 35,
+      "instagram": 35,
+      "google_ads": 30
+    },
+    "estimated_roas": 6.8,
+    "objectives": [
+      "OUTCOME_SALES",
+      "OUTCOME_TRAFFIC",
+      "OUTCOME_AWARENESS"
+    ],
+    "ad_types": [
+      "product carousel",
+      "video ads",
+      "collection ads"
+    ]
+  },
+  "martialarts": {
+    "primary_offering": "classes",
+    "peak_hours": "afternoons and weekends",
+    "target_demographics": "adults and children",
+    "conversion_factors": [
+      "instructor quality",
+      "location",
+      "pricing",
+      "community"
+    ],
+    "primary_interests": [
+      "martial arts",
+      "self defense",
+      "karate",
+      "fitness for kids",
+      "discipline"
+    ],
+    "secondary_interests": [
+      "parenting",
+      "family activities",
+      "health and fitness"
+    ],
+    "age_groups": [
+      "25-54"
+    ],
+    "budget_split": {
+      "facebook": 40,
+      "instagram": 35,
+      "messenger": 25
+    },
+    "estimated_roas": 4.0,
+    "objectives": [
+      "OUTCOME_LEADS",
+      "OUTCOME_TRAFFIC"
+    ],
+    "ad_types": [
+      "image ads",
+      "video ads",
+      "carousel ads"
+    ]
+  },
+  "medical": {
+    "primary_offering": "services",
+    "peak_hours": "business hours",
+    "target_demographics": "adults and families",
+    "conversion_factors": [
+      "credentials",
+      "location",
+      "insurance",
+      "reviews"
+    ],
+    "primary_interests": [
+      "health",
+      "wellness",
+      "medical care"
+    ],
+    "secondary_interests": [
+      "insurance",
+      "family health"
+    ],
+    "age_groups": [
+      "35-64"
+    ],
+    "budget_split": {
+      "facebook": 50,
+      "instagram": 25,
+      "messenger": 25
+    },
+    "estimated_roas": 4.0,
+    "objectives": [
+      "OUTCOME_LEADS",
+      "OUTCOME_TRAFFIC",
+      "OUTCOME_SALES"
+    ],
+    "ad_types": [
+      "image ads",
+      "text ads",
+      "video ads"
+    ]
+  }
+}
