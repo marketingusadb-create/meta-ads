@@ -3814,7 +3814,7 @@ var langData = {
     token_renew_soon: 'Token: {days} days - Renew soon',
     token_days: 'Token: {days} days',
     confidence_sin_datos: 'No leads recorded for this period yet.',
-    confidence_muy_bajo: 'Fewer than 10 leads \u2014 just an initial sample, don\'t draw conclusions yet.',
+    confidence_muy_bajo: 'Fewer than 10 leads \u2014 just an initial sample, don\\'t draw conclusions yet.',
     confidence_bajo: 'Between 10 and 30 leads \u2014 starting to be useful, but wait for more before making big changes.',
     confidence_aceptable: '30+ leads \u2014 enough to start trusting these numbers.',
   },
