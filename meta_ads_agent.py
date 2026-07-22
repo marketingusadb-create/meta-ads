@@ -2810,7 +2810,7 @@ HTML_TEMPLATE = """
   <div class="section" id="agreement-settings-section" style="display:none; border:2px solid #8b5cf6; border-radius:12px; padding:20px;">
     <h2 style="color:#8b5cf6; margin-bottom:8px;">&#x1f4dc; <span data-i18n="agreement_title">Payment & Service Agreement</span></h2>
     <p style="font-size:.85rem;color:#65676b;margin-bottom:12px;">Review the terms and payment agreement for this account.</p>
-    <button class="btn btn-primary" onclick="document.getElementById('agreement-modal').style.display='flex';" data-i18n="view_agreement">View Agreement</button>
+    <button class="btn btn-primary" onclick="openAgreementForView()" data-i18n="view_agreement">View Agreement</button>
   </div>
 </div>
 <div class="page" id="page-content">
@@ -7142,6 +7142,12 @@ translateDOM();
   </div>
 </div>
 
+<!-- Security warning: shown when admin has no password set -->
+<div id="no-password-warning" style="display:none; position:fixed; top:0; left:0; right:0; background:#dc2626; color:#fff; padding:10px 20px; z-index:100000; align-items:center; justify-content:center; gap:12px; font-size:13px; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.3);">
+  <span>&#9888;&#65039; Tu panel de admin no tiene contraseña — cualquiera con este link puede entrar. / Your admin panel has no password — anyone with this link can get in.</span>
+  <button onclick="document.getElementById('admin-new-password') ? document.getElementById('admin-new-password').scrollIntoView({behavior:'smooth', block:'center'}) : switchPage('tenants');" style="background:#fff; color:#dc2626; border:none; padding:6px 14px; border-radius:6px; font-weight:700; cursor:pointer; font-size:12px;">Set Password</button>
+</div>
+
 <!-- Small badge showing which studio you're logged in as, top-right corner -->
 <div id="tenant-badge" style="display:none; position:fixed; top:10px; right:10px; background:#111827; color:#fff; padding:6px 12px; border-radius:20px; font-size:12px; z-index:9999; align-items:center; gap:8px;">
   <span id="tenant-badge-name"></span>
@@ -7217,6 +7223,7 @@ translateDOM();
     <div style="padding:20px 24px; overflow-y:auto; flex:1; font-size:13px; line-height:1.6; color:#374151;" id="agreement-content">
     </div>
     <div style="padding:16px 24px; border-top:1px solid #e5e7eb; flex-shrink:0;">
+      <button onclick="printAgreement()" style="width:100%; padding:8px; background:#fff; color:#2563eb; border:1px solid #2563eb; border-radius:6px; font-weight:600; cursor:pointer; font-size:13px; margin-bottom:10px;">&#128438; Print / Download PDF</button>
       <label style="display:flex; align-items:flex-start; gap:8px; cursor:pointer; font-size:13px; margin-bottom:12px;">
         <input type="checkbox" id="agreement-checkbox" style="margin-top:3px; width:16px; height:16px;">
         <span data-i18n="agreement_accept_label">I have read and agree to the Payment & Service Agreement</span>
@@ -7348,6 +7355,23 @@ var agreementTexts = {
 
 var agreementCheckbox = document.getElementById('agreement-checkbox');
 var agreementConfirmBtn = document.getElementById('agreement-confirm-btn');
+
+function printAgreement() {
+  var content = document.getElementById('agreement-content').innerHTML;
+  var w = window.open('', '_blank');
+  w.document.write('<html><head><title>Agreement</title><style>body{font-family:Arial,sans-serif;max-width:700px;margin:40px auto;line-height:1.6;color:#222;} h3{color:#111;}</style></head><body>' + content + '</body></html>');
+  w.document.close();
+  w.focus();
+  setTimeout(function() { w.print(); }, 300);
+}
+
+window.openAgreementForView = function() {
+  var content = document.getElementById('agreement-content');
+  content.innerHTML = agreementTexts[lang] || agreementTexts.en;
+  document.getElementById('agreement-modal').style.display = 'flex';
+  document.body.style.overflow = 'hidden';
+};
+
 if (agreementCheckbox) {
   agreementCheckbox.addEventListener('change', function() {
     agreementConfirmBtn.disabled = !this.checked;
@@ -7377,10 +7401,10 @@ window.confirmAgreement = async function() {
 async function checkAgreementStatus() {
   try {
     var resp = await fetch('/api/agreement-status').then(r => r.json());
-    if (!resp.success || resp.is_admin) return;
+    if (!resp.success) return;
     var section = document.getElementById('agreement-settings-section');
     if (section) section.style.display = 'block';
-    if (resp.accepted) return;
+    if (resp.is_admin || resp.accepted) return;
     var modal = document.getElementById('agreement-modal');
     var content = document.getElementById('agreement-content');
     content.innerHTML = agreementTexts[lang] || agreementTexts.en;
@@ -7440,8 +7464,12 @@ async function connectFacebook() {
       var needsLogin = tenantCount > 1 || who.password_required;
 
       if (!needsLogin) {
+        var warnBar = document.getElementById('no-password-warning');
+        if (warnBar) warnBar.style.display = 'flex';
         return;
       }
+      var warnBar2 = document.getElementById('no-password-warning');
+      if (warnBar2) warnBar2.style.display = 'none';
       var sel = document.getElementById('tenant-login-id');
       sel.innerHTML = '';
       Object.keys(tenants).forEach(function(tid) {
@@ -7503,15 +7531,41 @@ async function connectFacebook() {
 <div id="kpi-panel-widget" style="position:fixed; bottom:55px; right:10px; z-index:9998; background:#fff; border-radius:10px; box-shadow:0 2px 12px rgba(0,0,0,0.15); padding:14px 18px; font-size:12px; min-width:280px;">
   <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
     <strong style="font-size:13px;" data-i18n="kpi_title">&#x1f4ca; Is it working?</strong>
-    <a href="#" onclick="loadKpiPanel(); return false;" style="font-size:11px; color:#2563eb; text-decoration:none;" data-i18n="kpi_refresh">&#x21bb; refresh</a>
+    <span>
+      <a href="#" onclick="loadKpiPanel(); return false;" style="font-size:11px; color:#2563eb; text-decoration:none;" data-i18n="kpi_refresh">&#x21bb; refresh</a>
+      <a href="#" onclick="toggleKpiPanel(); return false;" style="font-size:14px; color:#6b7280; text-decoration:none; margin-left:10px;" title="Minimize">&#x2212;</a>
+    </span>
   </div>
+  <div id="kpi-panel-collapsible">
   <div id="kpi-panel-body" style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; text-align:center;">
     <div><div id="kpi-cpl" style="font-size:18px; font-weight:700; color:#111827;">--</div><div style="color:#6b7280;" data-i18n="kpi_cost_per_lead">cost/lead</div></div>
     <div><div id="kpi-booking" style="font-size:18px; font-weight:700; color:#111827;">--</div><div style="color:#6b7280;" data-i18n="kpi_booked">booked</div></div>
     <div><div id="kpi-enroll" style="font-size:18px; font-weight:700; color:#111827;">--</div><div style="color:#6b7280;" data-i18n="kpi_enrolled">enrolled</div></div>
   </div>
   <div id="kpi-confidence-note" style="margin-top:10px; padding-top:8px; border-top:1px solid #eee; color:#6b7280; font-size:11px;"></div>
+  </div>
 </div>
+
+<script>
+function toggleKpiPanel() {
+  var body = document.getElementById('kpi-panel-collapsible');
+  var widget = document.getElementById('kpi-panel-widget');
+  var minimized = body.style.display === 'none';
+  body.style.display = minimized ? 'block' : 'none';
+  widget.style.minWidth = minimized ? '280px' : 'auto';
+  try { localStorage.setItem('kpi_panel_minimized', minimized ? '0' : '1'); } catch(e) {}
+}
+(function() {
+  try {
+    if (localStorage.getItem('kpi_panel_minimized') === '1') {
+      document.addEventListener('DOMContentLoaded', function() {
+        document.getElementById('kpi-panel-collapsible').style.display = 'none';
+        document.getElementById('kpi-panel-widget').style.minWidth = 'auto';
+      });
+    }
+  } catch(e) {}
+})();
+</script>
 
 <script>
 async function loadKpiPanel() {
