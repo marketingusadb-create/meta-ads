@@ -2772,6 +2772,11 @@ HTML_TEMPLATE = """
         <input type="text" id="tenant-ad-account" placeholder="Ad Account ID (optional - client connects later)" style="padding:8px;border:1px solid #ddd;border-radius:6px;">
         <input type="text" id="tenant-page-token" placeholder="Page Token (optional)" style="padding:8px;border:1px solid #ddd;border-radius:6px;">
         <input type="number" id="tenant-budget" placeholder="Daily Budget Cap ($)" value="50" min="1" style="padding:8px;border:1px solid #ddd;border-radius:6px;">
+        <select id="tenant-trial-days" style="padding:8px;border:1px solid #ddd;border-radius:6px;" title="Trial period length">
+          <option value="7">Trial: 7 days</option>
+          <option value="30" selected>Trial: 30 days</option>
+          <option value="0">No trial (paid from day 1)</option>
+        </select>
         <input type="text" id="tenant-payment-url" placeholder="Payment URL for this client (optional)" style="grid-column:span 2;padding:8px;border:1px solid #ddd;border-radius:6px;">
       </div>
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center;">
@@ -5057,6 +5062,7 @@ async function createTenant() {
   var adAccount = document.getElementById('tenant-ad-account').value.trim();
   var pageToken = document.getElementById('tenant-page-token').value.trim();
   var budget = parseInt(document.getElementById('tenant-budget').value) || 50;
+  var trialDays = parseInt(document.getElementById('tenant-trial-days').value);
   var paymentUrl = document.getElementById('tenant-payment-url').value.trim();
   var msgEl = document.getElementById('tenant-create-msg');
   if (!tid || !name || !password) {
@@ -5082,7 +5088,8 @@ async function createTenant() {
       industry: industry,
       max_total_daily_budget: budget,
       auto_budget_increase_enabled: false,
-      demo_mode: !metaToken
+      demo_mode: !metaToken,
+      trial_days: trialDays
     };
     if (metaToken) payload.meta_access_token = metaToken;
     if (adAccount) payload.meta_ad_account_id = adAccount;
