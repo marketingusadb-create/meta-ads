@@ -1,0 +1,67 @@
+# Meta Ads Agent - Credenciales
+# Edita estos valores con tus datos reales
+# ============================================================
+# IMPORTANTE: si compartiste estos tokens en algun chat o los subiste
+# a algun lado fuera de tu maquina, regeneralos antes de usarlos:
+# https://developers.facebook.com/ -> Tu App -> Graph API Explorer
+# ============================================================
+
+META_ACCESS_TOKEN=
+META_AD_ACCOUNT_ID=act_TU_ID_AQUI
+META_APP_ID=
+META_APP_SECRET=
+META_PAGE_TOKEN=
+
+# Opcional - IA para generar copys de anuncios
+# GROQ es gratis sin tarjeta: https://console.groq.com/ -> API Keys
+GROQ_API_KEY=
+GEMINI_API_KEY=
+OPENAI_API_KEY=
+
+SECRET_KEY=cambia-esto-por-algo-unico
+
+# ============================================================
+# SAFETY GUARD - limites de gasto real (NO borrar estas lineas)
+# ============================================================
+# Tope DURO de presupuesto diario TOTAL sumando todas las campanas activas.
+# Ninguna campana nueva ni aumento automatico puede pasar este numero.
+# Cambialo tu mismo cuando quieras gastar mas -- nunca lo decide la IA.
+MAX_TOTAL_DAILY_BUDGET=50
+
+# Si esto esta en false (recomendado para empezar), el optimizador
+# solo SUGIERE subir presupuesto -- nunca lo hace solo.
+# Cambialo a true unicamente cuando ya confies en el historial del sistema.
+AUTO_BUDGET_INCREASE_ENABLED=false
+
+# ============================================================
+# QUICKBOOKS (Intuit) - conexion para cobros/facturacion
+# ============================================================
+# Se obtienen creando una app en https://developer.intuit.com/ -> My Apps -> Create an app
+# Selecciona "QuickBooks Online and Payments" como plataforma.
+QB_CLIENT_ID=
+QB_CLIENT_SECRET=
+# Debe ser EXACTAMENTE la misma URL que registraste en developer.intuit.com
+# como Redirect URI, ej: https://tu-dominio.com/quickbooks/callback
+QB_REDIRECT_URI=
+# 'sandbox' mientras pruebas, 'production' cuando ya sea con tu cuenta real
+QB_ENVIRONMENT=sandbox
+
+# ============================================================
+# SMTP - notificaciones por email (token expiring, alertas)
+# ============================================================
+# Opcional. Si lo dejas vacio, no se envian emails de alerta.
+SMTP_HOST=
+SMTP_PORT=587
+SMTP_USER=
+SMTP_PASS=
+ALERT_EMAIL=
+
+# ============================================================
+# PRODUCTION - configuracion del servidor
+# ============================================================
+# PRODUCTION=true  -> usa waitress (WSGI) en vez de Flask dev server
+# HOST=0.0.0.0     -> interfaz de escucha
+# PORT=5000         -> puerto
+PRODUCTION=
+HOST=
+PORT=
