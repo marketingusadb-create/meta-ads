@@ -2772,6 +2772,7 @@ HTML_TEMPLATE = """
         <input type="text" id="tenant-ad-account" placeholder="Ad Account ID (optional - client connects later)" style="padding:8px;border:1px solid #ddd;border-radius:6px;">
         <input type="text" id="tenant-page-token" placeholder="Page Token (optional)" style="padding:8px;border:1px solid #ddd;border-radius:6px;">
         <input type="number" id="tenant-budget" placeholder="Daily Budget Cap ($)" value="50" min="1" style="padding:8px;border:1px solid #ddd;border-radius:6px;">
+        <input type="text" id="tenant-payment-url" placeholder="Payment URL for this client (optional)" style="grid-column:span 2;padding:8px;border:1px solid #ddd;border-radius:6px;">
       </div>
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center;">
         <button class="btn btn-success" onclick="createTenant()">Create Client</button>
@@ -2801,9 +2802,12 @@ HTML_TEMPLATE = """
       </div>
     </div>
   </div>
+  <div class="section" id="agreement-settings-section" style="display:none; border:2px solid #8b5cf6; border-radius:12px; padding:20px;">
+    <h2 style="color:#8b5cf6; margin-bottom:8px;">&#x1f4dc; <span data-i18n="agreement_title">Payment & Service Agreement</span></h2>
+    <p style="font-size:.85rem;color:#65676b;margin-bottom:12px;">Review the terms and payment agreement for this account.</p>
+    <button class="btn btn-primary" onclick="document.getElementById('agreement-modal').style.display='flex';" data-i18n="view_agreement">View Agreement</button>
+  </div>
 </div>
-
-<!-- ===== PAGE: CONTENT ===== -->
 <div class="page" id="page-content">
   <div class="section">
     <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
@@ -3838,6 +3842,16 @@ var langData = {
     confidence_muy_bajo: 'Fewer than 10 leads \u2014 just an initial sample, don\\'t draw conclusions yet.',
     confidence_bajo: 'Between 10 and 30 leads \u2014 starting to be useful, but wait for more before making big changes.',
     confidence_aceptable: '30+ leads \u2014 enough to start trusting these numbers.',
+    trial_remaining: 'Your trial ends in',
+    trial_days_label: 'days',
+    trial_activate_now: 'Activate Now',
+    trial_expired_title: 'Trial Expired',
+    trial_expired_msg: 'Your 30-day trial has ended. Activate your account to keep using the dashboard.',
+    trial_activate_btn: 'Activate Account',
+    agreement_title: 'Payment & Service Agreement',
+    agreement_accept_label: 'I have read and agree to the Payment & Service Agreement',
+    agreement_confirm: 'I Accept',
+    view_agreement: 'View Agreement',
   },
   es: {
     title: 'Panel de Control de Anuncios',
@@ -4253,6 +4267,16 @@ var langData = {
     confidence_muy_bajo: 'Menos de 10 leads \u2014 es solo una muestra inicial, no saques conclusiones todav\u00eda.',
     confidence_bajo: 'Entre 10 y 30 leads \u2014 ya empieza a ser \u00fatil, pero espera a tener m\u00e1s para decidir cambios grandes.',
     confidence_aceptable: '30+ leads \u2014 suficiente para empezar a confiar en estos n\u00fameros.',
+    trial_remaining: 'Tu prueba termina en',
+    trial_days_label: 'd\u00edas',
+    trial_activate_now: 'Activar Ahora',
+    trial_expired_title: 'Prueba Expirada',
+    trial_expired_msg: 'Tu prueba de 30 d\u00edas ha terminado. Activa tu cuenta para seguir usando el panel.',
+    trial_activate_btn: 'Activar Cuenta',
+    agreement_title: 'Acuerdo de Pago y Servicio',
+    agreement_accept_label: 'He leido y acepto el Acuerdo de Pago y Servicio',
+    agreement_confirm: 'Acepto',
+    view_agreement: 'Ver Acuerdo',
   }
 };
 function _t(key) { return langData[lang] && langData[lang][key] !== undefined ? langData[lang][key] : langData.en[key] || key; }
@@ -4969,6 +4993,7 @@ async function loadTenants() {
       container.innerHTML = '<p style="color:#65676b;">No clients yet.</p>';
       return;
     }
+    var now = Math.floor(Date.now() / 1000);
     var html = '';
     keys.forEach(function(tid) {
       var t = tenants[tid];
@@ -4976,19 +5001,50 @@ async function loadTenants() {
       var label = t.name || tid;
       var industry = t.industry || '-';
       var budget = t.max_total_daily_budget || 50;
+      var trialHtml = '';
+      if (!isDefault && t.created_at) {
+        var trialDays = t.trial_days || 30;
+        var trialEnd = t.created_at + (trialDays * 86400);
+        var daysLeft = Math.max(0, Math.ceil((trialEnd - now) / 86400));
+        var expired = now > trialEnd;
+        if (expired) {
+          trialHtml = ' <span style="background:#dc2626;color:#fff;font-size:10px;padding:2px 6px;border-radius:4px;">Expired</span>';
+        } else if (daysLeft <= 10) {
+          trialHtml = ' <span style="background:#f59e0b;color:#fff;font-size:10px;padding:2px 6px;border-radius:4px;">Trial: ' + daysLeft + 'd</span>';
+        } else {
+          trialHtml = ' <span style="background:#16a34a;color:#fff;font-size:10px;padding:2px 6px;border-radius:4px;">Active: ' + daysLeft + 'd</span>';
+        }
+      }
+      var demoHtml = t.demo_mode ? ' <span style="background:#f59e0b;color:#fff;font-size:10px;padding:2px 6px;border-radius:4px;">Demo</span>' : '';
+      var agreementHtml = (!isDefault && !t.agreement_accepted) ? ' <span style="background:#8b5cf6;color:#fff;font-size:10px;padding:2px 6px;border-radius:4px;">No Agreement</span>' : '';
       html += '<div style="display:flex;align-items:center;justify-content:space-between;padding:12px;border:1px solid #e5e7eb;border-radius:8px;margin-bottom:8px;background:#fafafa;">' +
         '<div><strong>' + _esc(label) + '</strong>' +
         ' <span style="font-size:11px;color:#65676b;">(' + _esc(tid) + ')</span>' +
         (isDefault ? ' <span class="badge" style="background:#2563eb;color:#fff;font-size:10px;">Admin</span>' : '') +
+        trialHtml + demoHtml + agreementHtml +
         '<br><span style="font-size:.8rem;color:#65676b;">' + _esc(industry) + ' | Budget cap: $' + budget + '/day</span></div>' +
         '<div style="display:flex;gap:6px;align-items:center;">' +
         '<a href="/?tenant=' + _esc(tid) + '" style="font-size:12px;color:#2563eb;text-decoration:none;">Open &rarr;</a>' +
         '<button class="btn btn-sm" style="background:#e4e6eb;" onclick="editTenant(\\x27' + _esc(tid) + '\\x27)">Edit</button>' +
+        (!isDefault ? '<button class="btn btn-sm" style="background:#fef3c7;color:#92400e;" onclick="resetTrial(\\x27' + _esc(tid) + '\\x27)">Reset Trial</button>' : '') +
         (isDefault ? '' : '<button class="btn btn-sm btn-danger" onclick="deleteTenant(\\x27' + _esc(tid) + '\\x27)">Delete</button>') +
         '</div></div>';
     });
     container.innerHTML = html;
   } catch(e) {}
+}
+
+async function resetTrial(tid) {
+  if (!confirm('Reset 30-day trial for "' + tid + '"?')) return;
+  try {
+    var res = await fetch('/api/tenants/' + tid, {
+      method: 'PUT', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({reset_trial: true})
+    });
+    var r = await res.json();
+    if (r.success) { showToast('Trial reset for ' + tid); loadTenants(); }
+    else showToast('Error: ' + (r.error || ''), true);
+  } catch(e) { showToast('Error: ' + e.message, true); }
 }
 
 async function createTenant() {
@@ -5001,6 +5057,7 @@ async function createTenant() {
   var adAccount = document.getElementById('tenant-ad-account').value.trim();
   var pageToken = document.getElementById('tenant-page-token').value.trim();
   var budget = parseInt(document.getElementById('tenant-budget').value) || 50;
+  var paymentUrl = document.getElementById('tenant-payment-url').value.trim();
   var msgEl = document.getElementById('tenant-create-msg');
   if (!tid || !name || !password) {
     msgEl.style.color = '#c0392b';
@@ -5030,6 +5087,7 @@ async function createTenant() {
     if (metaToken) payload.meta_access_token = metaToken;
     if (adAccount) payload.meta_ad_account_id = adAccount;
     if (pageToken) payload.meta_page_token = pageToken;
+    if (paymentUrl) payload.payment_url = paymentUrl;
     var res = await fetch('/api/tenants', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
     var r = await res.json();
     if (r.success) {
@@ -5041,6 +5099,7 @@ async function createTenant() {
       document.getElementById('tenant-meta-token').value = '';
       document.getElementById('tenant-ad-account').value = '';
       document.getElementById('tenant-page-token').value = '';
+      document.getElementById('tenant-payment-url').value = '';
       loadTenants();
     } else {
       msgEl.style.color = '#c0392b';
@@ -5100,11 +5159,13 @@ async function editTenant(tid) {
     var newBudget = prompt('Daily Budget Cap ($):', t.max_total_daily_budget || 50);
     var newToken = prompt('Meta Access Token (leave blank to keep current):', '');
     var newAdAccount = prompt('Ad Account ID (leave blank to keep current):', t.meta_ad_account_id || '');
+    var newPaymentUrl = prompt('Payment URL (leave blank to keep current):', t.payment_url || '');
     var payload = {tenant_id: tid, name: newName};
     if (newPass) payload.password = newPass;
     if (newBudget) payload.max_total_daily_budget = parseInt(newBudget) || 50;
     if (newToken) payload.meta_access_token = newToken;
     if (newAdAccount) payload.meta_ad_account_id = newAdAccount;
+    if (newPaymentUrl !== null && newPaymentUrl !== '') payload.payment_url = newPaymentUrl;
     var saveRes = await fetch('/api/tenants/' + tid, {
       method: 'PUT', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(payload)
@@ -7118,6 +7179,47 @@ translateDOM();
   </div>
 </div>
 
+<!-- Trial countdown banner -->
+<div id="trial-banner" style="display:none; position:fixed; top:0; left:0; right:0; background:linear-gradient(135deg,#3b82f6,#1d4ed8); color:#fff; padding:12px 20px; z-index:99998; box-shadow:0 2px 8px rgba(0,0,0,0.2);">
+  <div style="display:flex; align-items:center; justify-content:space-between; max-width:800px; margin:0 auto; flex-wrap:wrap; gap:8px;">
+    <div>
+      <span data-i18n="trial_remaining">Your trial ends in</span> <strong id="trial-days-num">0</strong> <span data-i18n="trial_days_label">days</span>.
+    </div>
+    <button onclick="openTrialActivate()" style="background:#fff; color:#1d4ed8; border:none; padding:8px 16px; border-radius:6px; font-weight:700; cursor:pointer; font-size:13px;" data-i18n="trial_activate_now">Activate Now</button>
+  </div>
+</div>
+
+<!-- Suspension overlay for expired trials -->
+<div id="trial-suspended-overlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.85); z-index:200000; align-items:center; justify-content:center;">
+  <div style="background:#fff; border-radius:16px; padding:40px; width:480px; max-width:90vw; box-shadow:0 10px 60px rgba(0,0,0,0.5); text-align:center;">
+    <div style="font-size:48px; margin-bottom:12px;">&#x1f534;</div>
+    <h2 style="margin:0 0 8px; font-size:22px; color:#111827;" data-i18n="trial_expired_title">Trial Expired</h2>
+    <p style="margin:0 0 20px; color:#6b7280; font-size:14px; line-height:1.5;" data-i18n="trial_expired_msg">Your 30-day trial has ended. Activate your account to keep using the dashboard.</p>
+    <button onclick="openTrialActivate()" style="padding:12px 32px; background:#2563eb; color:#fff; border:none; border-radius:8px; font-weight:700; cursor:pointer; font-size:15px; margin-bottom:12px;" data-i18n="trial_activate_btn">Activate Account</button>
+    <br>
+    <a href="#" onclick="tenantLogout(); return false;" style="color:#6b7280; font-size:12px; text-decoration:underline;" data-i18n="logout">logout</a>
+  </div>
+</div>
+
+<!-- Payment agreement modal -->
+<div id="agreement-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:200001; align-items:center; justify-content:center;">
+  <div style="background:#fff; border-radius:12px; padding:0; width:600px; max-width:90vw; max-height:85vh; box-shadow:0 10px 60px rgba(0,0,0,0.4); display:flex; flex-direction:column;">
+    <div style="padding:20px 24px 12px; border-bottom:1px solid #e5e7eb; flex-shrink:0;">
+      <h2 style="margin:0; font-size:18px;" data-i18n="agreement_title">Payment & Service Agreement</h2>
+    </div>
+    <div style="padding:20px 24px; overflow-y:auto; flex:1; font-size:13px; line-height:1.6; color:#374151;" id="agreement-content">
+    </div>
+    <div style="padding:16px 24px; border-top:1px solid #e5e7eb; flex-shrink:0;">
+      <label style="display:flex; align-items:flex-start; gap:8px; cursor:pointer; font-size:13px; margin-bottom:12px;">
+        <input type="checkbox" id="agreement-checkbox" style="margin-top:3px; width:16px; height:16px;">
+        <span data-i18n="agreement_accept_label">I have read and agree to the Payment & Service Agreement</span>
+      </label>
+      <div id="agreement-error" style="color:#c0392b; font-size:12px; margin-bottom:8px; display:none;"></div>
+      <button id="agreement-confirm-btn" onclick="confirmAgreement()" disabled style="width:100%; padding:10px; background:#2563eb; color:#fff; border:none; border-radius:6px; font-weight:600; cursor:not-allowed; opacity:0.5; font-size:14px;" data-i18n="agreement_confirm">I Accept</button>
+    </div>
+  </div>
+</div>
+
 <!-- Botón de pago configurable (solo admin) -->
 <div id="payment-link-widget" style="position:fixed; bottom:10px; right:10px; z-index:9999; display:none;">
   <button id="payment-link-btn" onclick="openPaymentLink()" style="background:#2ca01c; color:#fff; border:none; padding:8px 14px; border-radius:6px; font-size:12px; cursor:pointer; box-shadow:0 2px 8px rgba(0,0,0,0.2);">
@@ -7153,11 +7255,133 @@ async function checkDemoMode() {
     var tenant = (tResp.tenants || {})[who.tenant_id] || {};
     if (tenant.demo_mode && who.role !== 'admin') {
       document.getElementById('demo-banner').style.display = 'block';
-      document.body.style.paddingTop = '50px';
     }
   } catch(e) {}
 }
 document.addEventListener('DOMContentLoaded', checkDemoMode);
+
+window.openTrialActivate = function() {
+  var who_cached = null;
+  fetch('/api/whoami').then(r => r.json()).then(function(who) {
+    who_cached = who;
+    return fetch('/api/tenants');
+  }).then(r => r.json()).then(function(tResp) {
+    var tenant = (tResp.tenants || {})[who_cached.tenant_id] || {};
+    var paymentUrl = tenant.payment_url || '';
+    if (paymentUrl) {
+      window.open(paymentUrl, '_blank');
+    } else {
+      alert(lang === 'es' ? 'No hay enlace de pago configurado. Contacte al administrador.' : 'No payment link configured. Please contact your administrator.');
+    }
+  }).catch(function() {
+    alert(lang === 'es' ? 'Error al obtener informacion.' : 'Error fetching information.');
+  });
+};
+
+async function checkTrialStatus() {
+  try {
+    var resp = await fetch('/api/trial-status').then(r => r.json());
+    if (!resp.success || resp.is_admin || resp.no_trial) return;
+    var banner = document.getElementById('trial-banner');
+    var overlay = document.getElementById('trial-suspended-overlay');
+    if (resp.trial_expired) {
+      overlay.style.display = 'flex';
+      document.body.style.overflow = 'hidden';
+    } else if (resp.trial_days_remaining <= 10) {
+      document.getElementById('trial-days-num').textContent = resp.trial_days_remaining;
+      banner.style.display = 'block';
+    }
+    var demoBanner = document.getElementById('demo-banner');
+    var topPadding = 0;
+    if (demoBanner && demoBanner.style.display !== 'none') topPadding += 50;
+    if (banner && banner.style.display !== 'none') topPadding += 50;
+    if (topPadding > 0) document.body.style.paddingTop = topPadding + 'px';
+  } catch(e) {}
+}
+document.addEventListener('DOMContentLoaded', checkTrialStatus);
+
+var agreementTexts = {
+  en: `<h3 style="margin:0 0 12px; font-size:15px;">1. Service Description</h3>
+<p>This platform provides automated Meta (Facebook &amp; Instagram) advertising management services, including campaign creation, optimization, lead tracking, and performance reporting.</p>
+<h3 style="margin:16px 0 12px; font-size:15px;">2. Payment Terms</h3>
+<ul style="margin:0 0 12px; padding-left:20px;">
+  <li>A <strong>3.50% platform fee</strong> is charged on top of your total ad spend for platform maintenance, support, and automation services.</li>
+  <li>Ad spend is billed directly by Meta (Facebook) to your ad account. The 3.50% fee is billed separately by us.</li>
+  <li>Payment is due monthly. Failure to pay may result in account suspension.</li>
+</ul>
+<h3 style="margin:16px 0 12px; font-size:15px;">3. Additional Accounts</h3>
+<p>A <strong>3.50% surcharge</strong> applies to each additional ad account connected to the platform, calculated on the ad spend of each additional account.</p>
+<h3 style="margin:16px 0 12px; font-size:15px;">4. Trial Period</h3>
+<p>New accounts receive a <strong>30-day free trial</strong>. After the trial period, an active payment method or subscription is required to continue using the service.</p>
+<h3 style="margin:16px 0 12px; font-size:15px;">5. Cancellation</h3>
+<p>You may cancel your account at any time. Upon cancellation, your access will be revoked at the end of the current billing period. No refunds are issued for partial months.</p>
+<h3 style="margin:16px 0 12px; font-size:15px;">6. Data &amp; Privacy</h3>
+<p>Your Meta credentials and campaign data are stored securely and are never shared with third parties. We comply with Meta's platform terms and data policies.</p>
+<h3 style="margin:16px 0 12px; font-size:15px;">7. Limitation of Liability</h3>
+<p>The platform is provided "as is." We are not responsible for Meta's ad delivery, algorithm changes, or account suspensions imposed by Meta.</p>`,
+  es: `<h3 style="margin:0 0 12px; font-size:15px;">1. Descripcion del Servicio</h3>
+<p>Esta plataforma proporciona servicios automatizados de gestion de publicidad en Meta (Facebook e Instagram), incluyendo creacion de campanas, optimizacion, seguimiento de leads y reportes de rendimiento.</p>
+<h3 style="margin:16px 0 12px; font-size:15px;">2. Terminos de Pago</h3>
+<ul style="margin:0 0 12px; padding-left:20px;">
+  <li>Se cobra una <strong>tarifa de plataforma del 3.50%</strong> sobre el gasto total en anuncios para mantenimiento, soporte y servicios de automatizacion.</li>
+  <li>El gasto en anuncios es facturado directamente por Meta (Facebook) a tu cuenta de anuncios. La tarifa del 3.50% es facturada por separado por nosotros.</li>
+  <li>El pago es mensual. El no pago puede resultar en la suspension de la cuenta.</li>
+</ul>
+<h3 style="margin:16px 0 12px; font-size:15px;">3. Cuentas Adicionales</h3>
+<p>Se aplica un <strong>recargo del 3.50%</strong> por cada cuenta de anuncios adicional conectada a la plataforma, calculado sobre el gasto de cada cuenta adicional.</p>
+<h3 style="margin:16px 0 12px; font-size:15px;">4. Periodo de Prueba</h3>
+<p>Las cuentas nuevas reciben una <strong>prueba gratuita de 30 dias</strong>. Despues del periodo de prueba, se requiere un metodo de pago activo o una suscripcion para continuar usando el servicio.</p>
+<h3 style="margin:16px 0 12px; font-size:15px;">5. Cancelacion</h3>
+<p>Puedes cancelar tu cuenta en cualquier momento. Al cancelar, tu acceso sera revocado al final del periodo de facturacion actual. No se emiten reembolsos por meses parciales.</p>
+<h3 style="margin:16px 0 12px; font-size:15px;">6. Datos y Privacidad</h3>
+<p>Tus credenciales de Meta y datos de campanas se almacenan de forma segura y nunca se comparten con terceros. Cumplimos con los terminos de plataforma y politicas de datos de Meta.</p>
+<h3 style="margin:16px 0 12px; font-size:15px;">7. Limitacion de Responsabilidad</h3>
+<p>La plataforma se proporciona "tal cual". No somos responsables por la entrega de anuncios de Meta, cambios en algoritmos o suspensiones de cuenta impuestas por Meta.</p>`
+};
+
+var agreementCheckbox = document.getElementById('agreement-checkbox');
+var agreementConfirmBtn = document.getElementById('agreement-confirm-btn');
+if (agreementCheckbox) {
+  agreementCheckbox.addEventListener('change', function() {
+    agreementConfirmBtn.disabled = !this.checked;
+    agreementConfirmBtn.style.cursor = this.checked ? 'pointer' : 'not-allowed';
+    agreementConfirmBtn.style.opacity = this.checked ? '1' : '0.5';
+  });
+}
+
+window.confirmAgreement = async function() {
+  if (!document.getElementById('agreement-checkbox').checked) return;
+  try {
+    var resp = await fetch('/api/accept-agreement', {method: 'POST'});
+    var data = await resp.json();
+    if (data.success) {
+      document.getElementById('agreement-modal').style.display = 'none';
+      document.body.style.overflow = '';
+    } else {
+      document.getElementById('agreement-error').textContent = data.error || 'Error';
+      document.getElementById('agreement-error').style.display = 'block';
+    }
+  } catch(e) {
+    document.getElementById('agreement-error').textContent = 'Error: ' + e.message;
+    document.getElementById('agreement-error').style.display = 'block';
+  }
+};
+
+async function checkAgreementStatus() {
+  try {
+    var resp = await fetch('/api/agreement-status').then(r => r.json());
+    if (!resp.success || resp.is_admin) return;
+    var section = document.getElementById('agreement-settings-section');
+    if (section) section.style.display = 'block';
+    if (resp.accepted) return;
+    var modal = document.getElementById('agreement-modal');
+    var content = document.getElementById('agreement-content');
+    content.innerHTML = agreementTexts[lang] || agreementTexts.en;
+    modal.style.display = 'flex';
+    document.body.style.overflow = 'hidden';
+  } catch(e) {}
+}
+document.addEventListener('DOMContentLoaded', checkAgreementStatus);
 async function connectFacebook() {
   var token = document.getElementById('connect-meta-token').value.trim();
   var adAccount = document.getElementById('connect-ad-account').value.trim();
@@ -7456,6 +7680,9 @@ class TenantManager:
         config.setdefault('auto_budget_increase_enabled', False)
         if not config.get('meta_access_token') or not config.get('meta_ad_account_id'):
             config.setdefault('demo_mode', True)
+        if config.get('role') != 'admin':
+            config.setdefault('created_at', int(time.time()))
+            config.setdefault('trial_days', 30)
         self.tenants[tenant_id] = config
         self._save()
         safety_guard.log('create_tenant', allowed=True, reason=f"New tenant '{tenant_id}' created", tenant_id=tenant_id)
@@ -7649,11 +7876,61 @@ def create_web_interface(ads_agent, tenant_manager=None):
         pw_required = bool((tenant_manager.tenants.get(tid) if tenant_manager else {}).get('password_hash'))
         token_valid = resolve_agent().meta_api.validate_token()
         expires_at = getattr(resolve_agent().meta_api, 'token_expires_at', None)
+        cfg_t = (tenant_manager.tenants.get(tid) if tenant_manager else None) or {}
+        trial_expired = False
+        if cfg_t.get('role', 'client') != 'admin' and cfg_t.get('created_at'):
+            trial_days = cfg_t.get('trial_days', 30)
+            trial_end = cfg_t['created_at'] + (trial_days * 86400)
+            trial_expired = int(time.time()) > trial_end
         return jsonify({
             'success': True, 'tenant_id': tid, 'role': role,
             'has_session': has_session, 'password_required': pw_required,
-            'token_valid': token_valid, 'token_expires_at': expires_at
+            'token_valid': token_valid, 'token_expires_at': expires_at,
+            'trial_expired': trial_expired
         })
+
+    @app.route('/api/trial-status')
+    def api_trial_status():
+        tid = current_session_tenant() or 'default'
+        cfg = (tenant_manager.tenants.get(tid) if tenant_manager else None) or {}
+        role = cfg.get('role', 'client')
+        if role == 'admin':
+            return jsonify({'success': True, 'trial_active': True, 'trial_days_remaining': None, 'trial_expired': False, 'is_admin': True})
+        created_at = cfg.get('created_at')
+        if not created_at:
+            return jsonify({'success': True, 'trial_active': True, 'trial_days_remaining': None, 'trial_expired': False, 'no_trial': True})
+        trial_days = cfg.get('trial_days', 30)
+        trial_end = created_at + (trial_days * 86400)
+        now = int(time.time())
+        days_remaining = max(0, int((trial_end - now) / 86400))
+        trial_expired = now > trial_end
+        return jsonify({
+            'success': True, 'trial_active': not trial_expired,
+            'trial_days_remaining': days_remaining, 'trial_expired': trial_expired,
+            'created_at': created_at, 'trial_end': trial_end, 'is_admin': False
+        })
+
+    @app.route('/api/accept-agreement', methods=['POST'])
+    def api_accept_agreement():
+        tid = current_session_tenant() or 'default'
+        cfg = (tenant_manager.tenants.get(tid) if tenant_manager else None) or {}
+        if not cfg or tid == 'default':
+            return jsonify({'success': False, 'error': 'Invalid tenant'}), 400
+        tenant_manager.tenants[tid]['agreement_accepted'] = True
+        tenant_manager.tenants[tid]['agreement_accepted_at'] = int(time.time())
+        tenant_manager._save()
+        safety_guard.log('agreement_accepted', allowed=True, reason=f"Terms accepted by '{tid}'", tenant_id=tid)
+        return jsonify({'success': True})
+
+    @app.route('/api/agreement-status')
+    def api_agreement_status():
+        tid = current_session_tenant() or 'default'
+        cfg = (tenant_manager.tenants.get(tid) if tenant_manager else None) or {}
+        role = cfg.get('role', 'client')
+        if role == 'admin':
+            return jsonify({'success': True, 'accepted': True, 'is_admin': True})
+        accepted = bool(cfg.get('agreement_accepted'))
+        return jsonify({'success': True, 'accepted': accepted, 'is_admin': False})
 
     scheduler = ContentScheduler(ads_agent.meta_api)
 
@@ -7902,6 +8179,13 @@ def create_web_interface(ads_agent, tenant_manager=None):
         if data.get('password'):
             from werkzeug.security import generate_password_hash
             t['password_hash'] = generate_password_hash(data['password'])
+        if data.get('reset_trial'):
+            t['created_at'] = int(time.time())
+            t['trial_days'] = 30
+            t.pop('agreement_accepted', None)
+            t.pop('agreement_accepted_at', None)
+        if 'payment_url' in data:
+            t['payment_url'] = data['payment_url']
         tenant_manager._save()
         tenant_manager._agents.pop(tenant_id, None)
         return jsonify({'success': True})
