@@ -2589,6 +2589,7 @@ HTML_TEMPLATE = """
   <span style="font-size:1.5rem">&#x1f4ca;</span>
   <h1 data-i18n="title">Meta Ads Agent Dashboard</h1>
   <button id="lang-toggle" onclick="toggleLang()" style="background:#fff;border:1px solid #ddd;border-radius:6px;padding:4px 12px;cursor:pointer;font-size:13px;font-weight:600;margin-left:10px;">ES/EN</button>
+  <button id="logout-btn" onclick="tenantLogout()" style="display:none; background:#dc2626; color:#fff; border:none; border-radius:6px; padding:5px 14px; cursor:pointer; font-size:13px; font-weight:600; margin-left:10px;" data-i18n="logout">Logout</button>
   <span style="margin-left:auto;font-size:.85rem;opacity:.85;" id="token-status"></span>
 </div>
 
@@ -7074,7 +7075,7 @@ translateDOM();
 </div>
 
 <!-- Small badge showing which studio you're logged in as, top-right corner -->
-<div id="tenant-badge" style="display:none; position:fixed; top:10px; right:10px; background:#111827; color:#fff; padding:6px 12px; border-radius:20px; font-size:12px; z-index:9999; display:flex; align-items:center; gap:8px;">
+<div id="tenant-badge" style="display:none; position:fixed; top:10px; right:10px; background:#111827; color:#fff; padding:6px 12px; border-radius:20px; font-size:12px; z-index:9999; align-items:center; gap:8px;">
   <span id="tenant-badge-name"></span>
   <a href="#" onclick="tenantLogout(); return false;" style="color:#93c5fd; text-decoration:none;" data-i18n="logout">logout</a>
 </div>
@@ -7225,6 +7226,7 @@ async function connectFacebook() {
       }
       document.getElementById('tenant-badge').style.display = 'flex';
       document.getElementById('tenant-badge-name').textContent = who.tenant_id;
+      document.getElementById('logout-btn').style.display = 'inline-block';
     } catch (e) {
       console.warn('Auth check failed', e);
     }
