@@ -2779,6 +2779,24 @@ HTML_TEMPLATE = """
     <div style="margin-top:12px;padding:12px;background:#fef3c7;border-radius:8px;font-size:12px;color:#92400e;">
       <strong>How it works:</strong> Each client logs in at your-domain.com/?tenant=CLIENT-ID with their password. They only see their own campaigns and data.
     </div>
+    <div style="margin-top:12px;padding:16px;background:#f0f2f5;border-radius:8px;">
+      <h3 style="font-size:.9rem;margin-bottom:8px;">Admin Password</h3>
+      <p style="font-size:.8rem;color:#65676b;margin-bottom:8px;">Set a password for the admin (default) account. Without this, anyone with the URL can access the admin panel.</p>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <input type="password" id="admin-new-password" placeholder="New admin password" style="padding:8px;border:1px solid #ddd;border-radius:6px;flex:1;">
+        <button class="btn btn-primary" onclick="setAdminPassword()">Set Password</button>
+        <span id="admin-pw-msg" style="font-size:12px;"></span>
+      </div>
+    </div>
+    <div style="margin-top:12px;padding:16px;background:#f0f2f5;border-radius:8px;">
+      <h3 style="font-size:.9rem;margin-bottom:8px;">Payment Link</h3>
+      <p style="font-size:.8rem;color:#65676b;margin-bottom:8px;">Set a URL for any payment platform (Stripe, PayPal, QuickBooks, etc.). The Payment button will open this link.</p>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <input type="text" id="admin-payment-url" placeholder="https://..." style="padding:8px;border:1px solid #ddd;border-radius:6px;flex:1;">
+        <button class="btn btn-primary" onclick="setPaymentUrl()">Save</button>
+        <span id="admin-pay-msg" style="font-size:12px;"></span>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -4962,6 +4980,7 @@ async function loadTenants() {
         '<br><span style="font-size:.8rem;color:#65676b;">' + _esc(industry) + ' | Budget cap: $' + budget + '/day</span></div>' +
         '<div style="display:flex;gap:6px;align-items:center;">' +
         '<a href="/?tenant=' + _esc(tid) + '" style="font-size:12px;color:#2563eb;text-decoration:none;">Open &rarr;</a>' +
+        '<button class="btn btn-sm" style="background:#e4e6eb;" onclick="editTenant(\\x27' + _esc(tid) + '\\x27)">Edit</button>' +
         (isDefault ? '' : '<button class="btn btn-sm btn-danger" onclick="deleteTenant(\\x27' + _esc(tid) + '\\x27)">Delete</button>') +
         '</div></div>';
     });
@@ -5018,6 +5037,29 @@ async function createTenant() {
   }
 }
 
+async function setAdminPassword() {
+  var pw = document.getElementById('admin-new-password').value;
+  var msgEl = document.getElementById('admin-pw-msg');
+  if (!pw) { msgEl.style.color='#c0392b'; msgEl.textContent='Enter a password'; return; }
+  try {
+    var res = await fetch('/api/tenants/default', {
+      method:'PUT', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({password: pw})
+    });
+    var r = await res.json();
+    if (r.success) { msgEl.style.color='#16a34a'; msgEl.textContent='Password set! Use it next login.'; document.getElementById('admin-new-password').value=''; }
+    else { msgEl.style.color='#c0392b'; msgEl.textContent=r.error||'Error'; }
+  } catch(e) { msgEl.style.color='#c0392b'; msgEl.textContent='Error: '+e.message; }
+}
+
+function setPaymentUrl() {
+  var url = document.getElementById('admin-payment-url').value.trim();
+  var msgEl = document.getElementById('admin-pay-msg');
+  if (!url) { msgEl.style.color='#c0392b'; msgEl.textContent='Enter a URL'; return; }
+  try { localStorage.setItem('payment_url', url); } catch(e) {}
+  msgEl.style.color='#16a34a'; msgEl.textContent='Saved! Payment button updated.';
+}
+
 async function deleteTenant(tid) {
   if (!confirm('Delete client "' + tid + '"? This removes their campaigns and data.')) return;
   try {
@@ -5025,6 +5067,33 @@ async function deleteTenant(tid) {
     var r = await res.json();
     if (r.success) { showToast('Client deleted'); loadTenants(); }
     else showToast('Error: ' + (r.error || ''), true);
+  } catch(e) { showToast('Error: ' + e.message, true); }
+}
+
+async function editTenant(tid) {
+  try {
+    var res = await fetch('/api/tenants');
+    var d = await res.json();
+    var t = (d.tenants || {})[tid];
+    if (!t) { showToast('Client not found', true); return; }
+    var newName = prompt('Client Name:', t.name || tid);
+    if (newName === null) return;
+    var newPass = prompt('New Password (leave blank to keep current):', '');
+    var newBudget = prompt('Daily Budget Cap ($):', t.max_total_daily_budget || 50);
+    var newToken = prompt('Meta Access Token (leave blank to keep current):', '');
+    var newAdAccount = prompt('Ad Account ID (leave blank to keep current):', t.meta_ad_account_id || '');
+    var payload = {tenant_id: tid, name: newName};
+    if (newPass) payload.password = newPass;
+    if (newBudget) payload.max_total_daily_budget = parseInt(newBudget) || 50;
+    if (newToken) payload.meta_access_token = newToken;
+    if (newAdAccount) payload.meta_ad_account_id = newAdAccount;
+    var saveRes = await fetch('/api/tenants/' + tid, {
+      method: 'PUT', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    var sr = await saveRes.json();
+    if (sr.success) { showToast('Client updated'); loadTenants(); }
+    else showToast('Error: ' + (sr.error || ''), true);
   } catch(e) { showToast('Error: ' + e.message, true); }
 }
 
@@ -6986,43 +7055,34 @@ translateDOM();
   <a href="#" onclick="tenantLogout(); return false;" style="color:#93c5fd; text-decoration:none;" data-i18n="logout">logout</a>
 </div>
 
-<!-- Botón para conectar QuickBooks (Intuit) -->
-<div id="qb-connect-widget" style="position:fixed; bottom:10px; right:10px; z-index:9999;">
-  <button id="qb-connect-btn" onclick="connectQuickBooks()" style="background:#2ca01c; color:#fff; border:none; padding:8px 14px; border-radius:6px; font-size:12px; cursor:pointer; box-shadow:0 2px 8px rgba(0,0,0,0.2);">
-    Connect QuickBooks
+<!-- Botón de pago configurable (solo admin) -->
+<div id="payment-link-widget" style="position:fixed; bottom:10px; right:10px; z-index:9999; display:none;">
+  <button id="payment-link-btn" onclick="openPaymentLink()" style="background:#2ca01c; color:#fff; border:none; padding:8px 14px; border-radius:6px; font-size:12px; cursor:pointer; box-shadow:0 2px 8px rgba(0,0,0,0.2);">
+    Payment
   </button>
 </div>
 
 <script>
-async function connectQuickBooks() {
-  const params = new URLSearchParams(window.location.search);
-  const tenant = params.get('tenant') || 'default';
-  try {
-    const resp = await fetch('/api/quickbooks/connect-url?tenant=' + encodeURIComponent(tenant));
-    const data = await resp.json();
-    if (data.success) {
-      window.location = data.connect_url;
-    } else {
-      alert(data.error || 'Could not generate connection URL');
+async function openPaymentLink() {
+  var who = await fetch('/api/whoami').then(r => r.json());
+  if (who.role !== 'admin') return;
+  var url = prompt('Enter payment URL (Stripe, PayPal, QuickBooks, etc.):');
+  if (!url) return;
+  try { localStorage.setItem('payment_url', url); } catch(e) {}
+  window.open(url, '_blank');
+}
+async function showPaymentButton() {
+  var who = await fetch('/api/whoami').then(r => r.json());
+  if (who.role === 'admin') {
+    document.getElementById('payment-link-widget').style.display = 'block';
+    var savedUrl = '';
+    try { savedUrl = localStorage.getItem('payment_url') || ''; } catch(e) {}
+    if (savedUrl) {
+      document.getElementById('payment-link-btn').onclick = function() { window.open(savedUrl, '_blank'); };
     }
-  } catch (e) {
-    alert('Could not connect to server');
   }
 }
-async function refreshQbButton() {
-  const params = new URLSearchParams(window.location.search);
-  const tenant = params.get('tenant') || 'default';
-  try {
-    const resp = await fetch('/api/quickbooks/status?tenant=' + encodeURIComponent(tenant));
-    const data = await resp.json();
-    const btn = document.getElementById('qb-connect-btn');
-    if (data.connected) {
-      btn.textContent = 'QuickBooks connected ✓';
-      btn.style.background = '#6b7280';
-    }
-  } catch (e) {}
-}
-document.addEventListener('DOMContentLoaded', refreshQbButton);
+document.addEventListener('DOMContentLoaded', showPaymentButton);
 </script>
 
 <script>
@@ -7288,7 +7348,6 @@ class TenantManager:
         cfg = self.tenants.get(tenant_id)
         if not cfg:
             return False
-        # 'default' with no password set (classic single-studio setup) -- no login wall.
         if not cfg.get('password_hash'):
             return tenant_id == 'default'
         return check_password_hash(cfg['password_hash'], password)
@@ -7700,6 +7759,30 @@ def create_web_interface(ads_agent, tenant_manager=None):
         tenant_id = data.pop('tenant_id')
         ok, msg = tenant_manager.create_tenant(tenant_id, data)
         return jsonify({'success': ok, 'message': msg, 'tenant_id': tenant_id if ok else None})
+
+    @app.route('/api/tenants/<tenant_id>', methods=['PUT'])
+    @admin_required
+    def api_tenants_update(tenant_id):
+        if tenant_manager is None:
+            return jsonify({'success': False, 'error': 'Tenant manager not initialized'})
+        if tenant_id not in tenant_manager.tenants:
+            return jsonify({'success': False, 'error': 'Tenant not found'})
+        data = request.get_json() or {}
+        t = tenant_manager.tenants[tenant_id]
+        if 'name' in data:
+            t['name'] = data['name']
+        if 'max_total_daily_budget' in data:
+            t['max_total_daily_budget'] = int(data['max_total_daily_budget'])
+        if 'meta_access_token' in data:
+            t['meta_access_token'] = data['meta_access_token']
+        if 'meta_ad_account_id' in data:
+            t['meta_ad_account_id'] = data['meta_ad_account_id']
+        if data.get('password'):
+            from werkzeug.security import generate_password_hash
+            t['password_hash'] = generate_password_hash(data['password'])
+        tenant_manager._save()
+        tenant_manager._agents.pop(tenant_id, None)
+        return jsonify({'success': True})
 
     @app.route('/api/tenants/<tenant_id>', methods=['DELETE'])
     @admin_required
