@@ -6968,8 +6968,8 @@ translateDOM();
     <h2 style="margin:0 0 4px; font-size:20px;" data-i18n="login_title">Sign In</h2>
     <p style="margin:0 0 20px; color:#666; font-size:13px;" data-i18n="login_desc">This dashboard has multiple clients configured. Enter your credentials.</p>
     <div style="margin-bottom:12px;">
-      <label style="display:block; font-size:12px; color:#444; margin-bottom:4px;" data-i18n="login_client_id">Client (tenant ID)</label>
-      <input id="tenant-login-id" type="text" style="width:100%; padding:8px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;" placeholder="default">
+      <label style="display:block; font-size:12px; color:#444; margin-bottom:4px;" data-i18n="login_client_id">Client</label>
+      <select id="tenant-login-id" style="width:100%; padding:8px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;"></select>
     </div>
     <div style="margin-bottom:16px;">
       <label style="display:block; font-size:12px; color:#444; margin-bottom:4px;" data-i18n="password">Password</label>
@@ -7030,21 +7030,30 @@ document.addEventListener('DOMContentLoaded', refreshQbButton);
   async function checkAuth() {
     try {
       const params = new URLSearchParams(window.location.search);
-      const requestedTenant = params.get('tenant') || 'default';
+      const requestedTenant = params.get('tenant') || '';
       const who = await fetch('/api/whoami').then(r => r.json());
       const tenantsResp = await fetch('/api/tenants').then(r => r.json());
-      const tenantCount = tenantsResp.tenants ? Object.keys(tenantsResp.tenants).length : 1;
+      const tenants = tenantsResp.tenants || {};
+      const tenantCount = Object.keys(tenants).length;
 
       if (tenantCount <= 1) {
-        return; // classic single-studio setup, no login UI needed
-      }
-      if (who.tenant_id === requestedTenant) {
-        document.getElementById('tenant-badge').style.display = 'flex';
-        document.getElementById('tenant-badge-name').textContent = requestedTenant;
         return;
       }
-      document.getElementById('tenant-login-overlay').style.display = 'flex';
-      document.getElementById('tenant-login-id').value = requestedTenant;
+      var sel = document.getElementById('tenant-login-id');
+      sel.innerHTML = '';
+      Object.keys(tenants).forEach(function(tid) {
+        var opt = document.createElement('option');
+        opt.value = tid;
+        opt.textContent = tenants[tid].name || tid;
+        sel.appendChild(opt);
+      });
+      if (!who.has_session) {
+        if (requestedTenant) sel.value = requestedTenant;
+        document.getElementById('tenant-login-overlay').style.display = 'flex';
+        return;
+      }
+      document.getElementById('tenant-badge').style.display = 'flex';
+      document.getElementById('tenant-badge-name').textContent = who.tenant_id;
     } catch (e) {
       console.warn('Auth check failed', e);
     }
@@ -7087,7 +7096,7 @@ document.addEventListener('DOMContentLoaded', refreshQbButton);
 </script>
 
 <!-- Panel de los 3 numeros que importan: costo por lead, % que agenda, % que se inscribe -->
-<div id="kpi-panel-widget" style="position:fixed; bottom:10px; left:10px; z-index:9998; background:#fff; border-radius:10px; box-shadow:0 2px 12px rgba(0,0,0,0.15); padding:14px 18px; font-size:12px; min-width:280px;">
+<div id="kpi-panel-widget" style="position:fixed; bottom:55px; right:10px; z-index:9998; background:#fff; border-radius:10px; box-shadow:0 2px 12px rgba(0,0,0,0.15); padding:14px 18px; font-size:12px; min-width:280px;">
   <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
     <strong style="font-size:13px;" data-i18n="kpi_title">&#x1f4ca; Is it working?</strong>
     <a href="#" onclick="loadKpiPanel(); return false;" style="font-size:11px; color:#2563eb; text-decoration:none;" data-i18n="kpi_refresh">&#x21bb; refresh</a>
@@ -7451,7 +7460,9 @@ def create_web_interface(ads_agent, tenant_manager=None):
 
     @app.route('/api/whoami')
     def api_whoami():
-        tid = current_session_tenant() or 'default'
+        raw_tid = current_session_tenant()
+        has_session = raw_tid is not None
+        tid = raw_tid or 'default'
         role = 'client'
         if tenant_manager and tid in tenant_manager.tenants:
             role = tenant_manager.tenants[tid].get('role', 'client')
@@ -7459,6 +7470,7 @@ def create_web_interface(ads_agent, tenant_manager=None):
         expires_at = getattr(resolve_agent().meta_api, 'token_expires_at', None)
         return jsonify({
             'success': True, 'tenant_id': tid, 'role': role,
+            'has_session': has_session,
             'token_valid': token_valid, 'token_expires_at': expires_at
         })
 
