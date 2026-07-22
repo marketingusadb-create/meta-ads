@@ -4962,7 +4962,7 @@ async function loadTenants() {
         '<br><span style="font-size:.8rem;color:#65676b;">' + _esc(industry) + ' | Budget cap: $' + budget + '/day</span></div>' +
         '<div style="display:flex;gap:6px;align-items:center;">' +
         '<a href="/?tenant=' + _esc(tid) + '" style="font-size:12px;color:#2563eb;text-decoration:none;">Open &rarr;</a>' +
-        (isDefault ? '' : '<button class="btn btn-sm btn-danger" onclick="deleteTenant(\'' + _esc(tid) + '\')">Delete</button>') +
+        (isDefault ? '' : '<button class="btn btn-sm btn-danger" onclick="deleteTenant(\\x27' + _esc(tid) + '\\x27)">Delete</button>') +
         '</div></div>';
     });
     container.innerHTML = html;
