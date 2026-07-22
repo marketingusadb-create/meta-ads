@@ -2758,6 +2758,7 @@ HTML_TEMPLATE = """
         <input type="text" id="tenant-id" placeholder="Client ID (e.g. dojo-2)" style="padding:8px;border:1px solid #ddd;border-radius:6px;" title="Unique identifier, no spaces">
         <input type="text" id="tenant-name" placeholder="Client Name (e.g. Dojo 2)" style="padding:8px;border:1px solid #ddd;border-radius:6px;">
         <input type="password" id="tenant-password" placeholder="Password" style="padding:8px;border:1px solid #ddd;border-radius:6px;">
+        <input type="password" id="tenant-password-confirm" placeholder="Confirm Password" style="padding:8px;border:1px solid #ddd;border-radius:6px;">
         <select id="tenant-industry" style="padding:8px;border:1px solid #ddd;border-radius:6px;">
           <option value="martialarts">Martial Arts</option>
           <option value="service">Service</option>
@@ -2784,6 +2785,7 @@ HTML_TEMPLATE = """
       <p style="font-size:.8rem;color:#65676b;margin-bottom:8px;">Set a password for the admin (default) account. Without this, anyone with the URL can access the admin panel.</p>
       <div style="display:flex;gap:8px;align-items:center;">
         <input type="password" id="admin-new-password" placeholder="New admin password" style="padding:8px;border:1px solid #ddd;border-radius:6px;flex:1;">
+        <input type="password" id="admin-new-password-confirm" placeholder="Confirm password" style="padding:8px;border:1px solid #ddd;border-radius:6px;flex:1;">
         <button class="btn btn-primary" onclick="setAdminPassword()">Set Password</button>
         <span id="admin-pw-msg" style="font-size:12px;"></span>
       </div>
@@ -4992,6 +4994,7 @@ async function createTenant() {
   var tid = document.getElementById('tenant-id').value.trim().toLowerCase().replace(/[^a-z0-9-]/g, '');
   var name = document.getElementById('tenant-name').value.trim();
   var password = document.getElementById('tenant-password').value;
+  var password2 = document.getElementById('tenant-password-confirm').value;
   var industry = document.getElementById('tenant-industry').value;
   var metaToken = document.getElementById('tenant-meta-token').value.trim();
   var adAccount = document.getElementById('tenant-ad-account').value.trim();
@@ -5001,6 +5004,16 @@ async function createTenant() {
   if (!tid || !name || !password) {
     msgEl.style.color = '#c0392b';
     msgEl.textContent = 'Fill in: Client ID, Name, and Password.';
+    return;
+  }
+  if (password !== password2) {
+    msgEl.style.color = '#c0392b';
+    msgEl.textContent = 'Passwords do not match.';
+    return;
+  }
+  if (password.length < 6) {
+    msgEl.style.color = '#c0392b';
+    msgEl.textContent = 'Password must be at least 6 characters.';
     return;
   }
   try {
@@ -5040,15 +5053,18 @@ async function createTenant() {
 
 async function setAdminPassword() {
   var pw = document.getElementById('admin-new-password').value;
+  var pw2 = document.getElementById('admin-new-password-confirm').value;
   var msgEl = document.getElementById('admin-pw-msg');
   if (!pw) { msgEl.style.color='#c0392b'; msgEl.textContent='Enter a password'; return; }
+  if (pw !== pw2) { msgEl.style.color='#c0392b'; msgEl.textContent='Passwords do not match'; return; }
+  if (pw.length < 6) { msgEl.style.color='#c0392b'; msgEl.textContent='Password must be at least 6 characters'; return; }
   try {
     var res = await fetch('/api/tenants/default', {
       method:'PUT', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({password: pw})
     });
     var r = await res.json();
-    if (r.success) { msgEl.style.color='#16a34a'; msgEl.textContent='Password set! Use it next login.'; document.getElementById('admin-new-password').value=''; }
+    if (r.success) { msgEl.style.color='#16a34a'; msgEl.textContent='Password set! Use it next login.'; document.getElementById('admin-new-password').value=''; document.getElementById('admin-new-password-confirm').value=''; }
     else { msgEl.style.color='#c0392b'; msgEl.textContent=r.error||'Error'; }
   } catch(e) { msgEl.style.color='#c0392b'; msgEl.textContent='Error: '+e.message; }
 }
@@ -5365,9 +5381,16 @@ function showAlert(msg, type) {
 
 async function checkTokenStatus() {
   try {
+    var who = await fetch('/api/whoami').then(r => r.json());
+    var tResp = await fetch('/api/tenants').then(r => r.json());
+    var tenant = (tResp.tenants || {})[who.tenant_id] || {};
+    const el = document.getElementById('token-status');
+    if (tenant.demo_mode) {
+      el.innerHTML = '<span style="color:#f59e0b;">&#9888; Demo Mode</span>';
+      return;
+    }
     const res = await fetch('/api/token-status');
     const data = await res.json();
-    const el = document.getElementById('token-status');
     if (data.expires_at) {
       const days = Math.floor((data.expires_at * 1000 - Date.now()) / (1000*60*60*24));
       if (days > 365) {
@@ -7421,6 +7444,8 @@ class TenantManager:
         if missing:
             return False, f"Missing required fields: {', '.join(missing)}"
         password = config.pop('password')
+        if len(password) < 6:
+            return False, "Password must be at least 6 characters"
         config['password_hash'] = generate_password_hash(password)
         config.setdefault('name', tenant_id)
         config.setdefault('industry', 'service')
