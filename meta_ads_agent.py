@@ -7150,7 +7150,6 @@ translateDOM();
 <!-- Small badge showing which studio you're logged in as, top-right corner -->
 <div id="tenant-badge" style="display:none; position:fixed; top:10px; right:10px; background:#111827; color:#fff; padding:6px 12px; border-radius:20px; font-size:12px; z-index:9999; align-items:center; gap:8px;">
   <span id="tenant-badge-name"></span>
-  <a href="#" onclick="tenantLogout(); return false;" style="color:#93c5fd; text-decoration:none;" data-i18n="logout">logout</a>
 </div>
 
 <!-- Demo mode banner + connect form -->
@@ -7451,6 +7450,20 @@ async function connectFacebook() {
 
 <script>
 (function() {
+  // Any API call that comes back 401 (not authenticated) re-triggers the
+  // login check immediately, instead of leaving the page open with stale
+  // or broken data after a session ends (logout, expired cookie, etc).
+  const _origFetch = window.fetch;
+  window.fetch = function(input, init) {
+    return _origFetch(input, init).then(function(res) {
+      const url = typeof input === 'string' ? input : (input && input.url) || '';
+      if (res.status === 401 && url.indexOf('/api/') === 0) {
+        checkAuth();
+      }
+      return res;
+    });
+  };
+
   async function checkAuth() {
     try {
       const params = new URLSearchParams(window.location.search);
@@ -7851,9 +7864,11 @@ def create_web_interface(ads_agent, tenant_manager=None):
                 return redirect(url, code=301)
 
     def resolve_agent():
-        """Which studio's agent this request is for. ?tenant=<id> or header X-Tenant-Id.
-        No tenant specified -> the original single-studio agent, unchanged behavior."""
-        tid = request.args.get('tenant') or request.headers.get('X-Tenant-Id') or 'default'
+        """Which studio's agent this request is for. Prefers the logged-in
+        session; falls back to ?tenant=<id> or header X-Tenant-Id (used for the
+        very first, pre-login page load that picks which studio's login screen
+        to show). No tenant specified -> the original single-studio agent."""
+        tid = session.get('tenant_id') or request.args.get('tenant') or request.headers.get('X-Tenant-Id') or 'default'
         if tenant_manager is None or tid == 'default':
             return ads_agent
         return tenant_manager.get_agent(tid)
@@ -7870,7 +7885,7 @@ def create_web_interface(ads_agent, tenant_manager=None):
 
         @wraps(view_func)
         def wrapped(*args, **kwargs):
-            tid = request.args.get('tenant') or request.headers.get('X-Tenant-Id') or 'default'
+            tid = session.get('tenant_id') or request.args.get('tenant') or request.headers.get('X-Tenant-Id') or 'default'
             cfg = (tenant_manager.tenants.get(tid) if tenant_manager else None) or {}
             has_password = bool(cfg.get('password_hash'))
             if tid == 'default' and not has_password and (tenant_manager is None or len(tenant_manager.tenants) <= 1):
@@ -8018,10 +8033,12 @@ def create_web_interface(ads_agent, tenant_manager=None):
         return resp
 
     @app.route('/api/campaigns')
+    @require_tenant_auth
     def api_campaigns():
         return jsonify(resolve_agent().get_all_campaigns())
 
     @app.route('/api/campaign/<campaign_id>/performance')
+    @require_tenant_auth
     def api_campaign_performance(campaign_id):
         perf = resolve_agent().get_campaign_performance(campaign_id)
         if not perf:
@@ -8129,6 +8146,7 @@ def create_web_interface(ads_agent, tenant_manager=None):
         return jsonify({'success': True})
 
     @app.route('/api/token-status')
+    @require_tenant_auth
     def api_token_status():
         expires_at = getattr(resolve_agent().meta_api, 'token_expires_at', None)
         return jsonify({'expires_at': expires_at})
@@ -8144,6 +8162,7 @@ def create_web_interface(ads_agent, tenant_manager=None):
         return jsonify({'success': False, 'error': 'Token refresh failed. Update token manually in Settings.'}), 400
 
     @app.route('/api/safety-status')
+    @require_tenant_auth
     def api_safety_status():
         agent = resolve_agent()
         sg = agent.safety_guard
@@ -8195,6 +8214,7 @@ def create_web_interface(ads_agent, tenant_manager=None):
         return jsonify({'success': ok, 'industry': industry, 'config': config_store.get(industry)})
 
     @app.route('/api/audit-log')
+    @admin_required
     def api_audit_log():
         agent = resolve_agent()
         sg = agent.safety_guard
@@ -8307,6 +8327,7 @@ def create_web_interface(ads_agent, tenant_manager=None):
     # ==================== QuickBooks (Intuit) connect ====================
 
     @app.route('/api/quickbooks/connect-url')
+    @require_tenant_auth
     def api_quickbooks_connect_url():
         """The URL to connect directly to Intuit -- send the user's browser here."""
         if not quickbooks_connector.is_configured():
@@ -8354,6 +8375,7 @@ def create_web_interface(ads_agent, tenant_manager=None):
         """
 
     @app.route('/api/quickbooks/status')
+    @require_tenant_auth
     def api_quickbooks_status():
         tenant_id = request.args.get('tenant', 'default')
         conn = quickbooks_connector.get_connection(tenant_id)
@@ -8384,17 +8406,20 @@ def create_web_interface(ads_agent, tenant_manager=None):
         return jsonify({'success': True, 'headlines': result['headlines'], 'messages': result['messages']})
 
     @app.route('/api/lead-forms')
+    @require_tenant_auth
     def api_lead_forms():
         page_id = getattr(resolve_agent().meta_api, 'page_id', '117339024950778')
         forms = resolve_agent().meta_api.get_lead_forms(page_id)
         return jsonify({'success': True, 'forms': forms})
 
     @app.route('/api/leads/<form_id>')
+    @require_tenant_auth
     def api_leads(form_id):
         leads = resolve_agent().meta_api.get_leads(form_id)
         return jsonify({'success': True, 'leads': leads})
 
     @app.route('/api/audiences')
+    @require_tenant_auth
     def api_audiences_list():
         try:
             url = f"{resolve_agent().meta_api.base_url}/{resolve_agent().meta_api.ad_account_id}/customaudiences"
@@ -8493,6 +8518,7 @@ def create_web_interface(ads_agent, tenant_manager=None):
             return jsonify({'success': False, 'error': str(e)})
 
     @app.route('/api/accounts')
+    @require_tenant_auth
     def api_accounts():
         sensitive = ('token', 'secret', 'password', 'access_token', 'app_secret', 'page_token')
         raw = resolve_agent().get_accounts()
@@ -8518,6 +8544,7 @@ def create_web_interface(ads_agent, tenant_manager=None):
         return jsonify({'success': False, 'error': 'Account not found'}), 404
 
     @app.route('/api/reports')
+    @require_tenant_auth
     def api_reports():
         campaigns = resolve_agent().get_all_campaigns()
         total_spend = 0
@@ -8562,10 +8589,12 @@ def create_web_interface(ads_agent, tenant_manager=None):
         return jsonify({'pixel_id': ''})
 
     @app.route('/api/posts')
+    @require_tenant_auth
     def api_posts():
         return jsonify({'posts': scheduler.get_all_posts()})
 
     @app.route('/api/posts/<post_id>')
+    @require_tenant_auth
     def api_post_detail(post_id):
         post = scheduler.get_post(post_id)
         if not post:
@@ -8680,6 +8709,7 @@ def create_web_interface(ads_agent, tenant_manager=None):
     responder = SocialMediaAutoResponder(ads_agent.meta_api)
 
     @app.route('/api/responder/status')
+    @require_tenant_auth
     def api_responder_status():
         return jsonify({
             'enabled': responder.enabled,
@@ -8695,6 +8725,7 @@ def create_web_interface(ads_agent, tenant_manager=None):
         return jsonify({'success': True})
 
     @app.route('/api/responder/rules')
+    @require_tenant_auth
     def api_responder_rules():
         return jsonify({'rules': responder.rules.get('rules', [])})
 
@@ -8731,6 +8762,7 @@ def create_web_interface(ads_agent, tenant_manager=None):
         return jsonify({'success': True})
 
     @app.route('/api/responder/log')
+    @require_tenant_auth
     def api_responder_log():
         limit = request.args.get('limit', 50, type=int)
         return jsonify({'responses': responder.get_log(limit)})
@@ -8747,10 +8779,12 @@ def create_web_interface(ads_agent, tenant_manager=None):
     multi_scheduler.start_auto_publish()
 
     @app.route('/api/multi-scheduler/queue')
+    @require_tenant_auth
     def api_multi_queue():
         return jsonify({'items': multi_scheduler.get_queue()})
 
     @app.route('/api/multi-scheduler/item/<item_id>')
+    @require_tenant_auth
     def api_multi_item(item_id):
         item = multi_scheduler.get_item(item_id)
         if not item:
@@ -8827,16 +8861,19 @@ def create_web_interface(ads_agent, tenant_manager=None):
     lead_mgmt = AdvancedLeadManagement(ads_agent.meta_api)
 
     @app.route('/api/leads-v2')
+    @require_tenant_auth
     def api_leads_v2():
         status = request.args.get('status')
         limit = request.args.get('limit', 100, type=int)
         return jsonify({'leads': lead_mgmt.get_leads(status, limit)})
 
     @app.route('/api/leads-v2/stats')
+    @require_tenant_auth
     def api_leads_v2_stats():
         return jsonify(lead_mgmt.get_lead_stats())
 
     @app.route('/api/kpi-panel')
+    @require_tenant_auth
     def api_kpi_panel():
         """The 3 numbers that actually answer 'is this working': cost per lead,
         % that book a trial class, % that enroll. Real ad spend comes straight
@@ -8966,6 +9003,7 @@ def create_web_interface(ads_agent, tenant_manager=None):
         return jsonify({'success': True})
 
     @app.route('/api/leads-v2/workflows')
+    @require_tenant_auth
     def api_workflows():
         return jsonify({'workflows': lead_mgmt.workflows.get('workflows', [])})
 
