@@ -7936,12 +7936,17 @@ def create_web_interface(ads_agent, tenant_manager=None):
     @app.route('/api/whoami')
     def api_whoami():
         raw_tid = current_session_tenant()
+        if raw_tid and tenant_manager and raw_tid not in tenant_manager.tenants:
+            # Session points at a tenant that no longer exists (deleted, or
+            # tenants.json got reset by a redeploy) -- clear it instead of crashing.
+            session.pop('tenant_id', None)
+            raw_tid = None
         has_session = raw_tid is not None
         tid = raw_tid or 'default'
         role = 'admin' if tid == 'default' else 'client'
         if tenant_manager and tid in tenant_manager.tenants:
             role = tenant_manager.tenants[tid].get('role', role)
-        pw_required = bool((tenant_manager.tenants.get(tid) if tenant_manager else {}).get('password_hash'))
+        pw_required = bool(((tenant_manager.tenants.get(tid) if tenant_manager else None) or {}).get('password_hash'))
         token_valid = resolve_agent().meta_api.validate_token()
         expires_at = getattr(resolve_agent().meta_api, 'token_expires_at', None)
         cfg_t = (tenant_manager.tenants.get(tid) if tenant_manager else None) or {}
