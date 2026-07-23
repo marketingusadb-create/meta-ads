@@ -7699,6 +7699,13 @@ class TenantManager:
                     data = json.load(f)
                 for tid, cfg in data.items():
                     cfg.setdefault('role', 'admin' if tid == 'default' else 'client')
+                if 'default' not in data:
+                    # Defensive: tenants.json existed but somehow lost the owner's
+                    # own 'default' entry (e.g. wiped/rewritten by a deploy). Without
+                    # this, the owner's own account gets treated as an unauthenticated
+                    # client and gets stuck unable to accept/skip the agreement.
+                    data['default'] = {'name': 'Default Studio', 'industry': 'martialarts', 'role': 'admin', 'uses_env_credentials': True}
+                    self._save(data)
                 return data
             except Exception as e:
                 print(f"[TenantManager] WARNING: could not read {self.config_path}: {e}")
@@ -7931,9 +7938,9 @@ def create_web_interface(ads_agent, tenant_manager=None):
         raw_tid = current_session_tenant()
         has_session = raw_tid is not None
         tid = raw_tid or 'default'
-        role = 'client'
+        role = 'admin' if tid == 'default' else 'client'
         if tenant_manager and tid in tenant_manager.tenants:
-            role = tenant_manager.tenants[tid].get('role', 'client')
+            role = tenant_manager.tenants[tid].get('role', role)
         pw_required = bool((tenant_manager.tenants.get(tid) if tenant_manager else {}).get('password_hash'))
         token_valid = resolve_agent().meta_api.validate_token()
         expires_at = getattr(resolve_agent().meta_api, 'token_expires_at', None)
@@ -7954,7 +7961,7 @@ def create_web_interface(ads_agent, tenant_manager=None):
     def api_trial_status():
         tid = current_session_tenant() or 'default'
         cfg = (tenant_manager.tenants.get(tid) if tenant_manager else None) or {}
-        role = cfg.get('role', 'client')
+        role = cfg.get('role', 'admin' if tid == 'default' else 'client')
         if role == 'admin':
             return jsonify({'success': True, 'trial_active': True, 'trial_days_remaining': None, 'trial_expired': False, 'is_admin': True})
         created_at = cfg.get('created_at')
@@ -7975,7 +7982,10 @@ def create_web_interface(ads_agent, tenant_manager=None):
     def api_accept_agreement():
         tid = current_session_tenant() or 'default'
         cfg = (tenant_manager.tenants.get(tid) if tenant_manager else None) or {}
-        if not cfg or tid == 'default':
+        if tid == 'default' and not cfg.get('role'):
+            # Owner's own account got mis-detected as a client tenant -- nothing to accept.
+            return jsonify({'success': True, 'note': 'admin account, no agreement needed'})
+        if not cfg:
             return jsonify({'success': False, 'error': 'Invalid tenant'}), 400
         tenant_manager.tenants[tid]['agreement_accepted'] = True
         tenant_manager.tenants[tid]['agreement_accepted_at'] = int(time.time())
@@ -7987,7 +7997,7 @@ def create_web_interface(ads_agent, tenant_manager=None):
     def api_agreement_status():
         tid = current_session_tenant() or 'default'
         cfg = (tenant_manager.tenants.get(tid) if tenant_manager else None) or {}
-        role = cfg.get('role', 'client')
+        role = cfg.get('role', 'admin' if tid == 'default' else 'client')
         if role == 'admin':
             return jsonify({'success': True, 'accepted': True, 'is_admin': True})
         accepted = bool(cfg.get('agreement_accepted'))
