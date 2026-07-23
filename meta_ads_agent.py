@@ -2585,6 +2585,11 @@ HTML_TEMPLATE = """
 </head>
 <body>
 
+<div id="no-password-warning" style="display:none; background:#dc2626; color:#fff; padding:8px 14px; z-index:500; align-items:center; justify-content:center; gap:10px; font-size:12px; font-weight:600; flex-wrap:wrap; text-align:center;">
+  <span>&#9888;&#65039; Admin sin contraseña — cualquiera con este link entra / No admin password — anyone with this link gets in</span>
+  <button onclick="switchPage('settings'); setTimeout(function(){ var f = document.getElementById('admin-new-password'); if (f) { f.scrollIntoView({behavior:'smooth', block:'center'}); f.focus(); f.style.outline='3px solid #fbbf24'; } }, 150);" style="background:#fff; color:#dc2626; border:none; padding:4px 12px; border-radius:6px; font-weight:700; cursor:pointer; font-size:12px;">Set Password</button>
+</div>
+
 <div class="topbar">
   <span style="font-size:1.5rem">&#x1f4ca;</span>
   <h1 data-i18n="title">Meta Ads Agent Dashboard</h1>
@@ -7140,12 +7145,6 @@ translateDOM();
     <div id="tenant-login-error" style="color:#c0392b; font-size:12px; margin-bottom:12px; display:none;"></div>
     <button onclick="tenantLogin()" style="width:100%; padding:10px; background:#2563eb; color:#fff; border:none; border-radius:6px; font-weight:600; cursor:pointer;" data-i18n="sign_in">Sign In</button>
   </div>
-</div>
-
-<!-- Security warning: shown when admin has no password set -->
-<div id="no-password-warning" style="display:none; position:fixed; top:0; left:0; right:0; background:#dc2626; color:#fff; padding:10px 20px; z-index:100000; align-items:center; justify-content:center; gap:12px; font-size:13px; font-weight:600; box-shadow:0 2px 8px rgba(0,0,0,0.3);">
-  <span>&#9888;&#65039; Tu panel de admin no tiene contraseña — cualquiera con este link puede entrar. / Your admin panel has no password — anyone with this link can get in.</span>
-  <button onclick="document.getElementById('admin-new-password') ? document.getElementById('admin-new-password').scrollIntoView({behavior:'smooth', block:'center'}) : switchPage('tenants');" style="background:#fff; color:#dc2626; border:none; padding:6px 14px; border-radius:6px; font-weight:700; cursor:pointer; font-size:12px;">Set Password</button>
 </div>
 
 <!-- Small badge showing which studio you're logged in as, top-right corner -->
