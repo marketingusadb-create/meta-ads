@@ -2801,6 +2801,7 @@ HTML_TEMPLATE = """
         <button class="btn btn-primary" onclick="setAdminPassword()">Set Password</button>
         <span id="admin-pw-msg" style="font-size:12px;"></span>
       </div>
+      <p style="font-size:.75rem;color:#f59e0b;margin-top:10px;margin-bottom:0;">&#9888;&#65039; On Render (and similar hosts), this password can be lost if the server restarts or redeploys, since it's only saved to disk. For a password that always survives restarts, instead add an <strong>ADMIN_PASSWORD</strong> environment variable in your hosting settings (Render &rarr; your service &rarr; Environment) with your desired password as the value -- it will always take priority.</p>
     </div>
     <div style="margin-top:12px;padding:16px;background:#f0f2f5;border-radius:8px;">
       <h3 style="font-size:.9rem;margin-bottom:8px;">Payment Link</h3>
@@ -7788,6 +7789,22 @@ class TenantManager:
         if default_agent is not None:
             self._agents['default'] = default_agent  # reuse the already-running single-tenant agent
         self.tenants = self._load()
+        self._apply_env_admin_password()
+
+    def _apply_env_admin_password(self):
+        """If ADMIN_PASSWORD is set in the environment, it always wins for the
+        'default' (owner) account -- re-applied on every startup. This is what
+        makes the admin password survive Render restarts/redeploys: env vars
+        persist in your hosting settings, but tenants.json lives on disk that
+        gets wiped on every deploy (and, on free tiers, whenever the app spins
+        down from inactivity)."""
+        env_pw = os.environ.get('ADMIN_PASSWORD', '')
+        if not env_pw:
+            return
+        self.tenants.setdefault('default', {'name': 'Default Studio', 'industry': 'martialarts', 'role': 'admin', 'uses_env_credentials': True})
+        self.tenants['default']['role'] = 'admin'
+        self.tenants['default']['password_hash'] = generate_password_hash(env_pw)
+        self._save()
 
     def _load(self):
         if os.path.exists(self.config_path):
