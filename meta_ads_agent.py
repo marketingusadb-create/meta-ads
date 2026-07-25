@@ -3606,6 +3606,20 @@ var langData = {
     no_leads: 'No leads yet.',
     manage_accounts: 'Manage multiple ad accounts for different clients.',
     pixel_desc: 'Optional: Add your Meta Pixel ID for conversion tracking.',
+    lead_value_desc: 'Lead Value: estimated revenue per lead, used for ROAS calculations.',
+    back_to_login: 'Back to login',
+    confirm_password: 'Confirm Password',
+    forgot_password: 'Forgot password?',
+    media: 'Media (kept from original — upload new to replace)',
+    new: 'New',
+    new_password: 'New Password',
+    password: 'Password',
+    recover_desc: "This resets the owner's own login only. You need the recovery key set in your hosting environment (ADMIN_RESET_KEY on Render).",
+    recover_title: 'Recover Admin Password',
+    recovery_key: 'Recovery Key',
+    reset_password_btn: 'Reset Password',
+    settings: 'Settings',
+    trial_booked: 'Trial Booked',
     create_campaign_modal: 'Create New Campaign',
     biz_name_placeholder: "e.g. Joe's Pizza",
     headline_placeholder: 'e.g. Special Offer!',
@@ -4031,6 +4045,20 @@ var langData = {
     no_leads: 'A\u00fan no hay leads.',
     manage_accounts: 'Administra m\u00faltiples cuentas publicitarias para diferentes clientes.',
     pixel_desc: 'Opcional: Agrega tu ID de Meta Pixel para seguimiento de conversiones.',
+    lead_value_desc: 'Valor del Lead: ingreso estimado por cada lead, usado para calcular el ROAS.',
+    back_to_login: 'Volver al login',
+    confirm_password: 'Confirmar Contraseña',
+    forgot_password: '¿Olvidaste tu contraseña?',
+    media: 'Contenido multimedia (se mantiene el original — sube uno nuevo para reemplazarlo)',
+    new: 'Nuevo',
+    new_password: 'Nueva Contraseña',
+    password: 'Contraseña',
+    recover_desc: 'Esto reinicia solo el acceso del dueño. Necesitas la llave de recuperación configurada en tu servidor (ADMIN_RESET_KEY en Render).',
+    recover_title: 'Recuperar Contraseña de Admin',
+    recovery_key: 'Llave de Recuperación',
+    reset_password_btn: 'Restablecer Contraseña',
+    settings: 'Configuración',
+    trial_booked: 'Prueba Agendada',
     create_campaign_modal: 'Crear Nueva Campa\u00f1a',
     biz_name_placeholder: 'Ej: La Pizzer\u00eda de Juan',
     headline_placeholder: 'Ej: Oferta Especial!',
@@ -8776,7 +8804,9 @@ def create_web_interface(ads_agent, tenant_manager=None):
     @app.route('/api/pixel', methods=['GET', 'POST'])
     @require_tenant_auth
     def api_pixel():
-        pixel_file = os.path.join(os.path.dirname(__file__), 'pixel_config.json')
+        tid = _viewing_tid()
+        suffix = f'_{tid}' if tid != 'default' else ''
+        pixel_file = os.path.join(os.path.dirname(__file__), f'pixel_config{suffix}.json')
         if request.method == 'POST':
             data = request.get_json()
             try:
