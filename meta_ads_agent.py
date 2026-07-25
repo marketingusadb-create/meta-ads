@@ -7504,6 +7504,19 @@ async function connectFacebook() {
 
   async function checkAuth() {
     try {
+      // A real page refresh (F5 / reload button) always requires logging in
+      // again, even if the session was still valid. This does NOT affect the
+      // page load right after a successful login (that's a 'navigate', not a
+      // 'reload'), so logging in still works normally.
+      try {
+        const navEntries = performance.getEntriesByType('navigation');
+        const navType = navEntries.length ? navEntries[0].type
+          : (performance.navigation && performance.navigation.type === 1 ? 'reload' : 'navigate');
+        if (navType === 'reload') {
+          await fetch('/api/logout', {method: 'POST'});
+        }
+      } catch (e) {}
+
       const params = new URLSearchParams(window.location.search);
       const requestedTenant = params.get('tenant') || '';
       const who = await fetch('/api/whoami').then(r => r.json());
