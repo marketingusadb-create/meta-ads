@@ -2591,8 +2591,9 @@ HTML_TEMPLATE = """
 </div>
 
 <div class="topbar">
-  <span style="font-size:1.5rem">&#x1f4ca;</span>
-  <h1 data-i18n="title">Meta Ads Agent Dashboard</h1>
+  <img id="brand-logo" src="" alt="" style="display:none; height:28px; width:28px; object-fit:contain; border-radius:4px; background:#fff;">
+  <span id="brand-emoji" style="font-size:1.5rem">&#x1f4ca;</span>
+  <h1 id="brand-title" data-i18n="title">Meta Ads Agent Dashboard</h1>
   <button id="lang-toggle" onclick="toggleLang()" style="background:#fff;border:1px solid #ddd;border-radius:6px;padding:4px 12px;cursor:pointer;font-size:13px;font-weight:600;margin-left:10px;">ES/EN</button>
   <button id="logout-btn" onclick="tenantLogout()" style="display:none; background:#dc2626; color:#fff; border:none; border-radius:6px; padding:5px 14px; cursor:pointer; font-size:13px; font-weight:600; margin-left:10px;" data-i18n="logout">Logout</button>
   <span style="margin-left:auto;font-size:.85rem;opacity:.85;" id="token-status"></span>
@@ -2783,6 +2784,7 @@ HTML_TEMPLATE = """
           <option value="0">No trial (paid from day 1)</option>
         </select>
         <input type="text" id="tenant-payment-url" placeholder="Payment URL for this client (optional)" style="grid-column:span 2;padding:8px;border:1px solid #ddd;border-radius:6px;">
+        <input type="text" id="tenant-logo-url" placeholder="Logo image URL (optional -- makes their dashboard feel like their own app)" style="grid-column:span 2;padding:8px;border:1px solid #ddd;border-radius:6px;">
       </div>
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center;">
         <button class="btn btn-success" onclick="createTenant()">Create Client</button>
@@ -5070,6 +5072,7 @@ async function createTenant() {
   var budget = parseInt(document.getElementById('tenant-budget').value) || 50;
   var trialDays = parseInt(document.getElementById('tenant-trial-days').value);
   var paymentUrl = document.getElementById('tenant-payment-url').value.trim();
+  var logoUrl = document.getElementById('tenant-logo-url').value.trim();
   var msgEl = document.getElementById('tenant-create-msg');
   if (!tid || !name || !password) {
     msgEl.style.color = '#c0392b';
@@ -5101,6 +5104,7 @@ async function createTenant() {
     if (adAccount) payload.meta_ad_account_id = adAccount;
     if (pageToken) payload.meta_page_token = pageToken;
     if (paymentUrl) payload.payment_url = paymentUrl;
+    if (logoUrl) payload.logo_url = logoUrl;
     var res = await fetch('/api/tenants', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
     var r = await res.json();
     if (r.success) {
@@ -5113,6 +5117,7 @@ async function createTenant() {
       document.getElementById('tenant-ad-account').value = '';
       document.getElementById('tenant-page-token').value = '';
       document.getElementById('tenant-payment-url').value = '';
+      document.getElementById('tenant-logo-url').value = '';
       loadTenants();
     } else {
       msgEl.style.color = '#c0392b';
@@ -5180,12 +5185,14 @@ async function editTenant(tid) {
     var newToken = prompt('Meta Access Token (leave blank to keep current):', '');
     var newAdAccount = prompt('Ad Account ID (leave blank to keep current):', t.meta_ad_account_id || '');
     var newPaymentUrl = prompt('Payment URL (leave blank to keep current):', t.payment_url || '');
+    var newLogoUrl = prompt('Logo Image URL (leave blank to keep current):', t.logo_url || '');
     var payload = {tenant_id: tid, name: newName};
     if (newPass) payload.password = newPass;
     if (newBudget) payload.max_total_daily_budget = parseInt(newBudget) || 50;
     if (newToken) payload.meta_access_token = newToken;
     if (newAdAccount) payload.meta_ad_account_id = newAdAccount;
     if (newPaymentUrl !== null && newPaymentUrl !== '') payload.payment_url = newPaymentUrl;
+    if (newLogoUrl !== null && newLogoUrl !== '') payload.logo_url = newLogoUrl;
     var saveRes = await fetch('/api/tenants/' + tid, {
       method: 'PUT', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(payload)
@@ -7548,8 +7555,29 @@ async function connectFacebook() {
         return;
       }
       document.getElementById('tenant-badge').style.display = 'flex';
-      document.getElementById('tenant-badge-name').textContent = who.tenant_id;
+      if (who.is_admin_viewing) {
+        document.getElementById('tenant-badge-name').textContent = 'Viewing: ' + (who.viewing_tenant_name || who.viewing_tenant_id) + ' (admin)';
+        document.getElementById('tenant-badge').style.background = '#7c3aed';
+      } else {
+        document.getElementById('tenant-badge-name').textContent = who.tenant_id;
+      }
       document.getElementById('logout-btn').style.display = 'inline-block';
+
+      // White-label: show the client's own name/logo instead of the generic
+      // title, so their dashboard feels like their own app. Falls back to the
+      // default title when there's no custom name (your own admin account,
+      // or a client who hasn't set one yet).
+      var brandTitle = document.getElementById('brand-title');
+      var brandLogo = document.getElementById('brand-logo');
+      var brandEmoji = document.getElementById('brand-emoji');
+      if (who.display_name) {
+        brandTitle.textContent = who.display_name;
+      }
+      if (who.logo_url) {
+        brandLogo.src = who.logo_url;
+        brandLogo.style.display = 'inline-block';
+        brandEmoji.style.display = 'none';
+      }
     } catch (e) {
       console.warn('Auth check failed', e);
     }
@@ -7965,29 +7993,51 @@ def create_web_interface(ads_agent, tenant_manager=None):
                 url = request.url.replace('http://', 'https://', 1)
                 return redirect(url, code=301)
 
+    def current_session_tenant():
+        return session.get('tenant_id')
+
+    def _is_admin_session():
+        tid = session.get('tenant_id')
+        if not tid or not tenant_manager:
+            return False
+        return tenant_manager.tenants.get(tid, {}).get('role') == 'admin'
+
+    def _viewing_tid():
+        """Resolves which tenant's data this request is for. Normally that's
+        just whoever is logged in. The one exception: an admin can add
+        ?tenant=<id> to look at any client's data (e.g. from the 'Open ->'
+        link on the Tenants screen) without needing that client's password --
+        this is what lets you check whether a client is actually using the
+        app. A non-admin can never use ?tenant= to see someone else's data."""
+        session_tid = session.get('tenant_id')
+        requested_tid = request.args.get('tenant') or request.headers.get('X-Tenant-Id')
+        if session_tid and requested_tid and requested_tid != session_tid and _is_admin_session():
+            return requested_tid
+        return session_tid or requested_tid or 'default'
+
     def resolve_agent():
-        """Which studio's agent this request is for. Prefers the logged-in
-        session; falls back to ?tenant=<id> or header X-Tenant-Id (used for the
-        very first, pre-login page load that picks which studio's login screen
-        to show). No tenant specified -> the original single-studio agent."""
-        tid = session.get('tenant_id') or request.args.get('tenant') or request.headers.get('X-Tenant-Id') or 'default'
+        """Which studio's agent this request is for. See _viewing_tid() for
+        the resolution rules (own session, or admin viewing a client)."""
+        tid = _viewing_tid()
         if tenant_manager is None or tid == 'default':
             return ads_agent
         return tenant_manager.get_agent(tid)
 
-    def current_session_tenant():
-        return session.get('tenant_id')
-
     def require_tenant_auth(view_func):
-        """Blocks a request for tenant X unless the browser is logged in as tenant X.
-        The 'default' studio (classic single-studio setup, no other tenants ever
-        created) keeps working with zero login friction -- this only kicks in
-        once real multi-tenant accounts exist."""
+        """Blocks a request for tenant X unless the browser is logged in as
+        tenant X -- OR is an admin using ?tenant=X to check on a client (see
+        _viewing_tid()). The 'default' studio (classic single-studio setup,
+        no other tenants ever created) keeps working with zero login friction
+        -- this only kicks in once real multi-tenant accounts exist."""
         from functools import wraps
 
         @wraps(view_func)
         def wrapped(*args, **kwargs):
-            tid = session.get('tenant_id') or request.args.get('tenant') or request.headers.get('X-Tenant-Id') or 'default'
+            session_tid = session.get('tenant_id')
+            requested_tid = request.args.get('tenant') or request.headers.get('X-Tenant-Id')
+            if session_tid and requested_tid and requested_tid != session_tid and _is_admin_session():
+                return view_func(*args, **kwargs)  # admin checking on a client
+            tid = session_tid or requested_tid or 'default'
             cfg = (tenant_manager.tenants.get(tid) if tenant_manager else None) or {}
             has_password = bool(cfg.get('password_hash'))
             if tid == 'default' and not has_password and (tenant_manager is None or len(tenant_manager.tenants) <= 1):
@@ -8087,11 +8137,13 @@ def create_web_interface(ads_agent, tenant_manager=None):
             session.pop('tenant_id', None)
             raw_tid = None
         has_session = raw_tid is not None
-        tid = raw_tid or 'default'
-        role = 'admin' if tid == 'default' else 'client'
-        if tenant_manager and tid in tenant_manager.tenants:
-            role = tenant_manager.tenants[tid].get('role', role)
-        pw_required = bool(((tenant_manager.tenants.get(tid) if tenant_manager else None) or {}).get('password_hash'))
+        session_tid = raw_tid or 'default'
+        tid = _viewing_tid()  # may differ from session_tid if admin is checking on a client
+        is_admin_viewing = (tid != session_tid)
+        role = 'admin' if session_tid == 'default' else 'client'
+        if tenant_manager and session_tid in tenant_manager.tenants:
+            role = tenant_manager.tenants[session_tid].get('role', role)
+        pw_required = bool(((tenant_manager.tenants.get(session_tid) if tenant_manager else None) or {}).get('password_hash'))
         token_valid = resolve_agent().meta_api.validate_token()
         expires_at = getattr(resolve_agent().meta_api, 'token_expires_at', None)
         cfg_t = (tenant_manager.tenants.get(tid) if tenant_manager else None) or {}
@@ -8100,11 +8152,16 @@ def create_web_interface(ads_agent, tenant_manager=None):
             trial_days = cfg_t.get('trial_days', 30)
             trial_end = cfg_t['created_at'] + (trial_days * 86400)
             trial_expired = int(time.time()) > trial_end
+        viewing_name = cfg_t.get('name', tid) if is_admin_viewing else None
         return jsonify({
-            'success': True, 'tenant_id': tid, 'role': role,
+            'success': True, 'tenant_id': session_tid, 'role': role,
             'has_session': has_session, 'password_required': pw_required,
             'token_valid': token_valid, 'token_expires_at': expires_at,
-            'trial_expired': trial_expired
+            'trial_expired': trial_expired,
+            'is_admin_viewing': is_admin_viewing, 'viewing_tenant_id': tid if is_admin_viewing else None,
+            'viewing_tenant_name': viewing_name,
+            'display_name': cfg_t.get('name') if tid != 'default' else None,
+            'logo_url': cfg_t.get('logo_url') or None
         })
 
     @app.route('/api/trial-status')
@@ -8412,6 +8469,8 @@ def create_web_interface(ads_agent, tenant_manager=None):
             t.pop('agreement_accepted_at', None)
         if 'payment_url' in data:
             t['payment_url'] = data['payment_url']
+        if 'logo_url' in data:
+            t['logo_url'] = data['logo_url']
         tenant_manager._save()
         tenant_manager._agents.pop(tenant_id, None)
         return jsonify({'success': True})
