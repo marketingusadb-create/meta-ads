@@ -2599,6 +2599,18 @@ HTML_TEMPLATE = """
   <span style="margin-left:auto;font-size:.85rem;opacity:.85;" id="token-status"></span>
 </div>
 
+<!-- Demo mode banner + connect form -->
+<div id="demo-banner" style="display:none; background:linear-gradient(135deg,#f59e0b,#d97706); color:#fff; padding:12px 20px; z-index:500; box-shadow:0 2px 8px rgba(0,0,0,0.2);">
+  <div style="display:flex; align-items:center; justify-content:space-between; max-width:800px; margin:0 auto; flex-wrap:wrap; gap:8px;">
+    <div>
+      <strong>Demo Mode</strong> — Connect your Facebook account to start running ads.
+    </div>
+    <button onclick="document.getElementById('connect-facebook-modal').style.display='flex'" style="background:#fff; color:#d97706; border:none; padding:8px 16px; border-radius:6px; font-weight:700; cursor:pointer; font-size:13px;">
+      Connect Facebook
+    </button>
+  </div>
+</div>
+
 <div class="container">
   <div class="nav-tabs">
     <button class="nav-tab active" data-page="campaigns" data-i18n="campaigns_tab">Campaigns</button>
@@ -5037,7 +5049,7 @@ async function loadTenants() {
         trialHtml + demoHtml + agreementHtml +
         '<br><span style="font-size:.8rem;color:#65676b;">' + _esc(industry) + ' | Budget cap: $' + budget + '/day</span></div>' +
         '<div style="display:flex;gap:6px;align-items:center;">' +
-        '<a href="/?tenant=' + _esc(tid) + '" style="font-size:12px;color:#2563eb;text-decoration:none;">Open &rarr;</a>' +
+        '<a href="/?tenant=' + _esc(tid) + '" onclick="try{sessionStorage.setItem(\\x27_skipForcedLogout\\x27,\\x271\\x27)}catch(e){}" style="font-size:12px;color:#2563eb;text-decoration:none;">Open &rarr;</a>' +
         '<button class="btn btn-sm" style="background:#e4e6eb;" onclick="editTenant(\\x27' + _esc(tid) + '\\x27)">Edit</button>' +
         (!isDefault ? '<button class="btn btn-sm" style="background:#fef3c7;color:#92400e;" onclick="resetTrial(\\x27' + _esc(tid) + '\\x27)">Reset Trial</button>' : '') +
         (isDefault ? '' : '<button class="btn btn-sm btn-danger" onclick="deleteTenant(\\x27' + _esc(tid) + '\\x27)">Delete</button>') +
@@ -7198,18 +7210,6 @@ translateDOM();
   <span id="tenant-badge-name"></span>
 </div>
 
-<!-- Demo mode banner + connect form -->
-<div id="demo-banner" style="display:none; position:fixed; top:0; left:0; right:0; background:linear-gradient(135deg,#f59e0b,#d97706); color:#fff; padding:12px 20px; z-index:99998; box-shadow:0 2px 8px rgba(0,0,0,0.2);">
-  <div style="display:flex; align-items:center; justify-content:space-between; max-width:800px; margin:0 auto; flex-wrap:wrap; gap:8px;">
-    <div>
-      <strong>Demo Mode</strong> — Connect your Facebook account to start running ads.
-    </div>
-    <button onclick="document.getElementById('connect-facebook-modal').style.display='flex'" style="background:#fff; color:#d97706; border:none; padding:8px 16px; border-radius:6px; font-weight:700; cursor:pointer; font-size:13px;">
-      Connect Facebook
-    </button>
-  </div>
-</div>
-
 <!-- Connect Facebook modal for demo clients -->
 <div id="connect-facebook-modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:100000; align-items:center; justify-content:center;">
   <div style="background:#fff; border-radius:12px; padding:28px; width:420px; max-width:90vw; box-shadow:0 10px 40px rgba(0,0,0,0.3);">
@@ -7499,8 +7499,20 @@ async function connectFacebook() {
   // Any API call that comes back 401 (not authenticated) re-triggers the
   // login check immediately, instead of leaving the page open with stale
   // or broken data after a session ends (logout, expired cookie, etc).
+  //
+  // It also forwards the page's own ?tenant=<id> (the one in the address
+  // bar, e.g. from an admin clicking "Open ->" on a client) onto every /api/
+  // call automatically. Without this, only the address bar would know which
+  // tenant is being viewed -- each individual fetch('/api/campaigns') etc.
+  // would silently fall back to your own account instead of the client's.
   const _origFetch = window.fetch;
+  const _pageTenant = new URLSearchParams(window.location.search).get('tenant');
   window.fetch = function(input, init) {
+    if (_pageTenant) {
+      if (typeof input === 'string' && input.indexOf('/api/') === 0 && input.indexOf('tenant=') === -1) {
+        input += (input.indexOf('?') === -1 ? '?' : '&') + 'tenant=' + encodeURIComponent(_pageTenant);
+      }
+    }
     return _origFetch(input, init).then(function(res) {
       const url = typeof input === 'string' ? input : (input && input.url) || '';
       if (res.status === 401 && url.indexOf('/api/') === 0) {
@@ -7512,15 +7524,16 @@ async function connectFacebook() {
 
   async function checkAuth() {
     try {
-      // A real page refresh (F5 / reload button) always requires logging in
-      // again, even if the session was still valid. This does NOT affect the
-      // page load right after a successful login (that's a 'navigate', not a
-      // 'reload'), so logging in still works normally.
+      // Every page load requires logging in again -- first visit, refresh,
+      // reopening the tab, all of it. The only exception is the split-second
+      // reload we ourselves trigger right after a successful login (or after
+      // an admin clicks "Open ->" to check on a client) -- those set
+      // _skipForcedLogout first so the session they just created isn't
+      // immediately thrown away.
       try {
-        const navEntries = performance.getEntriesByType('navigation');
-        const navType = navEntries.length ? navEntries[0].type
-          : (performance.navigation && performance.navigation.type === 1 ? 'reload' : 'navigate');
-        if (navType === 'reload') {
+        if (sessionStorage.getItem('_skipForcedLogout') === '1') {
+          sessionStorage.removeItem('_skipForcedLogout');
+        } else {
           await fetch('/api/logout', {method: 'POST'});
         }
       } catch (e) {}
@@ -7597,6 +7610,7 @@ async function connectFacebook() {
       if (data.success) {
         const url = new URL(window.location);
         url.searchParams.set('tenant', tenant_id);
+        try { sessionStorage.setItem('_skipForcedLogout', '1'); } catch(e) {}
         window.location = url.toString();
       } else {
         errEl.textContent = data.error || 'Login failed';
