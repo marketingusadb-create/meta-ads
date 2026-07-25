@@ -5136,7 +5136,14 @@ async function setAdminPassword() {
       body: JSON.stringify({password: pw})
     });
     var r = await res.json();
-    if (r.success) { msgEl.style.color='#16a34a'; msgEl.textContent='Password set! Use it next login.'; document.getElementById('admin-new-password').value=''; document.getElementById('admin-new-password-confirm').value=''; }
+    if (r.success) {
+      msgEl.style.color='#16a34a';
+      msgEl.textContent='Password set! Redirecting to login...';
+      document.getElementById('admin-new-password').value='';
+      document.getElementById('admin-new-password-confirm').value='';
+      await fetch('/api/logout', {method:'POST'});
+      setTimeout(function() { window.location.reload(); }, 1200);
+    }
     else { msgEl.style.color='#c0392b'; msgEl.textContent=r.error||'Error'; }
   } catch(e) { msgEl.style.color='#c0392b'; msgEl.textContent='Error: '+e.message; }
 }
@@ -7144,6 +7151,37 @@ translateDOM();
     </div>
     <div id="tenant-login-error" style="color:#c0392b; font-size:12px; margin-bottom:12px; display:none;"></div>
     <button onclick="tenantLogin()" style="width:100%; padding:10px; background:#2563eb; color:#fff; border:none; border-radius:6px; font-weight:600; cursor:pointer;" data-i18n="sign_in">Sign In</button>
+    <div style="text-align:center; margin-top:12px;">
+      <a href="#" onclick="document.getElementById('tenant-login-overlay').style.display='none'; document.getElementById('admin-recover-overlay').style.display='flex'; return false;" style="font-size:12px; color:#6b7280; text-decoration:underline;" data-i18n="forgot_password">Forgot password?</a>
+    </div>
+  </div>
+</div>
+
+<!-- Admin password recovery: only for the owner's own 'default' account, gated by
+     the ADMIN_RESET_KEY the operator sets in their hosting environment. Client
+     tenants don't need this -- the admin resets those from the Tenants screen. -->
+<div id="admin-recover-overlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:99999; align-items:center; justify-content:center;">
+  <div style="background:#fff; border-radius:12px; padding:32px; width:360px; max-width:90vw; box-shadow:0 10px 40px rgba(0,0,0,0.3);">
+    <h2 style="margin:0 0 4px; font-size:20px;" data-i18n="recover_title">Recover Admin Password</h2>
+    <p style="margin:0 0 20px; color:#666; font-size:13px;" data-i18n="recover_desc">This resets the owner's own login only. You need the recovery key set in your hosting environment (ADMIN_RESET_KEY on Render).</p>
+    <div style="margin-bottom:12px;">
+      <label style="display:block; font-size:12px; color:#444; margin-bottom:4px;" data-i18n="recovery_key">Recovery Key</label>
+      <input id="admin-recover-key" type="password" style="width:100%; padding:8px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;">
+    </div>
+    <div style="margin-bottom:12px;">
+      <label style="display:block; font-size:12px; color:#444; margin-bottom:4px;" data-i18n="new_password">New Password</label>
+      <input id="admin-recover-newpw" type="password" style="width:100%; padding:8px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;">
+    </div>
+    <div style="margin-bottom:16px;">
+      <label style="display:block; font-size:12px; color:#444; margin-bottom:4px;" data-i18n="confirm_password">Confirm Password</label>
+      <input id="admin-recover-newpw2" type="password" style="width:100%; padding:8px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;" onkeydown="if(event.key==='Enter') adminRecoverPassword()">
+    </div>
+    <div id="admin-recover-error" style="color:#c0392b; font-size:12px; margin-bottom:12px; display:none;"></div>
+    <div id="admin-recover-success" style="color:#16a34a; font-size:12px; margin-bottom:12px; display:none;"></div>
+    <button onclick="adminRecoverPassword()" style="width:100%; padding:10px; background:#2563eb; color:#fff; border:none; border-radius:6px; font-weight:600; cursor:pointer;" data-i18n="reset_password_btn">Reset Password</button>
+    <div style="text-align:center; margin-top:12px;">
+      <a href="#" onclick="document.getElementById('admin-recover-overlay').style.display='none'; document.getElementById('tenant-login-overlay').style.display='flex'; return false;" style="font-size:12px; color:#6b7280; text-decoration:underline;" data-i18n="back_to_login">Back to login</a>
+    </div>
   </div>
 </div>
 
@@ -7533,6 +7571,40 @@ async function connectFacebook() {
     const url = new URL(window.location);
     url.searchParams.delete('tenant');
     window.location = url.toString();
+  };
+
+  window.adminRecoverPassword = async function() {
+    const reset_key = document.getElementById('admin-recover-key').value;
+    const new_password = document.getElementById('admin-recover-newpw').value;
+    const new_password2 = document.getElementById('admin-recover-newpw2').value;
+    const errEl = document.getElementById('admin-recover-error');
+    const okEl = document.getElementById('admin-recover-success');
+    errEl.style.display = 'none';
+    okEl.style.display = 'none';
+    if (!reset_key) { errEl.textContent = 'Enter the recovery key'; errEl.style.display = 'block'; return; }
+    if (!new_password || new_password.length < 6) { errEl.textContent = 'Password must be at least 6 characters'; errEl.style.display = 'block'; return; }
+    if (new_password !== new_password2) { errEl.textContent = 'Passwords do not match'; errEl.style.display = 'block'; return; }
+    try {
+      const resp = await fetch('/api/admin-reset-password', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({reset_key, new_password})
+      });
+      const data = await resp.json();
+      if (data.success) {
+        okEl.textContent = 'Password reset! Redirecting to login...';
+        okEl.style.display = 'block';
+        document.getElementById('admin-recover-key').value = '';
+        document.getElementById('admin-recover-newpw').value = '';
+        document.getElementById('admin-recover-newpw2').value = '';
+        setTimeout(function() { window.location.reload(); }, 1200);
+      } else {
+        errEl.textContent = data.error || 'Recovery failed';
+        errEl.style.display = 'block';
+      }
+    } catch (e) {
+      errEl.textContent = 'Could not connect to server';
+      errEl.style.display = 'block';
+    }
   };
 
   document.addEventListener('DOMContentLoaded', checkAuth);
@@ -7930,6 +8002,35 @@ def create_web_interface(ads_agent, tenant_manager=None):
     @app.route('/api/logout', methods=['POST'])
     def api_logout():
         session.pop('tenant_id', None)
+        return jsonify({'success': True})
+
+    @app.route('/api/admin-reset-password', methods=['POST'])
+    def api_admin_reset_password():
+        """Recovery for when the owner (the 'default' tenant) forgets their own
+        admin password and can't log in at all -- so there's no session to use
+        the normal 'change password' form. Gated by ADMIN_RESET_KEY, a secret
+        the operator sets in their hosting environment (e.g. Render), separate
+        from the login password itself. Client-tenant passwords don't need this:
+        the admin can already reset those from the Tenants screen once logged in."""
+        data = request.get_json() or {}
+        reset_key = data.get('reset_key', '')
+        new_password = data.get('new_password', '')
+        configured_key = os.environ.get('ADMIN_RESET_KEY', '')
+        if not configured_key:
+            return jsonify({'success': False, 'error': 'Password recovery is not set up. Add an ADMIN_RESET_KEY environment variable in your hosting settings (e.g. Render) to enable it.'}), 400
+        if not reset_key or reset_key != configured_key:
+            safety_guard.log('admin_password_reset', allowed=False, reason='Invalid recovery key', tenant_id='default')
+            return jsonify({'success': False, 'error': 'Invalid recovery key'}), 401
+        if len(new_password) < 6:
+            return jsonify({'success': False, 'error': 'Password must be at least 6 characters'}), 400
+        if tenant_manager is None:
+            return jsonify({'success': False, 'error': 'Tenant manager not initialized'}), 500
+        tenant_manager.tenants.setdefault('default', {'name': 'Default Studio', 'industry': 'martialarts', 'role': 'admin'})
+        tenant_manager.tenants['default']['role'] = 'admin'
+        tenant_manager.tenants['default']['password_hash'] = generate_password_hash(new_password)
+        tenant_manager._save()
+        session.pop('tenant_id', None)
+        safety_guard.log('admin_password_reset', allowed=True, reason='Recovered via ADMIN_RESET_KEY', tenant_id='default')
         return jsonify({'success': True})
 
     @app.route('/api/health')
