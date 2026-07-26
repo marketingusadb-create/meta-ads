@@ -15,6 +15,115 @@ from datetime import datetime
 from flask import Flask, send_from_directory, request, jsonify, session
 from werkzeug.security import generate_password_hash, check_password_hash
 
+# ==================== PERSISTENT STORE (Supabase, survives redeploys) ====================
+# Render's free tier has NO persistent disk -- every redeploy/restart wipes local
+# files back to whatever is in the git repo. This class replaces "read/write a
+# .json file on disk" with "read/write a row in Supabase" so data survives.
+#
+# Setup required in Render (Environment tab) and locally in your .env:
+#   SUPABASE_URL          -> Project URL from Supabase (Settings -> API)
+#   SUPABASE_SERVICE_KEY  -> service_role key from Supabase (Settings -> API)
+#
+# If those two env vars are NOT set, this silently falls back to local .json
+# files (same as before) -- so local development without Supabase still works.
+#
+# Requires one table in Supabase, created once via the Table Editor:
+#   Table name: app_storage
+#   Columns: key (text, Primary Key), value (jsonb), updated_at (timestamptz, default now())
+
+class PersistentStore:
+    def __init__(self):
+        self.url = os.environ.get('SUPABASE_URL', '').rstrip('/')
+        self.key = os.environ.get('SUPABASE_SERVICE_KEY', '')
+        self.enabled = bool(self.url and self.key)
+        if self.enabled:
+            print(f"[PersistentStore] Using Supabase for persistent storage ({self.url})")
+        else:
+            print("[PersistentStore] SUPABASE_URL/SUPABASE_SERVICE_KEY not set -- "
+                  "falling back to local .json files (data will NOT survive a Render redeploy).")
+
+    def _headers(self):
+        return {
+            "apikey": self.key,
+            "Authorization": f"Bearer {self.key}",
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates",
+        }
+
+    def load(self, storage_key, local_path, default):
+        """Read a JSON-able value. Tries Supabase first (if enabled), always
+        falls back to the local file (or `default`) on any failure so a
+        Supabase hiccup never crashes the app."""
+        if self.enabled:
+            try:
+                r = requests.get(
+                    f"{self.url}/rest/v1/app_storage",
+                    params={"key": f"eq.{storage_key}", "select": "value"},
+                    headers=self._headers(),
+                    timeout=10,
+                )
+                if r.status_code == 200:
+                    rows = r.json()
+                    if rows:
+                        return rows[0]["value"]
+                    return default
+                print(f"[PersistentStore] load({storage_key}) HTTP {r.status_code}: {r.text[:200]}")
+            except Exception as e:
+                print(f"[PersistentStore] load({storage_key}) error: {e}")
+        # Fallback: local file
+        try:
+            if local_path and os.path.exists(local_path):
+                with open(local_path, 'r') as f:
+                    return json.load(f)
+        except Exception as e:
+            print(f"[PersistentStore] local fallback load error for {local_path}: {e}")
+        return default
+
+    def delete(self, storage_key, local_path=None):
+        try:
+            if local_path and os.path.exists(local_path):
+                os.remove(local_path)
+        except Exception as e:
+            print(f"[PersistentStore] local delete error for {local_path}: {e}")
+        if self.enabled:
+            try:
+                requests.delete(
+                    f"{self.url}/rest/v1/app_storage",
+                    params={"key": f"eq.{storage_key}"},
+                    headers=self._headers(),
+                    timeout=10,
+                )
+            except Exception as e:
+                print(f"[PersistentStore] delete({storage_key}) error: {e}")
+
+    def save(self, storage_key, local_path, data):
+        """Write a JSON-able value. Always writes the local file too (cheap,
+        and useful for local dev / debugging), then tries Supabase."""
+        try:
+            if local_path:
+                with open(local_path, 'w') as f:
+                    json.dump(data, f, indent=2, default=str)
+        except Exception as e:
+            print(f"[PersistentStore] local save error for {local_path}: {e}")
+        if self.enabled:
+            try:
+                payload = {"key": storage_key, "value": json.loads(json.dumps(data, default=str))}
+                r = requests.post(
+                    f"{self.url}/rest/v1/app_storage?on_conflict=key",
+                    headers=self._headers(),
+                    json=payload,
+                    timeout=10,
+                )
+                if r.status_code not in (200, 201, 204):
+                    print(f"[PersistentStore] save({storage_key}) HTTP {r.status_code}: {r.text[:200]}")
+            except Exception as e:
+                print(f"[PersistentStore] save({storage_key}) error: {e}")
+
+
+# Single shared instance used everywhere in this file.
+persistent_store = PersistentStore()
+
+
 # ==================== SAFETY GUARD (spend caps + audit log) ====================
 # This layer sits between the AI/automation and any real money being spent.
 # Nothing that touches budget should bypass it.
@@ -192,10 +301,9 @@ class ConfigStore:
         self.data = self._load()
 
     def _load(self):
-        if os.path.exists(self.path):
+        loaded = persistent_store.load('industry_config', self.path, None)
+        if loaded:
             try:
-                with open(self.path, 'r', encoding='utf-8') as f:
-                    loaded = json.load(f)
                 # Fill in any industries/fields present in defaults but missing
                 # from the user's file, so upgrades never crash on a missing key.
                 merged = json.loads(json.dumps(DEFAULT_INDUSTRY_CONFIG))
@@ -204,17 +312,11 @@ class ConfigStore:
                     merged[industry].update(cfg)
                 return merged
             except Exception as e:
-                print(f"[ConfigStore] WARNING: could not read {self.path}, using defaults: {e}")
+                print(f"[ConfigStore] WARNING: could not parse stored config, using defaults: {e}")
         return json.loads(json.dumps(DEFAULT_INDUSTRY_CONFIG))
 
     def save(self):
-        try:
-            with open(self.path, 'w', encoding='utf-8') as f:
-                json.dump(self.data, f, indent=2, ensure_ascii=False)
-            return True
-        except Exception as e:
-            print(f"[ConfigStore] WARNING: could not save {self.path}: {e}")
-            return False
+        return persistent_store.save('industry_config', self.path, self.data) or True
 
     def get(self, industry):
         return self.data.get(industry, self.data.get('service', {}))
@@ -1460,21 +1562,15 @@ class UniversalMetaAdsAgent:
         # Enrich with Meta data on startup
         self._sync_from_meta()
 
+    def _campaigns_storage_key(self):
+        # e.g. 'campaigns.json' -> 'campaigns', 'campaigns_acme.json' -> 'campaigns_acme'
+        return os.path.basename(self.campaigns_file).replace('.json', '')
+
     def _save_campaigns(self):
-        try:
-            with open(self.campaigns_file, 'w') as f:
-                json.dump(self.campaigns, f, indent=2, default=str)
-        except Exception as e:
-            print(f"Error saving campaigns: {e}")
+        persistent_store.save(self._campaigns_storage_key(), self.campaigns_file, self.campaigns)
 
     def _load_campaigns(self):
-        try:
-            if os.path.exists(self.campaigns_file):
-                with open(self.campaigns_file, 'r') as f:
-                    return json.load(f)
-        except Exception as e:
-            print(f"Error loading campaigns: {e}")
-        return {}
+        return persistent_store.load(self._campaigns_storage_key(), self.campaigns_file, {})
 
     def _sync_from_meta(self):
         try:
@@ -1498,12 +1594,7 @@ class UniversalMetaAdsAgent:
         return os.path.join(os.path.dirname(__file__), 'accounts.json')
 
     def get_accounts(self):
-        try:
-            if os.path.exists(self._accounts_file()):
-                with open(self._accounts_file()) as f:
-                    return json.load(f)
-        except: pass
-        return {}
+        return persistent_store.load('accounts', self._accounts_file(), {})
 
     def save_account(self, account_data):
         accounts = self.get_accounts()
@@ -1511,8 +1602,7 @@ class UniversalMetaAdsAgent:
         account_data['id'] = aid
         accounts[aid] = account_data
         try:
-            with open(self._accounts_file(), 'w') as f:
-                json.dump(accounts, f, indent=2)
+            persistent_store.save('accounts', self._accounts_file(), accounts)
             return aid
         except Exception as e:
             return None
@@ -1521,8 +1611,7 @@ class UniversalMetaAdsAgent:
         accounts = self.get_accounts()
         if account_id in accounts:
             del accounts[account_id]
-            with open(self._accounts_file(), 'w') as f:
-                json.dump(accounts, f, indent=2)
+            persistent_store.save('accounts', self._accounts_file(), accounts)
             return True
         return False
 
@@ -1788,19 +1877,10 @@ class ContentScheduler:
         self.posts = self._load_posts()
 
     def _load_posts(self):
-        try:
-            if os.path.exists(self.posts_file):
-                with open(self.posts_file) as f:
-                    return json.load(f)
-        except: pass
-        return {}
+        return persistent_store.load('posts', self.posts_file, {})
 
     def _save_posts(self):
-        try:
-            with open(self.posts_file, 'w') as f:
-                json.dump(self.posts, f, indent=2, default=str)
-        except Exception as e:
-            print(f"Error saving posts: {e}")
+        persistent_store.save('posts', self.posts_file, self.posts)
 
     def create_post(self, data):
         post_id = f"post_{int(time.time() * 1000)}"
@@ -1944,34 +2024,17 @@ class SocialMediaAutoResponder:
         self.enabled = True
 
     def _load_rules(self):
-        try:
-            if os.path.exists(self.rules_file):
-                with open(self.rules_file) as f:
-                    return json.load(f)
-        except: pass
-        return {'rules': [], 'default_response': 'Thank you for your comment!', 'use_ai': True}
+        return persistent_store.load('responder_rules', self.rules_file,
+                                      {'rules': [], 'default_response': 'Thank you for your comment!', 'use_ai': True})
 
     def _save_rules(self):
-        try:
-            with open(self.rules_file, 'w') as f:
-                json.dump(self.rules, f, indent=2, default=str)
-        except Exception as e:
-            print(f"Error saving rules: {e}")
+        persistent_store.save('responder_rules', self.rules_file, self.rules)
 
     def _load_responses(self):
-        try:
-            if os.path.exists(self.responses_file):
-                with open(self.responses_file) as f:
-                    return json.load(f)
-        except: pass
-        return {'responses': []}
+        return persistent_store.load('responder_log', self.responses_file, {'responses': []})
 
     def _save_responses(self):
-        try:
-            with open(self.responses_file, 'w') as f:
-                json.dump(self.responses, f, indent=2, default=str)
-        except Exception as e:
-            print(f"Error saving responses: {e}")
+        persistent_store.save('responder_log', self.responses_file, self.responses)
 
     def add_rule(self, keyword, response_template, platform='all', sentiment=None):
         rule_id = f"rule_{int(time.time())}_{len(self.rules['rules'])}"
@@ -2095,19 +2158,10 @@ class MultiPlatformScheduler:
         self.running = False
 
     def _load_queue(self):
-        try:
-            if os.path.exists(self.queue_file):
-                with open(self.queue_file) as f:
-                    return json.load(f)
-        except: pass
-        return {'items': []}
+        return persistent_store.load('multi_queue', self.queue_file, {'items': []})
 
     def _save_queue(self):
-        try:
-            with open(self.queue_file, 'w') as f:
-                json.dump(self.queue, f, indent=2, default=str)
-        except Exception as e:
-            print(f"Error saving queue: {e}")
+        persistent_store.save('multi_queue', self.queue_file, self.queue)
 
     def schedule_post(self, platforms, message, media_urls=None, scheduled_time=None, page_id=None, ig_id=None, content_type='image', link_url='', media_file='', media_files=None, headline='', ai_instruction='', cta=''):
         item_id = f"multi_{int(time.time())}_{len(self.queue['items'])}"
@@ -2249,34 +2303,16 @@ class AdvancedLeadManagement:
         self.workflows = self._load_workflows()
 
     def _load_leads(self):
-        try:
-            if os.path.exists(self.leads_file):
-                with open(self.leads_file) as f:
-                    return json.load(f)
-        except: pass
-        return {'leads': [], 'score_config': {}}
+        return persistent_store.load('leads', self.leads_file, {'leads': [], 'score_config': {}})
 
     def _save_leads(self):
-        try:
-            with open(self.leads_file, 'w') as f:
-                json.dump(self.leads, f, indent=2, default=str)
-        except Exception as e:
-            print(f"Error saving leads: {e}")
+        persistent_store.save('leads', self.leads_file, self.leads)
 
     def _load_workflows(self):
-        try:
-            if os.path.exists(self.workflows_file):
-                with open(self.workflows_file) as f:
-                    return json.load(f)
-        except: pass
-        return {'workflows': []}
+        return persistent_store.load('workflows', self.workflows_file, {'workflows': []})
 
     def _save_workflows(self):
-        try:
-            with open(self.workflows_file, 'w') as f:
-                json.dump(self.workflows, f, indent=2, default=str)
-        except Exception as e:
-            print(f"Error saving workflows: {e}")
+        persistent_store.save('workflows', self.workflows_file, self.workflows)
 
     def fetch_meta_leads(self, ad_id=None, limit=50):
         try:
@@ -7818,30 +7854,18 @@ class QuickBooksConnector:
         return data, None
 
     def save_connection(self, tenant_id, token_data):
-        connections = {}
-        if os.path.exists(self.connections_path):
-            try:
-                with open(self.connections_path, 'r', encoding='utf-8') as f:
-                    connections = json.load(f)
-            except Exception:
-                pass
+        connections = persistent_store.load('quickbooks_connections', self.connections_path, {})
         connections[tenant_id] = token_data
         try:
-            with open(self.connections_path, 'w', encoding='utf-8') as f:
-                json.dump(connections, f, indent=2, ensure_ascii=False)
+            persistent_store.save('quickbooks_connections', self.connections_path, connections)
             return True
         except Exception as e:
             print(f"[QuickBooksConnector] WARNING: could not save connection: {e}")
             return False
 
     def get_connection(self, tenant_id):
-        if os.path.exists(self.connections_path):
-            try:
-                with open(self.connections_path, 'r', encoding='utf-8') as f:
-                    return json.load(f).get(tenant_id)
-            except Exception:
-                pass
-        return None
+        connections = persistent_store.load('quickbooks_connections', self.connections_path, {})
+        return connections.get(tenant_id)
 
 
 quickbooks_connector = QuickBooksConnector()
@@ -7877,22 +7901,18 @@ class TenantManager:
         self._save()
 
     def _load(self):
-        if os.path.exists(self.config_path):
-            try:
-                with open(self.config_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                for tid, cfg in data.items():
-                    cfg.setdefault('role', 'admin' if tid == 'default' else 'client')
-                if 'default' not in data:
-                    # Defensive: tenants.json existed but somehow lost the owner's
-                    # own 'default' entry (e.g. wiped/rewritten by a deploy). Without
-                    # this, the owner's own account gets treated as an unauthenticated
-                    # client and gets stuck unable to accept/skip the agreement.
-                    data['default'] = {'name': 'Default Studio', 'industry': 'martialarts', 'role': 'admin', 'uses_env_credentials': True}
-                    self._save(data)
-                return data
-            except Exception as e:
-                print(f"[TenantManager] WARNING: could not read {self.config_path}: {e}")
+        data = persistent_store.load('tenants', self.config_path, None)
+        if data:
+            for tid, cfg in data.items():
+                cfg.setdefault('role', 'admin' if tid == 'default' else 'client')
+            if 'default' not in data:
+                # Defensive: tenants data existed but somehow lost the owner's
+                # own 'default' entry (e.g. wiped/rewritten by a deploy). Without
+                # this, the owner's own account gets treated as an unauthenticated
+                # client and gets stuck unable to accept/skip the agreement.
+                data['default'] = {'name': 'Default Studio', 'industry': 'martialarts', 'role': 'admin', 'uses_env_credentials': True}
+                self._save(data)
+            return data
         # Seed with just 'default' -- it uses whatever is already in .env.txt,
         # nothing to configure here for a single-studio setup.
         seed = {'default': {'name': 'Default Studio', 'industry': 'martialarts', 'role': 'admin', 'uses_env_credentials': True}}
@@ -7900,13 +7920,8 @@ class TenantManager:
         return seed
 
     def _save(self, data=None):
-        try:
-            with open(self.config_path, 'w', encoding='utf-8') as f:
-                json.dump(data if data is not None else self.tenants, f, indent=2, ensure_ascii=False)
-            return True
-        except Exception as e:
-            print(f"[TenantManager] WARNING: could not save {self.config_path}: {e}")
-            return False
+        persistent_store.save('tenants', self.config_path, data if data is not None else self.tenants)
+        return True
 
     def list_tenants(self):
         # Never expose secrets in a listing
@@ -8551,9 +8566,7 @@ def create_web_interface(ads_agent, tenant_manager=None):
         del tenant_manager.tenants[tenant_id]
         tenant_manager._save()
         campaigns_file = os.path.join(os.path.dirname(__file__), f'campaigns_{tenant_id}.json')
-        if os.path.exists(campaigns_file):
-            try: os.remove(campaigns_file)
-            except: pass
+        persistent_store.delete(f'campaigns_{tenant_id}', campaigns_file)
         return jsonify({'success': True})
 
     # ==================== QuickBooks (Intuit) connect ====================
@@ -8807,20 +8820,15 @@ def create_web_interface(ads_agent, tenant_manager=None):
         tid = _viewing_tid()
         suffix = f'_{tid}' if tid != 'default' else ''
         pixel_file = os.path.join(os.path.dirname(__file__), f'pixel_config{suffix}.json')
+        storage_key = f'pixel_config{suffix}'
         if request.method == 'POST':
             data = request.get_json()
             try:
-                with open(pixel_file, 'w') as f:
-                    json.dump(data, f)
+                persistent_store.save(storage_key, pixel_file, data)
                 return jsonify({'success': True})
             except Exception as e:
                 return jsonify({'success': False, 'error': str(e)}), 400
-        try:
-            if os.path.exists(pixel_file):
-                with open(pixel_file) as f:
-                    return jsonify(json.load(f))
-        except: pass
-        return jsonify({'pixel_id': ''})
+        return jsonify(persistent_store.load(storage_key, pixel_file, {'pixel_id': ''}))
 
     @app.route('/api/posts')
     @require_tenant_auth
