@@ -342,6 +342,12 @@ config_store = ConfigStore()
 
 class MetaAPI:
     def __init__(self, access_token, ad_account_id, app_id=None, app_secret=None, page_token=None):
+        # If a refreshed token was saved (via refresh_access_token) after this
+        # env var was set, use that instead -- it's the newer one. Falls back
+        # to the env-provided token if nothing was ever saved, or on any error.
+        saved = persistent_store.load('meta_access_token', None, None)
+        if saved and saved.get('access_token'):
+            access_token = saved['access_token']
         self.access_token = access_token
         self.page_token = page_token or access_token
         self.ad_account_id = ad_account_id   # FIX: was 'ad_account'
@@ -528,6 +534,9 @@ class MetaAPI:
                     new_token = data.get('access_token')
                     if new_token:
                         self.access_token = new_token
+                        persistent_store.save('meta_access_token', None,
+                                               {'access_token': new_token,
+                                                'refreshed_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
                         return True
             except Exception:
                 pass
@@ -542,6 +551,9 @@ class MetaAPI:
                     new_token = response.json().get('access_token')
                     if new_token:
                         self.access_token = new_token
+                        persistent_store.save('meta_access_token', None,
+                                               {'access_token': new_token,
+                                                'refreshed_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')})
                         return True
             except Exception:
                 pass
