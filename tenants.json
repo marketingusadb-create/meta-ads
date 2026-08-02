@@ -1,0 +1,8 @@
+{
+  "default": {
+    "name": "Default Studio",
+    "industry": "martialarts",
+    "role": "admin",
+    "uses_env_credentials": true
+  }
+}
