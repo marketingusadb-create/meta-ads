@@ -12,7 +12,6 @@ services:
         value: "3.11.0"
       - key: SECRET_KEY
         generateValue: true
-    envFile: .env.txt
     autoDeploy: true
     healthCheckPath: /api/whoami
     disk:

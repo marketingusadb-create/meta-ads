@@ -353,7 +353,7 @@ class MetaAPI:
         self.ad_account_id = ad_account_id   # FIX: was 'ad_account'
         self.app_id = app_id
         self.app_secret = app_secret
-        self.base_url = "https://graph.facebook.com/v19.0"
+        self.base_url = "https://graph.facebook.com/v25.0"
         self.session = requests.Session()
         self.token_expires_at = None
         self._check_token_expiry()
@@ -470,7 +470,7 @@ class MetaAPI:
     def get_campaigns(self, limit=50):
         url = f"{self.base_url}/{self.ad_account_id}/campaigns"
         params = {'access_token': self.access_token, 'limit': limit,
-                  'fields': 'id,name,status,objective,daily_budget,lifetime_budget',
+                  'fields': 'id,name,status,objective,daily_budget,lifetime_budget,created_time',
                   'effective_status': '["ACTIVE","PAUSED","ARCHIVED"]'}
         try:
             response = self.session.get(url, params=params)
@@ -749,6 +749,29 @@ class MetaAPI:
             return response.json()
         except Exception as e:
             return {'error': str(e)}
+
+    def set_campaign_state(self, campaign_id, status):
+        """Activate or pause a campaign AND all its ad sets and ads.
+        status must be 'ACTIVE' or 'PAUSED'."""
+        results = []
+        target = 'ACTIVE' if status == 'ACTIVE' else 'PAUSED'
+        r = self.update_campaign(campaign_id, status=target)
+        results.append({'level': 'campaign', 'id': campaign_id, 'response': r})
+        try:
+            for aset in self.get_ad_sets(campaign_id=campaign_id, limit=100):
+                aid = aset.get('id')
+                if not aid:
+                    continue
+                r2 = self.update_campaign(aid, status=target)
+                results.append({'level': 'adset', 'id': aid, 'response': r2})
+                for ad in self.get_ads(adset_id=aid, limit=100):
+                    adid = ad.get('id')
+                    if adid:
+                        r3 = self.update_campaign(adid, status=target)
+                        results.append({'level': 'ad', 'id': adid, 'response': r3})
+        except Exception as e:
+            results.append({'level': 'error', 'error': str(e)})
+        return results
 
     def get_campaign_insights(self, campaign_id, fields='spend,clicks,impressions,ctr,cpc,actions'):
         url = f"{self.base_url}/{campaign_id}/insights"
@@ -1569,10 +1592,29 @@ class UniversalMetaAdsAgent:
         self.performance_optimizer = PerformanceOptimizer(self.meta_api, safety_guard_instance=self.safety_guard)
         self.audience_analyzer = AudienceAnalyzer()
         self.campaigns_file = campaigns_file or os.path.join(os.path.dirname(__file__), 'campaigns.json')
+        self.deleted_file = os.path.join(os.path.dirname(__file__), 'deleted_campaign_ids.json')
+        self.deleted_campaign_ids = self._load_deleted_campaign_ids()
         self.campaigns = self._load_campaigns()
         self.performance_optimizer.campaigns_ref = self.campaigns  # live reference for safety-cap checks
         # Enrich with Meta data on startup
         self._sync_from_meta()
+
+    def _load_deleted_campaign_ids(self):
+        try:
+            with open(self.deleted_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return set(data)
+        except Exception:
+            pass
+        return set()
+
+    def _save_deleted_campaign_ids(self):
+        try:
+            with open(self.deleted_file, 'w', encoding='utf-8') as f:
+                json.dump(sorted(self.deleted_campaign_ids), f, indent=2)
+        except Exception as e:
+            print(f"[MetaAdsAgent] error saving deleted ids: {e}")
 
     def _campaigns_storage_key(self):
         # e.g. 'campaigns.json' -> 'campaigns', 'campaigns_acme.json' -> 'campaigns_acme'
@@ -1589,12 +1631,14 @@ class UniversalMetaAdsAgent:
             meta_camps = self.meta_api.get_campaigns(limit=50)
             for mc in meta_camps:
                 cid = mc.get('id')
-                if cid and cid not in self.campaigns:
+                if cid and cid not in self.campaigns and cid not in self.deleted_campaign_ids:
                     self.campaigns[cid] = {
                         'campaign_id': cid,
                         'campaign_name': mc.get('name'),
                         'status': mc.get('status', 'unknown'),
                         'created_at': mc.get('created_time', ''),
+                        'budget_daily': (float(mc['daily_budget']) / 100
+                                         if mc.get('daily_budget') else None),
                         'meta_response': mc
                     }
             if meta_camps:
@@ -1857,7 +1901,9 @@ class UniversalMetaAdsAgent:
         }
 
     def get_all_campaigns(self):
-        return list(self.campaigns.values())
+        camps = list(self.campaigns.values())
+        camps.sort(key=lambda c: c.get('created_at') or '', reverse=True)
+        return camps
 
     def get_campaign_performance(self, campaign_id):
         if campaign_id not in self.campaigns:
@@ -2080,7 +2126,7 @@ class SocialMediaAutoResponder:
         if not pid:
             return []
         try:
-            url = f"https://graph.facebook.com/v19.0/{pid}/feed?fields=message,from,created_time,comments&limit={limit}&access_token={self.meta_api.page_token or self.meta_api.access_token}"
+            url = f"https://graph.facebook.com/v25.0/{pid}/feed?fields=message,from,created_time,comments&limit={limit}&access_token={self.meta_api.page_token or self.meta_api.access_token}"
             resp = requests.get(url)
             if resp.status_code == 200:
                 data = resp.json()
@@ -2125,7 +2171,7 @@ class SocialMediaAutoResponder:
         try:
             pid = page_id or self.meta_api.get_page_id()
             if pid and comment_id:
-                url = f"https://graph.facebook.com/v19.0/{comment_id}/comments?message={requests.utils.quote(response_text)}&access_token={self.meta_api.page_token or self.meta_api.access_token}"
+                url = f"https://graph.facebook.com/v25.0/{comment_id}/comments?message={requests.utils.quote(response_text)}&access_token={self.meta_api.page_token or self.meta_api.access_token}"
                 resp = requests.post(url)
                 log_entry = {
                     'comment_id': comment_id,
@@ -2330,9 +2376,9 @@ class AdvancedLeadManagement:
         try:
             params = f"limit={limit}&access_token={self.meta_api.access_token}"
             if ad_id:
-                url = f"https://graph.facebook.com/v19.0/{ad_id}/leads?{params}"
+                url = f"https://graph.facebook.com/v25.0/{ad_id}/leads?{params}"
             else:
-                url = f"https://graph.facebook.com/v19.0/act_{self.meta_api.ad_account_id.replace('act_','')}/leads?{params}"
+                url = f"https://graph.facebook.com/v25.0/act_{self.meta_api.ad_account_id.replace('act_','')}/leads?{params}"
             resp = requests.get(url)
             if resp.status_code == 200:
                 data = resp.json().get('data', [])
@@ -2629,7 +2675,8 @@ HTML_TEMPLATE = """
   .post-tab.active { background: #1877f2; color: #fff; border-color: #1877f2; }
   .campaign-filter-btn { padding:4px 12px; border:1px solid #ddd; border-radius:6px; background:#fff; cursor:pointer; font-size:.8rem; color:#65676b; }
   .campaign-filter-btn.active { background: #1877f2; color: #fff; border-color: #1877f2; }
-</style>
+  </style>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#x1f4ca;</text></svg>">
 </head>
 <body>
 
@@ -2698,11 +2745,13 @@ HTML_TEMPLATE = """
       <div style="display:flex;gap:6px;flex-wrap:wrap;">
         <button class="btn btn-sm campaign-filter-btn active" data-filter="all" onclick="setCampaignFilter('all')" data-i18n="all">All</button>
         <button class="btn btn-sm campaign-filter-btn" data-filter="trashed" onclick="setCampaignFilter('trashed')" data-i18n="trash">Trash</button>
+        <button class="btn btn-sm btn-danger" id="delete-selected-btn" onclick="deleteSelectedCampaigns()" style="display:none;" data-i18n="delete_selected">Delete Selected</button>
       </div>
     </div>
     <table>
       <thead>
         <tr>
+          <th style="width:32px;"><input type="checkbox" id="select-all-campaigns" onclick="toggleSelectAllCampaigns(this)" title="Select all"></th>
           <th data-i18n="campaign_name">Campaign Name</th>
           <th data-i18n="ad_type">Ad Type</th>
           <th data-i18n="targeting">Targeting</th>
@@ -3007,46 +3056,36 @@ HTML_TEMPLATE = """
       </div>
     </div>
   </div>
-  <div style="margin-bottom:16px;font-weight:600;font-size:.9rem;color:#1877f2;" data-i18n="quick_schedule">Quick Schedule</div>
-  <div class="form-group" style="background:#f0f2f5;border-radius:8px;padding:12px;margin-bottom:12px;">
-    <div style="font-size:.8rem;color:#65676b;margin-bottom:8px;" data-i18n="single_post_hint">Set one date &amp; time for THIS post.</div>
-    <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap;">
-      <input type="date" id="cp-schedule-start-date" style="flex:1;min-width:140px;padding:8px;border:1px solid #ddd;border-radius:6px;font-size:.85rem;">
-      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
-        <select id="cp-schedule-hour" style="padding:6px 8px;border:1px solid #ddd;border-radius:6px;font-size:.85rem;width:60px;">
+    <div class="form-group" style="background:#e7f3ff;border-radius:8px;padding:12px;margin-bottom:12px;border:1px solid #90caf9;">
+      <div style="font-weight:600;font-size:.9rem;color:#0d47a1;margin-bottom:4px;" data-i18n="simple_weekly">Programaci\u00f3n Semanal Simple</div>
+      <div style="font-size:.8rem;color:#1565c0;margin-bottom:8px;" data-i18n="simple_weekly_hint">Marca los d\u00edas, escribe cu\u00e1ntas semanas, y las horas que a\u00f1adas abajo se repetir\u00e1n en esos d\u00edas cada semana.</div>
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:8px;">
+        <select id="cpw-hour" style="padding:6px 8px;border:1px solid #ddd;border-radius:6px;font-size:.85rem;width:60px;">
           <option>12</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option><option>10</option><option>11</option>
         </select>
         <span style="font-weight:700;color:#65676b;font-size:.9rem;">:</span>
-        <select id="cp-schedule-min" style="padding:6px 8px;border:1px solid #ddd;border-radius:6px;font-size:.85rem;width:65px;">
+        <select id="cpw-min" style="padding:6px 8px;border:1px solid #ddd;border-radius:6px;font-size:.85rem;width:65px;">
           <option>00</option><option>15</option><option>30</option><option>45</option>
         </select>
-        <select id="cp-schedule-ampm" style="padding:6px 8px;border:1px solid #ddd;border-radius:6px;font-size:.85rem;width:65px;">
+        <select id="cpw-ampm" style="padding:6px 8px;border:1px solid #ddd;border-radius:6px;font-size:.85rem;width:65px;">
           <option value="AM">AM</option><option value="PM">PM</option>
         </select>
-        <button class="btn btn-sm btn-primary" onclick="addCpScheduleManualTime()" style="height:34px;" data-i18n="add_time">+ Add</button>
+        <button class="btn btn-sm btn-primary" onclick="addCpWeeklyHour()" style="height:34px;" data-i18n="add_hour">+ Add Hour</button>
+      </div>
+      <div id="cpw-hours-empty" style="color:#65676b;font-size:.85rem;margin-bottom:6px;" data-i18n="no_hours_yet">No hours added yet. Pick a time and click "+ Add Hour".</div>
+      <div id="cpw-hours-list" style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px;"></div>
+      <div id="cpw-weekdays" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px;"></div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+        <span style="font-size:.85rem;" data-i18n="repeat_every">Repetir cada</span>
+        <input type="number" id="cpw-weeks-count" value="4" min="1" max="52" style="width:70px;padding:8px;border:1px solid #ddd;border-radius:6px;">
+        <span style="font-size:.85rem;" data-i18n="weeks">semana(s)</span>
+        <button class="btn btn-sm btn-success" onclick="scheduleCpWeekly()" style="white-space:nowrap;" data-i18n="generate_weekly">Programar Repetici\u00f3n</button>
       </div>
     </div>
-    <div id="cp-schedule-confirm" style="display:none;align-items:center;gap:8px;background:#e6f4ea;border:1px solid #34a853;border-radius:6px;padding:8px 10px;margin-top:6px;font-size:.85rem;color:#1e7e34;">
-      <span id="cp-schedule-confirm-text" style="flex:1;"></span>
-      <span style="cursor:pointer;color:#dc2626;font-weight:700;" onclick="clearCpScheduleManualTime()" title="Remove" data-i18n-title="remove">✕</span>
-    </div>
-    <div id="cp-schedule-manual-empty" style="color:#65676b;font-size:.85rem;margin-top:6px;" data-i18n="no_time_yet">No time added yet. Pick date &amp; time and click "+ Add".</div>
-    <div style="margin-top:14px;border-top:1px solid #dadde1;padding-top:10px;">
-      <div style="font-size:.8rem;color:#65676b;margin-bottom:6px;" data-i18n="repeat_hint">Want to repeat this same post automatically (so you don't have to schedule it day by day)? Save it first, then choose how often:</div>
-      <div style="display:flex;gap:6px;flex-wrap:wrap;">
-        <button class="btn btn-sm" onclick="sendCpToRepeat(7)" style="background:#e7f3ff;" data-i18n="preset_7d">7 Days</button>
-        <button class="btn btn-sm" onclick="sendCpToRepeat(28)" style="background:#e7f3ff;" data-i18n="preset_weekly">4 Weeks</button>
-        <button class="btn btn-sm" onclick="sendCpToRepeat(90)" style="background:#e7f3ff;" data-i18n="preset_monthly">3 Months</button>
-        <button class="btn btn-sm" onclick="sendCpToRepeat(180)" style="background:#e7f3ff;" data-i18n="preset_3m">6 Months</button>
-        <button class="btn btn-sm" onclick="sendCpToRepeat(365)" style="background:#e7f3ff;" data-i18n="preset_12m">12 Months</button>
-      </div>
-    </div>
-  </div>
 
     <input type="hidden" id="cp-schedule" value="">
     <div class="form-group" style="display:flex;gap:8px;flex-wrap:wrap;">
       <button class="btn btn-primary" onclick="savePostAsDraft()" style="flex:1;" data-i18n="save_draft">Save as Draft</button>
-      <button class="btn btn-success" onclick="schedulePost()" style="flex:1;" data-i18n="schedule_post">Schedule</button>
       <button class="btn btn-warn" onclick="publishPostNow()" style="flex:1;" data-i18n="publish_post">Publish Now</button>
     </div>
     <div id="cp-status" style="margin-top:12px;font-size:.85rem;text-align:center;"></div>
@@ -3143,6 +3182,19 @@ HTML_TEMPLATE = """
         <button class="btn btn-sm" onclick="generateRepeatPreset(90)" style="background:#e7f3ff;" data-i18n="preset_monthly">3 Months</button>
         <button class="btn btn-sm" onclick="generateRepeatPreset(180)" style="background:#e7f3ff;" data-i18n="preset_3m">6 Months</button>
         <button class="btn btn-sm" onclick="generateRepeatPreset(365)" style="background:#e7f3ff;" data-i18n="preset_12m">12 Months</button>
+      </div>
+    </div>
+
+    <!-- Simple Weekly Repeat -->
+    <div class="form-group" style="background:#e7f3ff;border-radius:8px;padding:12px;margin-bottom:12px;border:1px solid #90caf9;">
+      <label style="font-weight:600;margin-bottom:4px;display:block;color:#0d47a1;"><span data-i18n="simple_weekly">Programaci\u00f3n Semanal Simple</span></label>
+      <div style="font-size:.8rem;color:#1565c0;margin-bottom:8px;" data-i18n="simple_weekly_hint">Marca los d\u00edas, escribe cu\u00e1ntas semanas, y las horas que a\u00f1adiste arriba se repetir\u00e1n en esos d\u00edas cada semana.</div>
+      <div id="rpt-weekdays" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;"></div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+        <span style="font-size:.85rem;" data-i18n="repeat_every">Repetir cada</span>
+        <input type="number" id="rpt-weeks-count" value="4" min="1" max="52" style="width:70px;padding:8px;border:1px solid #ddd;border-radius:6px;">
+        <span style="font-size:.85rem;" data-i18n="weeks">semana(s)</span>
+        <button class="btn btn-sm btn-success" onclick="generateSimpleWeekly()" data-i18n="generate_weekly">Generar Fechas</button>
       </div>
     </div>
 
@@ -3635,6 +3687,11 @@ var langData = {
     publish_post: 'Publish',
     campaign_created: 'Campaign created! Check Meta Ads Manager to activate.',
     campaign_deleted: 'Campaign archived.',
+    power_on: 'ON',
+    power_off: 'OFF',
+    confirm_activate: 'This will turn ON the campaign, its ad set and its ad, and it will start spending money. Continue?',
+    campaign_activated: 'Campaign turned ON.',
+    campaign_paused: 'Campaign turned OFF.',
     campaign_loaded: 'Campaign loaded - adjust and create',
     optimizing: 'Optimizing all campaigns...',
     optimized: 'All campaigns optimized!',
@@ -3697,6 +3754,8 @@ var langData = {
     confirm_delete_account: 'Delete this account?',
     confirm_delete_campaign: 'Delete this campaign? It will be moved to trash.',
     confirm_delete_forever: 'Delete this campaign permanently? This cannot be undone.',
+    delete_selected: 'Delete Selected',
+    confirm_delete_selected: 'Delete these campaigns permanently? This cannot be undone.',
     campaign_restored: 'Campaign restored!',
     no_trashed_campaigns: 'No trashed campaigns.',
     no_optimizations: 'No optimizations available.',
@@ -3897,6 +3956,15 @@ var langData = {
     preset_12m: '12 Months',
     manual_times: 'Manual Times',
     slots_generated: 'slots generated!',
+    simple_weekly: 'Simple Weekly Schedule',
+    simple_weekly_hint: 'Mark the days, choose how many weeks, and the hours you added above will repeat on those days every week.',
+    repeat_every: 'Repeat every',
+    weeks: 'week(s)',
+    generate_weekly: 'Generate Dates',
+    select_days_first: 'Select at least one day.',
+    add_hour: 'Add Hour',
+    no_hours_yet: 'No hours added yet. Pick a time and click "+ Add Hour".',
+    weekly_generated: 'Schedule generated! Review the times below, then click Schedule All.',
     login_title: 'Sign In',
     login_desc: 'This dashboard has multiple clients configured. Enter your credentials.',
     login_client_id: 'Client (tenant ID)',
@@ -4074,6 +4142,11 @@ var langData = {
     publish_post: 'Publicar',
     campaign_created: 'Campa\u00f1a creada! Revisa Meta Ads Manager para activarla.',
     campaign_deleted: 'Campa\u00f1a archivada.',
+    power_on: 'PRENDER',
+    power_off: 'APAGAR',
+    confirm_activate: 'Esto PRENDER\u00c1 la campa\u00f1a, su conjunto de anuncios y su anuncio, y empezar\u00e1 a gastar dinero. \u00bfContinuar?',
+    campaign_activated: 'Campa\u00f1a PRENDIDA.',
+    campaign_paused: 'Campa\u00f1a APAGADA.',
     campaign_loaded: 'Campa\u00f1a cargada - ajusta y crea',
     optimizing: 'Optimizando campa\u00f1as...',
     optimized: 'Campa\u00f1as optimizadas!',
@@ -4136,6 +4209,8 @@ var langData = {
     confirm_delete_account: 'Eliminar esta cuenta?',
     confirm_delete_campaign: 'Eliminar esta campa\u00f1a? Ir\u00e1 a la papelera.',
     confirm_delete_forever: 'Eliminar esta campa\u00f1a permanentemente? Esto no se puede deshacer.',
+    delete_selected: 'Eliminar Seleccionadas',
+    confirm_delete_selected: 'Eliminar estas campa\u00f1as permanentemente? Esto no se puede deshacer.',
     campaign_restored: 'Campa\u00f1a restaurada!',
     no_trashed_campaigns: 'No hay campa\u00f1as en la papelera.',
     no_optimizations: 'No hay optimizaciones disponibles.',
@@ -4336,6 +4411,15 @@ var langData = {
     preset_12m: '12 Meses',
     manual_times: 'Horas Manuales',
     slots_generated: 'espacios generados!',
+    simple_weekly: 'Programaci\u00f3n Semanal Simple',
+    simple_weekly_hint: 'Marca los d\u00edas, escribe cu\u00e1ntas semanas, y las horas que a\u00f1adiste arriba se repetir\u00e1n en esos d\u00edas cada semana.',
+    repeat_every: 'Repetir cada',
+    weeks: 'semana(s)',
+    generate_weekly: 'Generar Fechas',
+    select_days_first: 'Selecciona al menos un d\u00eda.',
+    add_hour: 'A\u00f1adir Hora',
+    no_hours_yet: 'Sin horas a\u00f1adidas. Elige una hora y haz clic en "+ A\u00f1adir Hora".',
+    weekly_generated: '\u00a1Programaci\u00f3n generada! Revisa las horas de abajo y luego haz clic en Programar Todo.',
     login_title: 'Iniciar sesi\u00f3n',
     login_desc: 'Este panel tiene m\u00faltiples clientes configurados. Ingresa tus datos.',
     login_client_id: 'Cliente (tenant ID)',
@@ -4785,6 +4869,7 @@ function downloadLeadsCSV(leads, keys) {
 async function loadCampaigns() {
   campaignPage = 1;
   campaignFilter = 'all';
+  window._selectedCampaignIds = [];
   updateCampaignFilterUI();
   try {
     const res = await fetch('/api/campaigns');
@@ -4799,6 +4884,18 @@ async function loadCampaigns() {
 function getFilteredCampaigns() {
   if (campaignFilter === 'trashed') return campaigns.filter(function(c) { return c.status === 'TRASHED'; });
   return campaigns.filter(function(c) { return c.status !== 'TRASHED'; });
+}
+
+function formatCampaignBudget(c) {
+  var meta = c.meta_response || {};
+  var val = null;
+  if (c.budget_daily !== undefined && c.budget_daily !== null && c.budget_daily !== '') {
+    val = parseFloat(c.budget_daily);
+  } else if (meta.daily_budget !== undefined && meta.daily_budget !== null && meta.daily_budget !== '') {
+    val = parseFloat(meta.daily_budget) / 100;
+  }
+  if (val === null || isNaN(val)) return '-';
+  return '$' + val.toFixed(2) + '/day';
 }
 
 function renderTable() {
@@ -4817,7 +4914,7 @@ function renderTable() {
   tbody.innerHTML = pageCampaigns.map(function(c) {
     const adType = c.ad_type || c.strategy?.ad_types?.[0] || '-';
     const locationText = c.location || '-';
-    const budget = c.budget_daily ? '$' + c.budget_daily + '/day' : (c.strategy?.campaign_name ? '-' : '-');
+    const budget = formatCampaignBudget(c);
     let badge = '<span class="badge badge-active">' + c.status + '</span>';
     if (c.status === 'pending_auth' || c.ad_status === 'pending_auth') {
       badge = '<span class="badge badge-warn">Pending Auth</span>';
@@ -4827,8 +4924,10 @@ function renderTable() {
     }
     const cid = c.campaign_id || c.id;
     const name = c.strategy?.campaign_name || c.campaign_name || 'Unnamed';
+    const selected = (window._selectedCampaignIds || []).includes(cid);
+    const checkboxCell = `<td><input type="checkbox" class="campaign-select" value="${cid}" onclick="onCampaignSelect()" ${selected?'checked':''}></td>`;
     if (c.status === 'TRASHED') {
-      return `<tr>` +
+      return `<tr>` + checkboxCell +
         `<td><strong>${name}</strong></td>` +
         `<td>${adType}</td>` +
         `<td>${locationText}</td>` +
@@ -4840,7 +4939,7 @@ function renderTable() {
           `<button class="btn btn-sm btn-danger" onclick="deleteCampaignForever('${cid}')">${_t('delete_forever')}</button> ` +
         `</td></tr>`;
     }
-    return `<tr>` +
+    return `<tr>` + checkboxCell +
       `<td><strong>${name}</strong></td>` +
       `<td>${adType}</td>` +
       `<td>${locationText}</td>` +
@@ -4851,17 +4950,102 @@ function renderTable() {
         `<button class="btn btn-sm btn-primary" onclick="viewCampaign('${cid}')">${_t('view')}</button> ` +
         `<button class="btn btn-sm btn-warn" onclick="optimizeCampaign('${cid}')">${_t('optimize')}</button> ` +
         `<button class="btn btn-sm btn-outline" onclick="reuseCampaign('${cid}')">${_t('reuse')}</button> ` +
+        `<button class="btn btn-sm" style="background:${c.status==='ACTIVE'?'#f97316':'#22c55e'};color:#fff;border:none;cursor:pointer;" onclick="toggleCampaignState('${cid}','${c.status==='ACTIVE'?'PAUSED':'ACTIVE'}')">${c.status==='ACTIVE'?_t('power_off'):_t('power_on')}</button> ` +
         `<button class="btn btn-sm btn-danger" onclick="deleteCampaign('${cid}')">🗑</button> ` +
       `</td></tr>`;
   }).join('');
   paginateCampaigns(totalPages);
+  updateBulkDeleteUI();
 }
 
 function setCampaignFilter(f) {
   campaignFilter = f;
   campaignPage = 1;
   updateCampaignFilterUI();
+  window._selectedCampaignIds = [];
   renderTable();
+}
+
+function toggleSelectAllCampaigns(checkbox) {
+  window._selectedCampaignIds = window._selectedCampaignIds || [];
+  const trashed = getFilteredCampaigns();
+  trashed.forEach(function(c) {
+    const cid = c.campaign_id || c.id;
+    const idx = window._selectedCampaignIds.indexOf(cid);
+    if (checkbox.checked) {
+      if (idx === -1) window._selectedCampaignIds.push(cid);
+    } else {
+      if (idx !== -1) window._selectedCampaignIds.splice(idx, 1);
+    }
+  });
+  renderTable();
+  updateBulkDeleteUI();
+}
+
+function onCampaignSelect() {
+  window._selectedCampaignIds = window._selectedCampaignIds || [];
+  const checkboxes = document.querySelectorAll('.campaign-select');
+  checkboxes.forEach(function(cb) {
+    const cid = cb.value;
+    const idx = window._selectedCampaignIds.indexOf(cid);
+    if (cb.checked) {
+      if (idx === -1) window._selectedCampaignIds.push(cid);
+    } else {
+      if (idx !== -1) window._selectedCampaignIds.splice(idx, 1);
+    }
+  });
+  const allChecked = checkboxes.length > 0 && Array.from(checkboxes).every(cb => cb.checked);
+  const selectAll = document.getElementById('select-all-campaigns');
+  if (selectAll) selectAll.checked = allChecked;
+  updateBulkDeleteUI();
+}
+
+function updateBulkDeleteUI() {
+  const btn = document.getElementById('delete-selected-btn');
+  if (!btn) return;
+  const count = (window._selectedCampaignIds || []).length;
+  if (campaignFilter === 'trashed' && count > 0) {
+    btn.style.display = 'inline-block';
+    btn.textContent = _t('delete_selected') + ' (' + count + ')';
+  } else {
+    btn.style.display = 'none';
+  }
+}
+
+async function deleteSelectedCampaigns() {
+  const ids = window._selectedCampaignIds || [];
+  if (!ids.length) return;
+  if (!confirm(_t('confirm_delete_selected') + ' (' + ids.length + ')')) return;
+  const res = await fetch('/api/delete-campaigns-forever', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({campaign_ids: ids})
+  });
+  const data = await res.json();
+  if (data.success) {
+    showToast(_t('campaign_deleted'));
+    window._selectedCampaignIds = [];
+    loadCampaigns();
+  } else {
+    showToast(_t('error') + ': ' + (data.error || 'unknown'));
+  }
+}
+
+async function toggleCampaignState(cid, status) {
+  if (status === 'ACTIVE' && !confirm(_t('confirm_activate'))) return;
+  const res = await fetch('/api/campaign/' + cid + '/state', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({status: status})
+  });
+  const data = await res.json();
+  if (data.success) {
+    showToast(status === 'ACTIVE' ? _t('campaign_activated') : _t('campaign_paused'));
+    loadCampaigns();
+  } else {
+    const e = data.errors && data.errors[0] ? (data.errors[0].error || data.errors[0].response?.error?.message || '') : '';
+    showToast(_t('error') + ': ' + (e || data.error || 'unknown'));
+  }
 }
 
 function updateCampaignFilterUI() {
@@ -4959,7 +5143,7 @@ function viewCampaign(campaignId) {
   document.getElementById('preview-camp-status').textContent = c.status;
   document.getElementById('preview-camp-objective').textContent = meta.objective || c.objective || '-';
   document.getElementById('preview-camp-created').textContent = c.created_at || '-';
-  document.getElementById('preview-camp-budget').textContent = c.budget_daily ? '$' + c.budget_daily + '/day' : (meta.daily_budget ? '$' + meta.daily_budget + '/day' : '-');
+  document.getElementById('preview-camp-budget').textContent = formatCampaignBudget(c);
   document.getElementById('preview-camp-lifetime').textContent = meta.lifetime_budget ? '$' + meta.lifetime_budget : '-';
   document.getElementById('preview-camp-targeting').textContent = c.location || c.targeting || '-';
   document.getElementById('preview-camp-adtype').textContent = c.ad_type || c.strategy?.ad_types?.[0] || meta.objective || '-';
@@ -5757,14 +5941,9 @@ translateDOM();
       document.getElementById('cp-ai-instruction').value = '';
       document.getElementById('cp-cta').value = 'LEARN_MORE';
       document.getElementById('cp-link').value = '';
-      document.getElementById('cp-schedule-start-date').value = '';
-      document.getElementById('cp-schedule-hour').value = '12';
-      document.getElementById('cp-schedule-min').value = '00';
-      document.getElementById('cp-schedule-ampm').value = 'AM';
-      document.getElementById('cp-schedule-confirm').style.display = 'none';
-      document.getElementById('cp-schedule-manual-empty').style.display = '';
       document.getElementById('cp-schedule').value = '';
       document.getElementById('cp-status').innerHTML = '';
+      if (typeof initCpWeekdayPicker === 'function') initCpWeekdayPicker();
       resetCpPreview();
       document.getElementById('create-post-modal').classList.add('open');
     } catch(e) {
@@ -5809,6 +5988,7 @@ translateDOM();
       document.getElementById('rpt-status').innerHTML = '';
       _rptTimeIndex = 0;
       _rptHourIndex = 0;
+      initWeekdayPicker();
       document.getElementById('repeat-modal').classList.add('open');
       if (typeof onReady === 'function') onReady();
     }).catch(function() { showToast(_t('error')); });
@@ -5839,6 +6019,7 @@ translateDOM();
       document.getElementById('rpt-status').innerHTML = '';
       _rptTimeIndex = 0;
       _rptHourIndex = 0;
+      initWeekdayPicker();
       document.getElementById('repeat-modal').classList.add('open');
     }).catch(function() { showToast(_t('error')); });
   }
@@ -5847,23 +6028,27 @@ translateDOM();
     document.getElementById('repeat-modal').classList.remove('open');
   }
 
+  function addRepeatHourValue(hour24Str, display) {
+    document.getElementById('rpt-hours-empty').style.display = 'none';
+    var idx = _rptHourIndex++;
+    var container = document.getElementById('rpt-hours-list');
+    var span = document.createElement('span');
+    span.id = 'rpt-hour-' + idx;
+    span.setAttribute('data-24h', hour24Str);
+    span.style.cssText = 'display:inline-flex;align-items:center;gap:4px;background:#e7f3ff;padding:4px 10px;border-radius:12px;font-size:.85rem;';
+    span.innerHTML = display + ' <span style="cursor:pointer;color:#dc2626;font-weight:700;" onclick="removeRepeatHour(' + idx + ')">x</span>';
+    container.appendChild(span);
+  }
+
   function addRepeatHour() {
     var h = parseInt(document.getElementById('rpt-hour-select').value, 10);
     var m = document.getElementById('rpt-minute-select').value;
     var ampm = document.getElementById('rpt-ampm-select').value;
     if (isNaN(h)) { showToast(_t('select_hour_first')); return; }
     var h24 = (ampm === 'PM' && h !== 12) ? h + 12 : (ampm === 'AM' && h === 12 ? 0 : h);
-    var hour24Str = String(h24).padStart(2, '0');
+    var hour24Str = String(h24).padStart(2, '0') + ':' + m;
     var display = h + ':' + m + ' ' + ampm;
-    document.getElementById('rpt-hours-empty').style.display = 'none';
-    var idx = _rptHourIndex++;
-    var container = document.getElementById('rpt-hours-list');
-    var span = document.createElement('span');
-    span.id = 'rpt-hour-' + idx;
-    span.setAttribute('data-24h', hour24Str + ':' + m);
-    span.style.cssText = 'display:inline-flex;align-items:center;gap:4px;background:#e7f3ff;padding:4px 10px;border-radius:12px;font-size:.85rem;';
-    span.innerHTML = display + ' <span style="cursor:pointer;color:#dc2626;font-weight:700;" onclick="removeRepeatHour(' + idx + ')">x</span>';
-    container.appendChild(span);
+    addRepeatHourValue(hour24Str, display);
     if (_cpRepeatPendingDays && document.getElementById('rpt-start-date').value) {
       var pendingDays = _cpRepeatPendingDays;
       _cpRepeatPendingDays = null;
@@ -5910,6 +6095,86 @@ translateDOM();
           '<button class="btn btn-sm btn-danger" onclick="removeRepeatTime(' + idx + ')" title="' + _t('remove_time') + '">x</button>';
         container.appendChild(div);
         count++;
+      }
+    }
+    showToast(count + ' ' + _t('slots_generated'));
+  }
+
+  var _rptWeekdays = [];
+  function initWeekdayPicker(preselect) {
+    var container = document.getElementById('rpt-weekdays');
+    if (!container) return;
+    container.innerHTML = '';
+    _rptWeekdays = [];
+    var dayKeys = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+    var jsDays = [1, 2, 3, 4, 5, 6, 0];
+    for (var i = 0; i < dayKeys.length; i++) {
+      (function(key, jsd) {
+        var btn = document.createElement('button');
+        btn.type = 'button';
+        btn.setAttribute('data-jsday', String(jsd));
+        btn.textContent = _t(key);
+        btn.style.cssText = 'padding:6px 12px;border-radius:8px;border:1px solid #ddd;background:#fff;cursor:pointer;font-size:.85rem;color:#1c1e21;';
+        btn.onclick = function() { toggleWeekday(btn); };
+        container.appendChild(btn);
+        if (preselect && preselect.indexOf(jsd) !== -1) toggleWeekday(btn);
+      })(dayKeys[i], jsDays[i]);
+    }
+  }
+
+  function toggleWeekday(btn) {
+    var jsd = parseInt(btn.getAttribute('data-jsday'), 10);
+    var idx = _rptWeekdays.indexOf(jsd);
+    if (idx === -1) {
+      _rptWeekdays.push(jsd);
+      btn.style.background = '#1877f2';
+      btn.style.color = '#fff';
+      btn.style.borderColor = '#1877f2';
+    } else {
+      _rptWeekdays.splice(idx, 1);
+      btn.style.background = '#fff';
+      btn.style.color = '#1c1e21';
+      btn.style.borderColor = '#ddd';
+    }
+  }
+
+  function generateSimpleWeekly() {
+    var weeks = parseInt(document.getElementById('rpt-weeks-count').value, 10) || 4;
+    if (!_rptWeekdays.length) { showToast(_t('select_days_first')); return; }
+    var hourSpans = document.getElementById('rpt-hours-list').children;
+    if (!hourSpans.length) { showToast(_t('add_hours_first')); return; }
+    var hours = [];
+    for (var i = 0; i < hourSpans.length; i++) {
+      var h24 = hourSpans[i].getAttribute('data-24h');
+      if (h24) hours.push(h24);
+    }
+    if (!hours.length) { showToast(_t('add_hours_first')); return; }
+    var today = new Date();
+    var startToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+    var container = document.getElementById('rpt-times-list');
+    document.getElementById('rpt-times-empty').style.display = 'none';
+    var count = 0;
+    _rptWeekdays.sort(function(a, b) { return a - b; });
+    for (var w = 0; w < weeks; w++) {
+      for (var k = 0; k < _rptWeekdays.length; k++) {
+        var jsd = _rptWeekdays[k];
+        var diff = (jsd - today.getDay() + 7) % 7;
+        var dateObj = new Date(startToday);
+        dateObj.setDate(dateObj.getDate() + diff + w * 7);
+        var y = dateObj.getFullYear();
+        var m = String(dateObj.getMonth() + 1).padStart(2, '0');
+        var d = String(dateObj.getDate()).padStart(2, '0');
+        var dateStr = y + '-' + m + '-' + d;
+        for (var h = 0; h < hours.length; h++) {
+          var idx = _rptTimeIndex++;
+          var div = document.createElement('div');
+          div.id = 'rpt-time-' + idx;
+          div.style.cssText = 'display:flex;gap:8px;align-items:center;margin-bottom:6px;';
+          div.innerHTML = '<input type="datetime-local" id="rpt-dt-' + idx + '" value="' + dateStr + 'T' + hours[h] + '" style="flex:1;padding:8px;border:1px solid #ddd;border-radius:6px;">' +
+            '<button class="btn btn-sm btn-danger" onclick="removeRepeatTime(' + idx + ')" title="' + _t('remove_time') + '">x</button>';
+          container.appendChild(div);
+          count++;
+        }
       }
     }
     showToast(count + ' ' + _t('slots_generated'));
@@ -6210,6 +6475,123 @@ translateDOM();
             _cpRepeatPendingDays = totalDays;
             showToast(_t('repeat_setup_hint'));
           });
+        } else {
+          statusEl.innerHTML = _t('error') + ': ' + (d.error || 'Unknown');
+        }
+      }).catch(function(e) { statusEl.innerHTML = 'Error: ' + e.message; });
+  }
+
+  var _cpwHourIndex = 0;
+  var _cpwWeekdays = [];
+  function initCpWeekdayPicker() {
+    var container = document.getElementById('cpw-weekdays');
+    if (!container) return;
+    container.innerHTML = '';
+    _cpwWeekdays = [];
+    var dayKeys = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+    var jsDays = [1, 2, 3, 4, 5, 6, 0];
+    for (var i = 0; i < dayKeys.length; i++) {
+      (function(key, jsd) {
+        var btn = document.createElement('button');
+        btn.type = 'button';
+        btn.setAttribute('data-jsday', String(jsd));
+        btn.textContent = _t(key);
+        btn.style.cssText = 'padding:6px 12px;border-radius:8px;border:1px solid #ddd;background:#fff;cursor:pointer;font-size:.85rem;color:#1c1e21;';
+        btn.onclick = function() { toggleCpWeekday(btn); };
+        container.appendChild(btn);
+      })(dayKeys[i], jsDays[i]);
+    }
+  }
+
+  function toggleCpWeekday(btn) {
+    var jsd = parseInt(btn.getAttribute('data-jsday'), 10);
+    var idx = _cpwWeekdays.indexOf(jsd);
+    if (idx === -1) {
+      _cpwWeekdays.push(jsd);
+      btn.style.background = '#1877f2';
+      btn.style.color = '#fff';
+      btn.style.borderColor = '#1877f2';
+    } else {
+      _cpwWeekdays.splice(idx, 1);
+      btn.style.background = '#fff';
+      btn.style.color = '#1c1e21';
+      btn.style.borderColor = '#ddd';
+    }
+  }
+
+  function addCpWeeklyHour() {
+    var h = parseInt(document.getElementById('cpw-hour').value, 10);
+    var m = document.getElementById('cpw-min').value;
+    var ampm = document.getElementById('cpw-ampm').value;
+    if (isNaN(h)) { showToast(_t('select_hour_first')); return; }
+    var h24 = (ampm === 'PM' && h !== 12) ? h + 12 : (ampm === 'AM' && h === 12 ? 0 : h);
+    var hour24Str = String(h24).padStart(2, '0') + ':' + m;
+    var display = h + ':' + m + ' ' + ampm;
+    document.getElementById('cpw-hours-empty').style.display = 'none';
+    var idx = _cpwHourIndex++;
+    var container = document.getElementById('cpw-hours-list');
+    var span = document.createElement('span');
+    span.id = 'cpw-hour-' + idx;
+    span.setAttribute('data-24h', hour24Str);
+    span.style.cssText = 'display:inline-flex;align-items:center;gap:4px;background:#fff;border:1px solid #1877f2;color:#1877f2;padding:4px 10px;border-radius:12px;font-size:.85rem;';
+    span.innerHTML = display + ' <span style="cursor:pointer;color:#dc2626;font-weight:700;" onclick="removeCpWeeklyHour(' + idx + ')">x</span>';
+    container.appendChild(span);
+  }
+
+  function removeCpWeeklyHour(idx) {
+    var el = document.getElementById('cpw-hour-' + idx);
+    if (el) el.remove();
+    var container = document.getElementById('cpw-hours-list');
+    if (container.children.length === 0) {
+      document.getElementById('cpw-hours-empty').style.display = '';
+    }
+  }
+
+  function scheduleCpWeekly() {
+    var weeks = parseInt(document.getElementById('cpw-weeks-count').value, 10) || 4;
+    if (!_cpwWeekdays.length) { showToast(_t('select_days_first')); return; }
+    var hourSpans = document.getElementById('cpw-hours-list').children;
+    if (!hourSpans.length) { showToast(_t('add_hours_first')); return; }
+    var hours = [];
+    for (var i = 0; i < hourSpans.length; i++) {
+      var h24 = hourSpans[i].getAttribute('data-24h');
+      if (h24) hours.push(h24);
+    }
+    if (!hours.length) { showToast(_t('add_hours_first')); return; }
+    var payload = getCpPayload();
+    if (!payload.message && !payload.media_url && !(payload.media_urls && payload.media_urls.length)) {
+      showToast(_t('add_content_first'));
+      return;
+    }
+    var statusEl = document.getElementById('cp-status');
+    statusEl.innerHTML = _t('processing');
+    var onReady = function() {
+      var weeksEl = document.getElementById('rpt-weeks-count');
+      if (weeksEl) weeksEl.value = String(weeks);
+      for (var j = 0; j < hours.length; j++) {
+        var parts = hours[j].split(':');
+        var hh = parseInt(parts[0], 10);
+        var mm = parts[1] || '00';
+        var disp = (hh % 12 === 0 ? 12 : hh % 12) + ':' + mm + (hh >= 12 ? ' PM' : ' AM');
+        addRepeatHourValue(hours[j], disp);
+      }
+      initWeekdayPicker(_cpwWeekdays);
+      generateSimpleWeekly();
+      showToast(_t('weekly_generated'));
+    };
+    if (payload.post_id) {
+      closeCreatePostModal();
+      openRepeatModal(payload.post_id, onReady);
+      return;
+    }
+    payload.status = 'draft';
+    payload.scheduled_time = null;
+    fetch('/api/posts/create', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)})
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        if (d.success && d.post && d.post.id) {
+          closeCreatePostModal();
+          openRepeatModal(d.post.id, onReady);
         } else {
           statusEl.innerHTML = _t('error') + ': ' + (d.error || 'Unknown');
         }
@@ -8281,6 +8663,10 @@ def create_web_interface(ads_agent, tenant_manager=None):
 
     scheduler = ContentScheduler(ads_agent.meta_api)
 
+    @app.route('/favicon.ico')
+    def favicon():
+        return app.response_class('', status=204)
+
     @app.route('/')
     def home():
         resp = app.response_class(HTML_TEMPLATE, content_type='text/html; charset=utf-8')
@@ -8293,6 +8679,21 @@ def create_web_interface(ads_agent, tenant_manager=None):
     @require_tenant_auth
     def api_campaigns():
         return jsonify(resolve_agent().get_all_campaigns())
+
+    @app.route('/api/campaign/<campaign_id>/state', methods=['POST'])
+    @require_tenant_auth
+    def api_campaign_state(campaign_id):
+        data = request.get_json(silent=True) or {}
+        status = (data.get('status') or '').upper()
+        if status not in ('ACTIVE', 'PAUSED'):
+            return jsonify({'success': False, 'error': 'status must be ACTIVE or PAUSED'}), 400
+        agent = resolve_agent()
+        results = agent.meta_api.set_campaign_state(campaign_id, status)
+        errors = [r for r in results if 'error' in r or (r.get('response') and isinstance(r['response'], dict) and r['response'].get('error'))]
+        if campaign_id in agent.campaigns:
+            agent.campaigns[campaign_id]['status'] = status
+            agent._save_campaigns()
+        return jsonify({'success': not errors, 'errors': errors, 'results': results})
 
     @app.route('/api/campaign/<campaign_id>/performance')
     @require_tenant_auth
@@ -8380,6 +8781,26 @@ def create_web_interface(ads_agent, tenant_manager=None):
                 del agent.campaigns[campaign_id]
                 agent._save_campaigns()
             return jsonify({'success': True})
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)})
+
+    @app.route('/api/delete-campaigns-forever', methods=['POST'])
+    @require_tenant_auth
+    def api_delete_campaigns_forever():
+        try:
+            data = request.get_json(silent=True) or {}
+            ids = data.get('campaign_ids', [])
+            agent = resolve_agent()
+            removed = 0
+            for campaign_id in ids:
+                if campaign_id in agent.campaigns:
+                    del agent.campaigns[campaign_id]
+                    removed += 1
+                agent.deleted_campaign_ids.add(str(campaign_id))
+            if removed or ids:
+                agent._save_campaigns()
+                agent._save_deleted_campaign_ids()
+            return jsonify({'success': True, 'removed': removed})
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)})
 
@@ -9378,8 +9799,8 @@ def main():
     te = threading.Thread(target=token_expiry_check, daemon=True)
     te.start()
 
-    host = os.environ.get('HOST', '0.0.0.0')
-    port = int(os.environ.get('PORT', 5000))
+    host = os.environ.get('HOST') or '0.0.0.0'
+    port = int(os.environ.get('PORT') or 5000)
 
     if os.environ.get('PRODUCTION'):
         try:
