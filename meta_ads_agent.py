@@ -3109,9 +3109,41 @@ HTML_TEMPLATE = """
     <input type="hidden" id="cp-schedule" value="">
     <div class="form-group" style="display:flex;gap:8px;flex-wrap:wrap;">
       <button class="btn btn-primary" onclick="savePostAsDraft()" style="flex:1;" data-i18n="save_draft">Save as Draft</button>
+      <button class="btn btn-outline" onclick="previewCpPost()" style="flex:1;background:#1c1e21;color:#fff;border-color:#1c1e21;" data-i18n="preview_post">Preview</button>
       <button class="btn btn-warn" onclick="publishPostNow()" style="flex:1;" data-i18n="publish_post">Publish Now</button>
     </div>
     <div id="cp-status" style="margin-top:12px;font-size:.85rem;text-align:center;"></div>
+  </div>
+</div>
+
+<!-- Post Preview Modal -->
+<div class="modal-bg" id="cp-preview-modal">
+  <div class="modal" style="max-width:520px;background:#f0f2f5;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+      <h3 style="margin:0;" data-i18n="preview_title">Post Preview</h3>
+      <button onclick="closeCpPreview()" style="background:none;border:none;font-size:1.4rem;cursor:pointer;">x</button>
+    </div>
+    <div style="background:#fff;border-radius:10px;padding:16px;box-shadow:0 1px 2px rgba(0,0,0,0.1);">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+        <div style="width:40px;height:40px;border-radius:50%;background:#1877f2;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:1.1rem;">M</div>
+        <div style="font-size:.85rem;">
+          <div style="font-weight:700;" id="cpv-platform"></div>
+          <div style="color:#65676b;" id="cpv-status">Now</div>
+        </div>
+      </div>
+      <div id="cpv-media" style="margin-bottom:10px;"></div>
+      <div style="background:#f0f2f5;border-radius:8px;padding:12px;font-size:.9rem;white-space:pre-wrap;line-height:1.4;" id="cpv-message"></div>
+      <div id="cpv-linkcard" style="margin-top:10px;border:1px solid #dddfe2;border-radius:8px;overflow:hidden;display:none;">
+        <div style="padding:10px;background:#fff;">
+          <div style="font-weight:700;font-size:.9rem;color:#385898;" id="cpv-headline"></div>
+          <div style="color:#65676b;font-size:.8rem;" id="cpv-link"></div>
+        </div>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:16px;">
+      <button class="btn" onclick="closeCpPreview()" style="flex:1;" data-i18n="back_edit">Back</button>
+      <button class="btn btn-warn" onclick="publishFromPreview()" style="flex:1;" data-i18n="publish_post">Publish Now</button>
+    </div>
   </div>
 </div>
 
@@ -3708,6 +3740,9 @@ var langData = {
     save_draft: 'Save as Draft',
     schedule_post: 'Schedule',
     publish_post: 'Publish',
+    preview_post: 'Preview',
+    preview_title: 'Post Preview',
+    back_edit: 'Back',
     campaign_created: 'Campaign created! Check Meta Ads Manager to activate.',
     campaign_deleted: 'Campaign archived.',
     power_on: 'ON',
@@ -4163,6 +4198,9 @@ var langData = {
     save_draft: 'Guardar Borrador',
     schedule_post: 'Programar',
     publish_post: 'Publicar',
+    preview_post: 'Vista Previa',
+    preview_title: 'Vista Previa del Post',
+    back_edit: 'Volver',
     campaign_created: 'Campa\u00f1a creada! Revisa Meta Ads Manager para activarla.',
     campaign_deleted: 'Campa\u00f1a archivada.',
     power_on: 'PRENDER',
@@ -6635,6 +6673,58 @@ translateDOM();
     payload.status = 'publish_now';
     payload.scheduled_time = null;
     submitPost(payload, _t('publishing'));
+  }
+
+  function previewCpPost() {
+    var payload = getCpPayload();
+    var platforms = getCpPlatforms();
+    var warn = document.getElementById('cp-platform-warning');
+    if (!platforms.length) {
+      if (warn) warn.style.display = 'block';
+      return;
+    }
+    if (warn) warn.style.display = 'none';
+    document.getElementById('cpv-platform').textContent = platforms.join(' + ');
+    document.getElementById('cpv-message').textContent = payload.message || '(no message)';
+    var mediaBox = document.getElementById('cpv-media');
+    mediaBox.innerHTML = '';
+    var media = payload.media_urls && payload.media_urls.length ? payload.media_urls : (payload.media_url ? [payload.media_url] : []);
+    if (media.length) {
+      var isVideo = payload.content_type === 'video' && media.length === 1;
+      media.forEach(function(src) {
+        if (isVideo) {
+          var vid = document.createElement('video');
+          vid.src = src;
+          vid.controls = true;
+          vid.style.cssText = 'max-width:100%;max-height:280px;border-radius:8px;display:block;';
+          mediaBox.appendChild(vid);
+        } else {
+          var img = document.createElement('img');
+          img.src = src;
+          img.style.cssText = 'max-width:100%;max-height:280px;border-radius:8px;object-fit:cover;display:block;';
+          img.onerror = function() { this.style.display = 'none'; };
+          mediaBox.appendChild(img);
+        }
+      });
+    }
+    var linkCard = document.getElementById('cpv-linkcard');
+    if (payload.link_url) {
+      linkCard.style.display = 'block';
+      document.getElementById('cpv-headline').textContent = payload.headline || 'Learn More';
+      document.getElementById('cpv-link').textContent = payload.link_url;
+    } else {
+      linkCard.style.display = 'none';
+    }
+    document.getElementById('cp-preview-modal').classList.add('open');
+  }
+
+  function closeCpPreview() {
+    document.getElementById('cp-preview-modal').classList.remove('open');
+  }
+
+  function publishFromPreview() {
+    closeCpPreview();
+    publishPostNow();
   }
 
   function submitPost(payload, successMsg) {
