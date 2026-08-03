@@ -838,10 +838,33 @@ class MetaAPI:
 
     def _ensure_public_url(self, media_url, page_id, token):
         if media_url.startswith('/uploads/') or media_url.startswith('uploads/'):
+            # Try to build a real public URL from the app's own host (works on
+            # Render and locally). Meta must be able to download the image from
+            # this URL, so we prefer the dashboard's own /uploads/ route over
+            # the graph.facebook.com /picture trick which Instagram rejects.
+            pub = self._public_upload_url(media_url)
+            if pub:
+                return pub
             fb_url = self._upload_to_facebook_for_ig(media_url, page_id, token)
             if fb_url:
                 return fb_url
         return media_url
+
+    def _public_upload_url(self, media_url):
+        """Build a public URL for a locally-uploaded file, e.g.
+        https://<dashboard-host>/uploads/xxxx.png"""
+        name = media_url.lstrip('/')
+        base = os.environ.get('PUBLIC_BASE_URL', '').rstrip('/')
+        if not base:
+            try:
+                from flask import request as _r, has_request_context
+                if has_request_context():
+                    base = _r.host_url.rstrip('/')
+            except Exception:
+                base = ''
+        if base and name.startswith('uploads/'):
+            return f"{base}/{name}"
+        return ''
 
     def create_instagram_post(self, ig_id, image_url, caption='', scheduled_time=None, page_id=None):
         token = self._ig_token()
@@ -6755,8 +6778,8 @@ translateDOM();
       box.appendChild(hdr);
 
       // Media preview
-      var imgSrc = p.media_file || p.media_url || '';
       var allImgs = (p.media_files && p.media_files.length) ? p.media_files : ((p.media_urls && p.media_urls.length) ? p.media_urls : []);
+      var imgSrc = p.media_file || p.media_url || (allImgs.length === 1 ? allImgs[0] : '');
 
       if (allImgs.length > 1) {
         var label = document.createElement('div');
