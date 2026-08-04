@@ -1956,6 +1956,8 @@ class ContentScheduler:
         self.page_id = page_id
         self.posts_file = os.path.join(os.path.dirname(__file__), 'posts.json')
         self.posts = self._load_posts()
+        self.running = False
+        self.thread = None
 
     def _load_posts(self):
         return persistent_store.load('posts', self.posts_file, {})
@@ -1968,6 +1970,7 @@ class ContentScheduler:
         post = {
             'id': post_id,
             'platform': data.get('platform', 'facebook'),
+            'platforms': data.get('platforms', []),
             'content_type': data.get('content_type', 'image'),
             'headline': data.get('headline', ''),
             'message': data.get('message', ''),
@@ -2049,6 +2052,53 @@ class ContentScheduler:
             post['meta_response'] = result
             self._save_posts()
         return result
+
+    def publish_due_posts(self):
+        now = datetime.now()
+        published = []
+        for pid, post in list(self.posts.items()):
+            if post.get('status') != 'scheduled':
+                continue
+            sched = post.get('scheduled_time')
+            if not sched:
+                continue
+            try:
+                if isinstance(sched, (int, float)):
+                    sched_dt = datetime.fromtimestamp(sched)
+                else:
+                    sched_dt = datetime.strptime(str(sched).replace('T', ' ')[:16], '%Y-%m-%d %H:%M')
+            except Exception:
+                continue
+            if sched_dt <= now:
+                saved_sched = post.get('scheduled_time')
+                post['scheduled_time'] = None
+                result = self._execute_publish(post)
+                post['scheduled_time'] = saved_sched
+                if 'error' not in result:
+                    post['status'] = 'published'
+                    post['published_at'] = datetime.now().strftime('%Y-%m-%d %H:%M')
+                    post['meta_response'] = result
+                    self._save_posts()
+                    published.append(pid)
+                    print(f"[AUTO-PUBLISH] Post {pid} published")
+                else:
+                    print(f"[AUTO-PUBLISH] Post {pid} failed: {result.get('error')}")
+        return published
+
+    def start_auto_publish(self, interval=60):
+        self.running = True
+        def _loop():
+            while self.running:
+                try:
+                    self.publish_due_posts()
+                except Exception as e:
+                    print(f"[AUTO-PUBLISH] Error: {e}")
+                time.sleep(interval)
+        self.thread = threading.Thread(target=_loop, daemon=True)
+        self.thread.start()
+
+    def stop_auto_publish(self):
+        self.running = False
 
     def _execute_publish(self, post):
         page_id = self.page_id or self.meta_api.get_page_id()
@@ -3157,6 +3207,20 @@ HTML_TEMPLATE = """
     <input type="hidden" id="rpt-source-id" value="">
     <input type="hidden" id="rpt-source-type" value="post">
     <div class="form-group">
+      <label data-i18n="platform">Platform</label>
+      <div style="display:flex;gap:16px;padding:10px 12px;border:1px solid #ddd;border-radius:6px;background:#f8f9fa;">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-weight:600;color:#1877f2;">
+          <input type="checkbox" id="rpt-platform-fb" value="facebook" checked onchange="toggleRptPlatform()" style="width:18px;height:18px;cursor:pointer;accent-color:#1877f2;">
+          <span>📘 Facebook</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-weight:600;color:#e1306c;">
+          <input type="checkbox" id="rpt-platform-ig" value="instagram" onchange="toggleRptPlatform()" style="width:18px;height:18px;cursor:pointer;accent-color:#e1306c;">
+          <span>📸 Instagram</span>
+        </label>
+      </div>
+      <div id="rpt-platform-warning" style="display:none;color:#dc2626;font-size:.8rem;margin-top:4px;" data-i18n="select_platform">⚠️ Select at least one platform.</div>
+    </div>
+    <div class="form-group">
       <label data-i18n="headline">Headline</label>
       <div style="display:flex;gap:6px;">
         <input type="text" id="rpt-headline" maxlength="40" style="flex:1;padding:8px;border:1px solid #ddd;border-radius:6px;">
@@ -3259,7 +3323,8 @@ HTML_TEMPLATE = """
       <div id="rpt-times-list" style="margin-top:6px;"></div>
       <div id="rpt-times-empty" style="color:#65676b;font-size:.85rem;text-align:center;padding:12px;" data-i18n="no_times">No times added. Use Quick Schedule presets or add manually.</div>
     </div>
-    <div class="form-group" style="text-align:right;">
+    <div class="form-group" style="text-align:right;display:flex;gap:8px;justify-content:flex-end;">
+      <button class="btn btn-outline" onclick="previewRptPost()" style="background:#1c1e21;color:#fff;border-color:#1c1e21;font-weight:700;" data-i18n="preview_post">Preview</button>
       <button class="btn btn-success" onclick="scheduleRepeatCopies()" style="font-weight:700;" data-i18n="schedule_all">Schedule All</button>
     </div>
     <div id="rpt-status" style="margin-top:12px;font-size:.85rem;text-align:center;"></div>
@@ -3699,6 +3764,7 @@ var langData = {
     no_matches: 'No posts match your filters.',
     type: 'Type',
     platform: 'Platform',
+    select_platform: 'Select at least one platform.',
     message: 'Message',
     schedule: 'Schedule',
     publish: 'Publish',
@@ -4157,6 +4223,7 @@ var langData = {
     no_matches: 'Ning\u00fan post coincide con los filtros.',
     type: 'Tipo',
     platform: 'Plataforma',
+    select_platform: 'Selecciona al menos una plataforma.',
     message: 'Mensaje',
     schedule: 'Programado',
     publish: 'Publicar',
@@ -5901,7 +5968,7 @@ translateDOM();
     var pagePosts = filtered.slice(start, start + postPerPage);
     document.getElementById('post-count').textContent = filtered.length + ' ' + _t('posts') + (filtered.length !== allPosts.length ? ' (' + _t('filtered_from') + ' ' + allPosts.length + ')' : '');
     var html = '';
-    function fmtDT(v) { return v ? new Date(v).toLocaleDateString() + ' ' + new Date(v).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}) : '-'; }
+    function fmtDT(v) { if (!v) return '-'; var ms = (typeof v === 'number' && v < 1e12) ? v * 1000 : v; var d2 = new Date(ms); return d2.toLocaleDateString() + ' ' + d2.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}); }
     if (pagePosts.length === 0) {
       html = '<tr><td colspan="6" style="text-align:center;color:#65676b;padding:30px;">' + _t('no_matches') + '</td></tr>';
     } else {
@@ -6040,6 +6107,18 @@ translateDOM();
       else if (p.media_urls && p.media_urls.length) mediaInfo = '📑 ' + p.media_urls.length + ' ' + _t('images');
       else mediaInfo = _t('no_media');
       document.getElementById('rpt-media-info').textContent = mediaInfo;
+      _rptSourcePlatform = p.platform || 'facebook';
+      _rptSourceContentType = p.content_type || 'image';
+      _rptSourceMediaFile = p.media_file || '';
+      _rptSourceMediaUrl = p.media_url || '';
+      _rptSourceMediaUrls = (p.media_urls && p.media_urls.length) ? p.media_urls.slice() : [];
+      _rptSourceMediaFiles = (p.media_files && p.media_files.length) ? p.media_files.slice() : [];
+      var srcPlatforms = (p.platforms && p.platforms.length) ? p.platforms : [p.platform || 'facebook'];
+      var rpFb = document.getElementById('rpt-platform-fb');
+      var rpIg = document.getElementById('rpt-platform-ig');
+      if (rpFb) rpFb.checked = srcPlatforms.indexOf('facebook') !== -1;
+      if (rpIg) rpIg.checked = srcPlatforms.indexOf('instagram') !== -1;
+      if (rpFb || rpIg) toggleRptPlatform();
       resetRptPreview();
       document.getElementById('rpt-times-list').innerHTML = '';
       document.getElementById('rpt-times-empty').style.display = '';
@@ -6273,21 +6352,98 @@ translateDOM();
     return times;
   }
 
+  function getRptPlatforms() {
+    var platforms = [];
+    if (document.getElementById('rpt-platform-fb') && document.getElementById('rpt-platform-fb').checked) platforms.push('facebook');
+    if (document.getElementById('rpt-platform-ig') && document.getElementById('rpt-platform-ig').checked) platforms.push('instagram');
+    return platforms;
+  }
+
+  function toggleRptPlatform() {
+    var platforms = getRptPlatforms();
+    var warn = document.getElementById('rpt-platform-warning');
+    if (warn) warn.style.display = platforms.length ? 'none' : 'block';
+  }
+
+  function previewRptPost() {
+    var platforms = getRptPlatforms();
+    var warn = document.getElementById('rpt-platform-warning');
+    if (!platforms.length) {
+      if (warn) warn.style.display = 'block';
+      return;
+    }
+    if (warn) warn.style.display = 'none';
+    document.getElementById('cpv-platform').textContent = platforms.join(' + ');
+    document.getElementById('cpv-message').textContent = document.getElementById('rpt-message').value.trim() || '(no message)';
+    var mediaBox = document.getElementById('cpv-media');
+    mediaBox.innerHTML = '';
+    var media = [];
+    if (_rptCarouselUrls.length) media = _rptCarouselUrls.slice();
+    else if (_rptUploadedMedia) media = [_rptUploadedMedia];
+    else if (_rptSourceMediaUrls.length) media = _rptSourceMediaUrls.slice();
+    else if (_rptSourceMediaUrl) media = [_rptSourceMediaUrl];
+    if (media.length) {
+      var isVideo = _rptSourceContentType === 'video' && media.length === 1;
+      media.forEach(function(src) {
+        if (isVideo) {
+          var vid = document.createElement('video');
+          vid.src = src;
+          vid.controls = true;
+          vid.style.cssText = 'max-width:100%;max-height:280px;border-radius:8px;display:block;';
+          mediaBox.appendChild(vid);
+        } else {
+          var img = document.createElement('img');
+          img.src = src;
+          img.style.cssText = 'max-width:100%;max-height:280px;border-radius:8px;object-fit:cover;display:block;';
+          img.onerror = function() { this.style.display = 'none'; };
+          mediaBox.appendChild(img);
+        }
+      });
+    }
+    var linkCard = document.getElementById('cpv-linkcard');
+    var linkUrl = document.getElementById('rpt-link').value.trim();
+    if (linkUrl) {
+      linkCard.style.display = 'block';
+      document.getElementById('cpv-headline').textContent = document.getElementById('rpt-headline').value.trim() || 'Learn More';
+      document.getElementById('cpv-link').textContent = linkUrl;
+    } else {
+      linkCard.style.display = 'none';
+    }
+    document.getElementById('cp-preview-modal').classList.add('open');
+  }
+
   function scheduleRepeatCopies() {
     var times = getAllRepeatTimes();
     if (!times.length) { showToast(_t('select_schedule')); return; }
     var sourceId = document.getElementById('rpt-source-id').value;
     var sourceType = document.getElementById('rpt-source-type').value;
+    var platforms = getRptPlatforms();
+    var warn = document.getElementById('rpt-platform-warning');
+    if (!platforms.length) {
+      if (warn) warn.style.display = 'block';
+      return;
+    }
+    if (warn) warn.style.display = 'none';
+    if (sourceType === 'post') {
+      times = times.map(function(t) { return new Date(t).getTime() / 1000; });
+    }
     var statusEl = document.getElementById('rpt-status');
     statusEl.innerHTML = _t('saving') + '...';
     var payload = {
       source_id: sourceId,
       source_type: sourceType,
+      platform: platforms[0],
+      platforms: platforms,
+      content_type: _rptSourceContentType,
       headline: document.getElementById('rpt-headline').value.trim(),
       message: document.getElementById('rpt-message').value.trim(),
       ai_instruction: document.getElementById('rpt-ai-instruction').value.trim(),
       cta: document.getElementById('rpt-cta').value,
       link_url: document.getElementById('rpt-link').value.trim(),
+      media_file: _rptUploadedMedia || _rptSourceMediaFile,
+      media_url: _rptUploadedMedia || _rptSourceMediaUrl,
+      media_urls: _rptCarouselUrls.length ? _rptCarouselUrls : _rptSourceMediaUrls,
+      media_files: _rptCarouselUrls.length ? _rptCarouselUrls : _rptSourceMediaFiles,
       times: times
     };
     var url = sourceType === 'multi' ? '/api/multi-scheduler/repeat' : '/api/posts/repeat';
@@ -6376,6 +6532,12 @@ translateDOM();
 
   var _rptUploadedMedia = '';
   var _rptCarouselUrls = [];
+  var _rptSourcePlatform = 'facebook';
+  var _rptSourceContentType = 'image';
+  var _rptSourceMediaFile = '';
+  var _rptSourceMediaUrl = '';
+  var _rptSourceMediaUrls = [];
+  var _rptSourceMediaFiles = [];
 
   function resetRptPreview() {
     document.getElementById('rpt-upload-preview').style.display = 'none';
@@ -6840,7 +7002,8 @@ translateDOM();
 
       function fmtDate(dt) {
         if (!dt) return '-';
-        var d2 = new Date(dt);
+        var ms = (typeof dt === 'number' && dt < 1e12) ? dt * 1000 : dt;
+        var d2 = new Date(ms);
         return d2.toLocaleDateString() + ' ' + d2.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
       }
       var statuses = {published:_t('published'),scheduled:_t('scheduled'),draft:_t('drafts'),trashed:_t('trash')};
@@ -9396,27 +9559,33 @@ def create_web_interface(ads_agent, tenant_manager=None):
         if not data or not data.get('source_id') or not data.get('times'):
             return jsonify({'success': False, 'error': 'Missing data'}), 400
         times = data['times']
+        source = scheduler.get_post(data.get('source_id')) if data.get('source_type') == 'post' else None
+        platforms = data.get('platforms') or [data.get('platform') or (source.get('platform') if source else 'facebook')]
+        if not platforms:
+            platforms = ['facebook']
         created = []
         for i, t in enumerate(times):
-            post_data = {
-                'platform': data.get('platform', 'facebook'),
-                'content_type': data.get('content_type', 'image'),
-                'headline': data.get('headline', ''),
-                'message': data.get('message', ''),
-                'ai_instruction': data.get('ai_instruction', ''),
-                'cta': data.get('cta', ''),
-                'link_url': data.get('link_url', ''),
-                'media_file': '',
-                'media_url': '',
-                'media_urls': [],
-                'media_files': [],
-                'scheduled_time': t,
-                'status': 'scheduled'
-            }
-            if i > 0:
-                time.sleep(0.01)
-            post = scheduler.create_post(post_data)
-            created.append(post)
+            for plat in platforms:
+                post_data = {
+                    'platform': plat,
+                    'platforms': platforms,
+                    'content_type': data.get('content_type') or (source.get('content_type') if source else 'image'),
+                    'headline': data.get('headline', ''),
+                    'message': data.get('message', ''),
+                    'ai_instruction': data.get('ai_instruction', ''),
+                    'cta': data.get('cta', ''),
+                    'link_url': data.get('link_url', ''),
+                    'media_file': data.get('media_file') or (source.get('media_file') if source else ''),
+                    'media_url': data.get('media_url') or (source.get('media_url') if source else ''),
+                    'media_urls': data.get('media_urls') or (source.get('media_urls') if source else []),
+                    'media_files': data.get('media_files') or (source.get('media_files') if source else []),
+                    'scheduled_time': t,
+                    'status': 'scheduled'
+                }
+                if created:
+                    time.sleep(0.01)
+                post = scheduler.create_post(post_data)
+                created.append(post)
         return jsonify({'success': True, 'count': len(created), 'posts': created})
 
     @app.route('/api/posts/create', methods=['POST'])
@@ -9432,6 +9601,7 @@ def create_web_interface(ads_agent, tenant_manager=None):
         publish_now = data.get('status') == 'publish_now'
         post_data = {
             'platform': platform,
+            'platforms': data.get('platforms', []) or [platform],
             'content_type': data.get('content_type', 'image'),
             'headline': data.get('headline', ''),
             'message': message,
@@ -9565,6 +9735,7 @@ def create_web_interface(ads_agent, tenant_manager=None):
     # Multi-Platform Scheduler routes
     multi_scheduler = MultiPlatformScheduler(ads_agent.meta_api)
     multi_scheduler.start_auto_publish()
+    scheduler.start_auto_publish()
 
     @app.route('/api/multi-scheduler/queue')
     @require_tenant_auth
