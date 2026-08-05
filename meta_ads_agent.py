@@ -3114,6 +3114,7 @@ HTML_TEMPLATE = """
     <div class="form-group" id="cp-link-group">
       <label data-i18n="dest_url">Destination URL</label>
       <input type="url" id="cp-link" placeholder="https://your-site.com/page" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;">
+      <div id="cp-link-hint" style="display:none;font-size:.8rem;color:#e1306c;margin-top:4px;" data-i18n="ig_link_hint">Instagram does not support clickable links in posts. The link will only apply to Facebook.</div>
     </div>
     <div class="form-group">
       <label data-i18n="upload_media">Media</label>
@@ -3726,6 +3727,7 @@ var langData = {
     chatgpt: 'ChatGPT',
     cta: 'Call to Action',
     dest_url: 'Destination URL',
+    ig_link_hint: 'Instagram does not support clickable links in posts. The link will only apply to Facebook.',
     upload_media: 'Upload Media',
     location: 'Location (city, zip)',
     radius: 'Radius (miles)',
@@ -4191,6 +4193,7 @@ var langData = {
     chatgpt: 'ChatGPT',
     cta: 'Llamado a la Acci\u00f3n',
     dest_url: 'URL de Destino',
+    ig_link_hint: 'Instagram no soporta enlaces clicables en los posts. El enlace solo se aplicar\u00e1 a Facebook.',
     upload_media: 'Subir Media',
     location: 'Ubicaci\u00f3n (ciudad, c\u00f3digo postal)',
     radius: 'Radio (millas)',
@@ -5874,11 +5877,12 @@ async function optimizeAll() {
   showToast(_t('optimized'));
 }
 
-function showToast(msg) {
+function showToast(msg, duration) {
   var t = document.getElementById('toast');
   t.textContent = msg;
   t.classList.add('show');
-  setTimeout(function() { t.classList.remove('show'); }, 3000);
+  clearTimeout(t._tm);
+  t._tm = setTimeout(function() { t.classList.remove('show'); }, duration || 3000);
 }
 
 function showAlert(msg, type) {
@@ -6571,8 +6575,11 @@ translateDOM();
     var fbChecked = document.getElementById('cp-platform-fb') && document.getElementById('cp-platform-fb').checked;
     var igChecked = document.getElementById('cp-platform-ig') && document.getElementById('cp-platform-ig').checked;
     var linkGroup = document.getElementById('cp-link-group');
-    // Hide link URL only if Instagram-only (Instagram doesn't support link in posts)
-    linkGroup.style.display = (igChecked && !fbChecked) ? 'none' : '';
+    var linkHint = document.getElementById('cp-link-hint');
+    // Keep the URL field always visible so the user can enter it.
+    // Instagram does not support a clickable link in the caption, so show a hint.
+    if (linkGroup) linkGroup.style.display = '';
+    if (linkHint) linkHint.style.display = (igChecked && !fbChecked) ? '' : 'none';
   }
   function resetCpPreview() {
     document.getElementById('cp-upload-preview').style.display = 'none';
@@ -7071,8 +7078,8 @@ translateDOM();
       .then(function(r) { return r.json(); })
       .then(function(d) {
         if (d.success) { showToast(_t('post_published')); loadPosts(); }
-        else { showToast(_t('error') + ': ' + (d.error || '')); }
-      }).catch(function() {});
+        else { showToast(_t('error') + ': ' + (d.error || ''), 8000); }
+      }).catch(function(e) { showToast(_t('error') + ': ' + e.message, 8000); });
   }
 
   function deletePost(postId) {
