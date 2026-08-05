@@ -898,7 +898,11 @@ class MetaAPI:
         token = self._ig_token()
         if page_id:
             image_urls = [self._ensure_public_url(u, page_id, token) for u in image_urls]
+        image_urls = [u for u in image_urls if u]
+        if len(image_urls) < 2:
+            return {'error': 'Carousel requires at least 2 images'}
         children = []
+        last_error = None
         for url in image_urls:
             item_url = f"{self.base_url}/{ig_id}/media"
             item_params = {'access_token': token, 'image_url': url, 'is_carousel_item': 'true'}
@@ -907,10 +911,14 @@ class MetaAPI:
                 d = r.json()
                 if d.get('id'):
                     children.append(d['id'])
-            except:
-                pass
-        if not children:
-            return {'error': 'No carousel items created'}
+                else:
+                    last_error = self._extract_meta_error(d)
+            except Exception as e:
+                last_error = str(e)
+        if len(children) < 2:
+            if last_error:
+                return {'error': last_error}
+            return {'error': 'Carousel requires at least 2 images with valid media IDs'}
         container_url = f"{self.base_url}/{ig_id}/media"
         params = {
             'access_token': token,
@@ -2136,6 +2144,13 @@ class ContentScheduler:
         if link_url:
             message = f"{message}\n\n{link_url}" if message else link_url
         scheduled = post.get('scheduled_time')
+        if content_type == 'carousel':
+            urls = media_urls if media_urls else media_files
+            urls = [u for u in (urls or []) if u]
+            if len(urls) < 2:
+                content_type = 'image'
+                media_url = urls[0] if urls else media_url
+                media_file = urls[0] if urls else media_file
         if platform == 'instagram':
             ig_id = self.meta_api.get_instagram_business_account_id(page_id)
             if not ig_id:
@@ -6759,7 +6774,7 @@ translateDOM();
   }
 
   function getCpPayload() {
-    var isCarousel = _cpCarouselUrls.length > 0;
+    var isCarousel = _cpCarouselUrls.length > 1;
     var isVideo = !isCarousel && _cpUploadedMedia && document.getElementById('cp-preview-video').style.display !== 'none' && document.getElementById('cp-preview-video').style.display !== '';
     var platforms = getCpPlatforms();
     var payload = {
@@ -7602,7 +7617,7 @@ translateDOM();
     var cta = document.getElementById('mp-cta').value;
     var linkUrl = document.getElementById('mp-link').value.trim();
     var schedule = document.getElementById('mp-schedule').value;
-    var isCarousel = _mpCarouselUrls.length > 0;
+    var isCarousel = _mpCarouselUrls.length > 1;
     var isVideo = !isCarousel && _mpUploadedMedia && document.getElementById('mp-preview-video').style.display !== 'none' && document.getElementById('mp-preview-video').style.display !== '';
     var payload = {
       platforms: platforms,
