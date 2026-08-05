@@ -3043,10 +3043,17 @@ HTML_TEMPLATE = """
       </select>
       <input type="text" id="post-search" data-i18n-placeholder="search_posts" placeholder="Buscar posts..." oninput="renderFilteredPosts()" style="padding:6px;border:1px solid #ddd;border-radius:6px;font-size:13px;flex:1;min-width:150px;">
     </div>
+    <div id="post-bulk-bar" style="display:none;align-items:center;gap:8px;padding:10px 12px;background:#e7f3ff;border-radius:8px;margin-bottom:10px;">
+      <span style="font-weight:700;flex:1;"><span id="post-bulk-count">0</span> <span data-i18n="selected_posts">selected</span></span>
+      <button class="btn btn-sm btn-danger" id="post-bulk-trash-btn" onclick="trashSelected()" data-i18n="move_trash">Move to trash</button>
+      <button class="btn btn-sm btn-primary" id="post-bulk-restore-btn" style="display:none;" onclick="restoreSelected()" data-i18n="restore">Restore</button>
+      <button class="btn btn-sm btn-danger" id="post-bulk-forever-btn" style="display:none;" onclick="deleteSelectedForever()" data-i18n="delete_forever">Delete forever</button>
+      <button class="btn btn-sm" onclick="clearPostSelection()" style="background:#e4e6eb;" data-i18n="clear_sel">Clear</button>
+    </div>
     <table>
-      <thead><tr><th data-i18n="type">Type</th><th data-i18n="platform">Platform</th><th data-i18n="message">Message</th><th data-i18n="schedule">Scheduled</th><th data-i18n="status">Status</th><th data-i18n="actions">Actions</th></tr></thead>
+      <thead><tr><th style="width:30px;"><input type="checkbox" id="post-select-all" onclick="toggleSelectAll(this)" title="Select all"></th><th data-i18n="type">Type</th><th data-i18n="platform">Platform</th><th data-i18n="message">Message</th><th data-i18n="schedule">Scheduled</th><th data-i18n="status">Status</th><th data-i18n="actions">Actions</th></tr></thead>
       <tbody id="posts-table">
-        <tr><td colspan="6" style="text-align:center;color:#65676b;padding:30px;" data-i18n="no_posts">No posts yet.</td></tr>
+        <tr><td colspan="7" style="text-align:center;color:#65676b;padding:30px;" data-i18n="no_posts">No posts yet.</td></tr>
       </tbody>
     </table>
     <div id="post-pagination" style="display:flex;justify-content:center;gap:8px;margin-top:12px;"></div>
@@ -3826,6 +3833,12 @@ var langData = {
     error: 'Error',
     confirm_trash: 'Move this post to trash?',
     confirm_delete_forever: 'Delete this post permanently? Cannot be undone.',
+    selected_posts: 'selected',
+    move_trash: 'Move to trash',
+    clear_sel: 'Clear',
+    confirm_trash_selected: 'Move selected posts to trash?',
+    confirm_restore_selected: 'Restore selected posts?',
+    confirm_delete_forever_selected: 'Delete selected posts permanently? Cannot be undone.',
     safety_alert: 'You must confirm you will check the OFF/ON status in Meta Ads Manager after creating the campaign.',
     select_form: 'Select a form...',
     load_leads: 'Load Leads',
@@ -4285,6 +4298,12 @@ var langData = {
     error: 'Error',
     confirm_trash: 'Mover este post a la papelera?',
     confirm_delete_forever: 'Eliminar este post permanentemente? No se puede deshacer.',
+    selected_posts: 'seleccionados',
+    move_trash: 'Mover a papelera',
+    clear_sel: 'Limpiar',
+    confirm_trash_selected: 'Mover los posts seleccionados a la papelera?',
+    confirm_restore_selected: 'Restaurar los posts seleccionados?',
+    confirm_delete_forever_selected: 'Eliminar los posts seleccionados permanentemente? No se puede deshacer.',
     safety_alert: 'Debes confirmar que revisar\u00e1s el estado OFF/ON en Meta Ads Manager tras crear la campa\u00f1a.',
     select_form: 'Seleccionar un formulario...',
     load_leads: 'Cargar Leads',
@@ -5933,6 +5952,92 @@ translateDOM();
   var postFilter = 'all';
   var postPage = 1;
   var postPerPage = 10;
+  var _selectedPostIds = [];
+
+  function getSelectedPostIds() {
+    var ids = [];
+    var checks = document.querySelectorAll('#posts-table input[type="checkbox"]:checked');
+    for (var i = 0; i < checks.length; i++) {
+      var v = checks[i].value;
+      if (v && ids.indexOf(v) === -1) ids.push(v);
+    }
+    return ids;
+  }
+
+  function updatePostBulkBar() {
+    var ids = getSelectedPostIds();
+    var bar = document.getElementById('post-bulk-bar');
+    var count = document.getElementById('post-bulk-count');
+    if (count) count.textContent = ids.length;
+    if (bar) bar.style.display = ids.length ? 'flex' : 'none';
+    var isTrash = postFilter === 'trashed';
+    var trashBtn = document.getElementById('post-bulk-trash-btn');
+    var restoreBtn = document.getElementById('post-bulk-restore-btn');
+    var foreverBtn = document.getElementById('post-bulk-forever-btn');
+    if (trashBtn) trashBtn.style.display = isTrash ? 'none' : '';
+    if (restoreBtn) restoreBtn.style.display = isTrash ? '' : 'none';
+    if (foreverBtn) foreverBtn.style.display = isTrash ? '' : 'none';
+    var selAll = document.getElementById('post-select-all');
+    if (selAll) {
+      var checks = document.querySelectorAll('#posts-table input[type="checkbox"]');
+      var allChecked = checks.length > 0;
+      for (var j = 0; j < checks.length; j++) { if (!checks[j].checked) { allChecked = false; break; } }
+      selAll.checked = allChecked && checks.length > 0;
+    }
+  }
+
+  function onPostSelect() {
+    updatePostBulkBar();
+  }
+
+  function toggleSelectAll(cb) {
+    var checks = document.querySelectorAll('#posts-table input[type="checkbox"]');
+    for (var i = 0; i < checks.length; i++) {
+      if (checks[i].value) checks[i].checked = cb.checked;
+    }
+    updatePostBulkBar();
+  }
+
+  function clearPostSelection() {
+    var checks = document.querySelectorAll('#posts-table input[type="checkbox"]');
+    for (var i = 0; i < checks.length; i++) checks[i].checked = false;
+    updatePostBulkBar();
+  }
+
+  function trashSelected() {
+    var ids = getSelectedPostIds();
+    if (!ids.length) return;
+    if (!confirm(_t('confirm_trash_selected') + ' (' + ids.length + ')')) return;
+    postBulkAction('/api/posts/batch-trash', ids, _t('moved_to_trash'));
+  }
+
+  function restoreSelected() {
+    var ids = getSelectedPostIds();
+    if (!ids.length) return;
+    if (!confirm(_t('confirm_restore_selected') + ' (' + ids.length + ')')) return;
+    postBulkAction('/api/posts/batch-restore', ids, _t('post_restored'));
+  }
+
+  function deleteSelectedForever() {
+    var ids = getSelectedPostIds();
+    if (!ids.length) return;
+    if (!confirm(_t('confirm_delete_forever_selected') + ' (' + ids.length + ')')) return;
+    postBulkAction('/api/posts/batch-delete-forever', ids, _t('post_deleted_permanent'));
+  }
+
+  function postBulkAction(url, ids, successMsg) {
+    fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ids: ids})})
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        if (d.success) {
+          showToast(successMsg + ' (' + d.count + ')');
+          _selectedPostIds = [];
+          loadPosts();
+        } else {
+          showToast(_t('error') + ': ' + (d.error || ''));
+        }
+      }).catch(function(e) { showToast(_t('error') + ': ' + e.message); });
+  }
 
   function getFilteredPosts() {
     var plat = document.getElementById('post-platform-filter').value;
@@ -5947,6 +6052,7 @@ translateDOM();
   function loadPosts() {
     fetch('/api/posts').then(function(r) { return r.json(); }).then(function(d) {
       allPosts = d.posts || [];
+      _selectedPostIds = [];
       renderFilteredPosts();
       renderCalendar(allPosts);
     }).catch(function() {});
@@ -5970,7 +6076,7 @@ translateDOM();
     var html = '';
     function fmtDT(v) { if (!v) return '-'; var ms = (typeof v === 'number' && v < 1e12) ? v * 1000 : v; var d2 = new Date(ms); return d2.toLocaleDateString() + ' ' + d2.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}); }
     if (pagePosts.length === 0) {
-      html = '<tr><td colspan="6" style="text-align:center;color:#65676b;padding:30px;">' + _t('no_matches') + '</td></tr>';
+      html = '<tr><td colspan="7" style="text-align:center;color:#65676b;padding:30px;">' + _t('no_matches') + '</td></tr>';
     } else {
       for (var i = 0; i < pagePosts.length; i++) {
         var p = pagePosts[i];
@@ -5982,6 +6088,7 @@ translateDOM();
                           '<span style="color:#dc2626;font-weight:700;">🗑 ' + _t('trash') + '</span>';
         var sched = p.status === 'published' ? fmtDT(p.published_at) : (p.scheduled_time ? fmtDT(p.scheduled_time) : '-');
         var msg = (p.message || '').substring(0, 60) + ((p.message || '').length > 60 ? '...' : '');
+        var checked = (_selectedPostIds.indexOf(p.id) !== -1) ? ' checked' : '';
         var actionsHtml = '';
         if (p.status === 'trashed') {
           actionsHtml = '<button class="btn btn-sm btn-primary" onclick="restorePost(' + "'" + p.id + "'" + ')" style="margin-right:4px;">' + _t('restore') + '</button>' +
@@ -5996,11 +6103,12 @@ translateDOM();
           actionsHtml += '<button class="btn btn-sm btn-primary" onclick="openRepeatModal(' + "'" + p.id + "'" + ')" style="margin-right:4px;" title="' + _t('repeat') + '">🔁</button>';
           actionsHtml += '<button class="btn btn-sm btn-warn" onclick="deletePost(' + "'" + p.id + "'" + ')">🗑</button>';
         }
-        html += '<tr><td>' + typeIcon + '</td><td>' + platformIcon + '</td><td style="cursor:pointer;" onclick="showPostDetail(' + "'" + p.id + "'" + ')">' + _esc(msg) + '</td><td>' + sched + '</td><td>' + statusBadge + '</td><td>' + actionsHtml + '</td></tr>';
+        html += '<tr><td><input type="checkbox" value="' + p.id + '"' + checked + ' onchange="onPostSelect(this)"></td><td>' + typeIcon + '</td><td>' + platformIcon + '</td><td style="cursor:pointer;" onclick="showPostDetail(' + "'" + p.id + "'" + ')">' + _esc(msg) + '</td><td>' + sched + '</td><td>' + statusBadge + '</td><td>' + actionsHtml + '</td></tr>';
       }
     }
     var el = document.getElementById('posts-table');
     if (el) el.innerHTML = html;
+    updatePostBulkBar();
     var pg = document.getElementById('post-pagination');
     if (pg) {
       if (totalPages <= 1) { pg.innerHTML = ''; return; }
@@ -6931,12 +7039,14 @@ translateDOM();
         if (errors.length === 0) {
           statusEl.innerHTML = '✅ Posted to ' + platforms.join(' & ') + '!';
           showToast('✅ Published to Facebook & Instagram!');
+          setTimeout(function() { closeCreatePostModal(); loadPosts(); }, 1500);
         } else if (results.length > 0) {
           statusEl.innerHTML = '⚠️ Partial: ' + results.join(', ') + ' OK. Errors: ' + errors.join(', ');
+          showToast('⚠️ ' + errors.join(', '), 8000);
         } else {
           statusEl.innerHTML = _t('error') + ': ' + errors.join(', ');
+          showToast(_t('error') + ': ' + errors.join(', '), 8000);
         }
-        setTimeout(function() { closeCreatePostModal(); loadPosts(); }, 1500);
         return;
       }
       var pl = platforms[index];
@@ -9662,6 +9772,36 @@ def create_web_interface(ads_agent, tenant_manager=None):
         if scheduler.delete_forever(post_id):
             return jsonify({'success': True})
         return jsonify({'success': False, 'error': 'Post not found'}), 404
+
+    @app.route('/api/posts/batch-trash', methods=['POST'])
+    @require_tenant_auth
+    def api_batch_trash():
+        ids = (request.get_json() or {}).get('ids', [])
+        count = 0
+        for pid in ids:
+            if scheduler.delete_post(str(pid)):
+                count += 1
+        return jsonify({'success': True, 'count': count})
+
+    @app.route('/api/posts/batch-restore', methods=['POST'])
+    @require_tenant_auth
+    def api_batch_restore():
+        ids = (request.get_json() or {}).get('ids', [])
+        count = 0
+        for pid in ids:
+            if scheduler.restore_post(str(pid)):
+                count += 1
+        return jsonify({'success': True, 'count': count})
+
+    @app.route('/api/posts/batch-delete-forever', methods=['POST'])
+    @require_tenant_auth
+    def api_batch_delete_forever():
+        ids = (request.get_json() or {}).get('ids', [])
+        count = 0
+        for pid in ids:
+            if scheduler.delete_forever(str(pid)):
+                count += 1
+        return jsonify({'success': True, 'count': count})
 
     # Auto Responder routes
     responder = SocialMediaAutoResponder(ads_agent.meta_api)
