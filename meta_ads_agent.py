@@ -2051,6 +2051,8 @@ class ContentScheduler:
             post['published_at'] = datetime.now().strftime('%Y-%m-%d %H:%M')
             post['meta_response'] = result
             self._save_posts()
+        elif 'error' in result and isinstance(result['error'], dict):
+            result['error'] = self._extract_meta_error(result['error'])
         return result
 
     def publish_due_posts(self):
@@ -2099,6 +2101,24 @@ class ContentScheduler:
 
     def stop_auto_publish(self):
         self.running = False
+
+    def _extract_meta_error(self, data):
+        """Extract a readable error message from a Meta Graph API response,
+        preferring the detailed user-facing message when present."""
+        if not isinstance(data, dict):
+            return str(data)
+        err = data.get('error') or data.get('meta_error')
+        if not isinstance(err, dict):
+            err = data  # already the inner error dict, e.g. {'code': 100, 'message': ...}
+        msg = err.get('error_user_msg') or err.get('error_user_message') or err.get('message') or ''
+        code = err.get('code')
+        subcode = err.get('error_subcode')
+        detail = msg or 'Unknown error'
+        if code:
+            detail = f"[#{code}] {detail}"
+        if subcode:
+            detail = f"{detail} (subcode {subcode})"
+        return detail
 
     def _execute_publish(self, post):
         page_id = self.page_id or self.meta_api.get_page_id()
@@ -9759,7 +9779,7 @@ def create_web_interface(ads_agent, tenant_manager=None):
         if 'error' in result:
             err = result['error']
             if isinstance(err, dict):
-                err = err.get('message', str(err))
+                err = err.get('error_user_msg') or err.get('error_user_message') or err.get('message') or str(err)
             return jsonify({'success': False, 'error': err}), 400
         return jsonify({'success': True, 'result': result})
 
