@@ -5023,17 +5023,21 @@ async function loadCampaigns() {
   updateCampaignFilterUI();
   try {
     const res = await fetch('/api/campaigns');
-    campaigns = await res.json();
+    const data = await res.json();
+    campaigns = Array.isArray(data) ? data : (Array.isArray(data.campaigns) ? data.campaigns : []);
     renderTable();
     updateStats();
   } catch(e) {
-    showAlert(_t('error') + ': ' + e.message, 'error');
+    campaigns = [];
+    renderTable();
+    updateStats();
   }
 }
 
 function getFilteredCampaigns() {
-  if (campaignFilter === 'trashed') return campaigns.filter(function(c) { return c.status === 'TRASHED'; });
-  return campaigns.filter(function(c) { return c.status !== 'TRASHED'; });
+  var list = Array.isArray(campaigns) ? campaigns : [];
+  if (campaignFilter === 'trashed') return list.filter(function(c) { return c.status === 'TRASHED'; });
+  return list.filter(function(c) { return c.status !== 'TRASHED'; });
 }
 
 function formatCampaignBudget(c) {
