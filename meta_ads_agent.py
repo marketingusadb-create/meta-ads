@@ -866,6 +866,30 @@ class MetaAPI:
             return f"{base}/{name}"
         return ''
 
+    def _wait_container_ready(self, ig_id, container_id, token, timeout=120):
+        """Poll the Instagram container status until it is FINISHED.
+        Meta needs time to download/process the image; publishing too early
+        raises error #9007 (media not ready yet)."""
+        import time as _time
+        status_url = f"{self.base_url}/{container_id}"
+        params = {'access_token': token, 'fields': 'status_code,status'}
+        deadline = _time.time() + timeout
+        while _time.time() < deadline:
+            try:
+                r = self.session.get(status_url, params=params)
+                d = r.json()
+                if d.get('status_code') == 'FINISHED':
+                    return {'ok': True}
+                if d.get('status_code') == 'ERROR' or d.get('status') == 'ERROR':
+                    return {'error': 'Media processing failed: ' + str(d.get('status', ''))}
+                err = d.get('error')
+                if err:
+                    return {'error': err.get('message', str(err)) if isinstance(err, dict) else str(err)}
+            except Exception:
+                pass
+            _time.sleep(4)
+        return {'error': 'Timeout waiting for Instagram to process the image'}
+
     def create_instagram_post(self, ig_id, image_url, caption='', scheduled_time=None, page_id=None):
         token = self._ig_token()
         if page_id:
@@ -887,6 +911,9 @@ class MetaAPI:
                 return container_data
             if scheduled_time:
                 return {'id': container_id, 'scheduled': True}
+            ready = self._wait_container_ready(ig_id, container_id, token)
+            if ready.get('error'):
+                return ready
             publish_url = f"{self.base_url}/{ig_id}/media_publish"
             pub_params = {'access_token': token, 'creation_id': container_id}
             pub_resp = self.session.post(publish_url, params=pub_params)
@@ -937,6 +964,9 @@ class MetaAPI:
                 return container_data
             if scheduled_time:
                 return {'id': container_id, 'scheduled': True}
+            ready = self._wait_container_ready(ig_id, container_id, token)
+            if ready.get('error'):
+                return ready
             publish_url = f"{self.base_url}/{ig_id}/media_publish"
             pub_params = {'access_token': token, 'creation_id': container_id}
             pub_resp = self.session.post(publish_url, params=pub_params)
