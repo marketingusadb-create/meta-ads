@@ -2151,6 +2151,13 @@ class ContentScheduler:
                 content_type = 'image'
                 media_url = urls[0] if urls else media_url
                 media_file = urls[0] if urls else media_file
+        if content_type != 'carousel' and not media_url and not media_file:
+            for src in (media_urls, media_files):
+                clean = [u for u in (src or []) if u]
+                if clean:
+                    media_url = clean[0]
+                    media_file = clean[0]
+                    break
         if platform == 'instagram':
             ig_id = self.meta_api.get_instagram_business_account_id(page_id)
             if not ig_id:
@@ -6580,6 +6587,8 @@ translateDOM();
     }
     var statusEl = document.getElementById('rpt-status');
     statusEl.innerHTML = _t('saving') + '...';
+    var rptSingle = (_rptCarouselUrls.length === 1) ? _rptCarouselUrls[0] : '';
+    var rptMedia = _rptUploadedMedia || rptSingle || _rptSourceMediaFile || _rptSourceMediaUrl;
     var payload = {
       source_id: sourceId,
       source_type: sourceType,
@@ -6591,8 +6600,8 @@ translateDOM();
       ai_instruction: document.getElementById('rpt-ai-instruction').value.trim(),
       cta: document.getElementById('rpt-cta').value,
       link_url: document.getElementById('rpt-link').value.trim(),
-      media_file: _rptUploadedMedia || _rptSourceMediaFile,
-      media_url: _rptUploadedMedia || _rptSourceMediaUrl,
+      media_file: rptMedia,
+      media_url: rptMedia,
       media_urls: _rptCarouselUrls.length ? _rptCarouselUrls : _rptSourceMediaUrls,
       media_files: _rptCarouselUrls.length ? _rptCarouselUrls : _rptSourceMediaFiles,
       times: times
@@ -6774,8 +6783,9 @@ translateDOM();
   }
 
   function getCpPayload() {
+    var singleImg = (_cpCarouselUrls.length === 1) ? _cpCarouselUrls[0] : '';
     var isCarousel = _cpCarouselUrls.length > 1;
-    var isVideo = !isCarousel && _cpUploadedMedia && document.getElementById('cp-preview-video').style.display !== 'none' && document.getElementById('cp-preview-video').style.display !== '';
+    var isVideo = !isCarousel && (_cpUploadedMedia || singleImg) && document.getElementById('cp-preview-video').style.display !== 'none' && document.getElementById('cp-preview-video').style.display !== '';
     var platforms = getCpPlatforms();
     var payload = {
       platform: platforms[0] || 'facebook',
@@ -6786,8 +6796,8 @@ translateDOM();
       cta: document.getElementById('cp-cta').value,
       link_url: document.getElementById('cp-link').value.trim(),
       content_type: isVideo ? 'video' : (isCarousel ? 'carousel' : 'image'),
-      media_url: isCarousel ? '' : _cpUploadedMedia,
-      media_file: isCarousel ? '' : _cpUploadedMedia,
+      media_url: isCarousel ? '' : (_cpUploadedMedia || singleImg),
+      media_file: isCarousel ? '' : (_cpUploadedMedia || singleImg),
       media_urls: _cpCarouselUrls,
       media_files: _cpCarouselUrls
     };
@@ -7617,8 +7627,9 @@ translateDOM();
     var cta = document.getElementById('mp-cta').value;
     var linkUrl = document.getElementById('mp-link').value.trim();
     var schedule = document.getElementById('mp-schedule').value;
+    var singleImg = (_mpCarouselUrls.length === 1) ? _mpCarouselUrls[0] : '';
     var isCarousel = _mpCarouselUrls.length > 1;
-    var isVideo = !isCarousel && _mpUploadedMedia && document.getElementById('mp-preview-video').style.display !== 'none' && document.getElementById('mp-preview-video').style.display !== '';
+    var isVideo = !isCarousel && (_mpUploadedMedia || singleImg) && document.getElementById('mp-preview-video').style.display !== 'none' && document.getElementById('mp-preview-video').style.display !== '';
     var payload = {
       platforms: platforms,
       headline: headline,
@@ -7627,7 +7638,9 @@ translateDOM();
       cta: cta,
       link_url: linkUrl,
       content_type: isVideo ? 'video' : (isCarousel ? 'carousel' : 'image'),
-      media_file: isCarousel ? '' : _mpUploadedMedia,
+      media_file: isCarousel ? '' : (_mpUploadedMedia || singleImg),
+      media_url: isCarousel ? '' : (_mpUploadedMedia || singleImg),
+      media_urls: isCarousel ? _mpCarouselUrls : ((_mpUploadedMedia || singleImg) ? [_mpUploadedMedia || singleImg] : []),
       media_files: _mpCarouselUrls,
       scheduled_time: schedule || null
     };
