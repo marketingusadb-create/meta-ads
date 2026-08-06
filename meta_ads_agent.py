@@ -3295,6 +3295,7 @@ HTML_TEMPLATE = """
         <option value="instagram">Instagram</option>
       </select>
       <input type="text" id="post-search" data-i18n-placeholder="search_posts" placeholder="Buscar posts..." oninput="renderFilteredPosts()" style="padding:6px;border:1px solid #ddd;border-radius:6px;font-size:13px;flex:1;min-width:150px;">
+      <button id="post-sort-btn" onclick="togglePostSort()" style="padding:6px 10px;border:1px solid #ddd;border-radius:6px;font-size:13px;background:#fff;cursor:pointer;" title="Cambiar orden"></button>
     </div>
     <div id="post-bulk-bar" style="display:none;align-items:center;gap:8px;padding:10px 12px;background:#e7f3ff;border-radius:8px;margin-bottom:10px;">
       <span style="font-weight:700;flex:1;"><span id="post-bulk-count">0</span> <span data-i18n="selected_posts">selected</span></span>
@@ -4022,6 +4023,8 @@ var langData = {
     trash: 'Trash',
     all_platforms: 'All platforms',
     search_posts: 'Search posts...',
+    newest_first: 'Newest first',
+    oldest_first: 'Oldest first',
     no_posts: 'No posts yet.',
     no_matches: 'No posts match your filters.',
     type: 'Type',
@@ -4488,6 +4491,8 @@ var langData = {
     trash: 'Papelera',
     all_platforms: 'Todas las plataformas',
     search_posts: 'Buscar posts...',
+    newest_first: 'M\u00e1s recientes primero',
+    oldest_first: 'M\u00e1s antiguos primero',
     no_posts: 'A\u00fan no hay posts.',
     no_matches: 'Ning\u00fan post coincide con los filtros.',
     type: 'Tipo',
@@ -6213,7 +6218,24 @@ translateDOM();
   var postFilter = 'all';
   var postPage = 1;
   var postPerPage = 10;
+  var postSortDesc = true;
   var _selectedPostIds = [];
+
+  function postSortKey(p) {
+    var k = p.published_at || p.scheduled_time || p.created_at || '';
+    if (typeof k === 'string' && k.indexOf('T') !== -1) k = k.replace('T', ' ');
+    return k;
+  }
+
+  function togglePostSort() {
+    postSortDesc = !postSortDesc;
+    renderFilteredPosts();
+  }
+
+  function updatePostSortBtn() {
+    var el = document.getElementById('post-sort-btn');
+    if (el) el.textContent = postSortDesc ? '↓ ' + _t('newest_first') : '↑ ' + _t('oldest_first');
+  }
 
   function getSelectedPostIds() {
     var ids = [];
@@ -6307,6 +6329,10 @@ translateDOM();
     if (postFilter !== 'all') filtered = filtered.filter(function(p) { return p.status === postFilter; });
     if (plat !== 'all') filtered = filtered.filter(function(p) { return p.platform === plat; });
     if (q) filtered = filtered.filter(function(p) { return (p.message || '').toLowerCase().indexOf(q) !== -1; });
+    filtered.sort(function(a, b) {
+      var ka = postSortKey(a), kb = postSortKey(b);
+      return postSortDesc ? kb.localeCompare(ka) : ka.localeCompare(kb);
+    });
     return filtered;
   }
 
@@ -6329,6 +6355,7 @@ translateDOM();
 
   function renderFilteredPosts() {
     var filtered = getFilteredPosts();
+    updatePostSortBtn();
     var totalPages = Math.ceil(filtered.length / postPerPage) || 1;
     if (postPage > totalPages) postPage = totalPages;
     var start = (postPage - 1) * postPerPage;
