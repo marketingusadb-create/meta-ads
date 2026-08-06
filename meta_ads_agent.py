@@ -2279,6 +2279,9 @@ class ContentScheduler:
         pt = self.meta_api.page_token or self.meta_api.access_token
         platform = post.get('platform', 'facebook')
         message = post.get('message', '')
+        headline = post.get('headline', '')
+        if headline and headline not in message:
+            message = f"{headline}\n\n{message}" if message else headline
         content_type = post.get('content_type', 'image')
         media_file = post.get('media_file', '')
         media_url = post.get('media_url', '')
