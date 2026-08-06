@@ -50,10 +50,20 @@ class PersistentStore:
             "Prefer": "resolution=merge-duplicates",
         }
 
+    def _local_path(self, local_path):
+        """Redirect a repo-relative local path into the persistent DATA_DIR so
+        files survive Render redeploys. Only basename is used; subdirs like
+        'uploads' are recreated under DATA_DIR."""
+        if not local_path:
+            return None
+        name = os.path.basename(local_path)
+        return os.path.join(DATA_DIR, name)
+
     def load(self, storage_key, local_path, default):
         """Read a JSON-able value. Tries Supabase first (if enabled), always
         falls back to the local file (or `default`) on any failure so a
         Supabase hiccup never crashes the app."""
+        lp = self._local_path(local_path)
         if self.enabled:
             try:
                 r = requests.get(
@@ -72,19 +82,20 @@ class PersistentStore:
                 print(f"[PersistentStore] load({storage_key}) error: {e}")
         # Fallback: local file
         try:
-            if local_path and os.path.exists(local_path):
-                with open(local_path, 'r') as f:
+            if lp and os.path.exists(lp):
+                with open(lp, 'r') as f:
                     return json.load(f)
         except Exception as e:
-            print(f"[PersistentStore] local fallback load error for {local_path}: {e}")
+            print(f"[PersistentStore] local fallback load error for {lp}: {e}")
         return default
 
     def delete(self, storage_key, local_path=None):
+        lp = self._local_path(local_path)
         try:
-            if local_path and os.path.exists(local_path):
-                os.remove(local_path)
+            if lp and os.path.exists(lp):
+                os.remove(lp)
         except Exception as e:
-            print(f"[PersistentStore] local delete error for {local_path}: {e}")
+            print(f"[PersistentStore] local delete error for {lp}: {e}")
         if self.enabled:
             try:
                 requests.delete(
@@ -99,12 +110,13 @@ class PersistentStore:
     def save(self, storage_key, local_path, data):
         """Write a JSON-able value. Always writes the local file too (cheap,
         and useful for local dev / debugging), then tries Supabase."""
+        lp = self._local_path(local_path)
         try:
-            if local_path:
-                with open(local_path, 'w') as f:
+            if lp:
+                with open(lp, 'w') as f:
                     json.dump(data, f, indent=2, default=str)
         except Exception as e:
-            print(f"[PersistentStore] local save error for {local_path}: {e}")
+            print(f"[PersistentStore] local save error for {lp}: {e}")
         if self.enabled:
             try:
                 payload = {"key": storage_key, "value": json.loads(json.dumps(data, default=str))}
@@ -122,6 +134,29 @@ class PersistentStore:
 
 # Single shared instance used everywhere in this file.
 persistent_store = PersistentStore()
+
+
+def data_dir():
+    """Return a persistent data directory that survives Render redeploys.
+    Render's free plan wipes the repo directory on every deploy, but keeps
+    anything under the mounted disk (/data) -- see render.yaml. Falls back to
+    the repo dir for local dev, where files already persist fine."""
+    for cand in (os.environ.get('DATA_DIR', '').strip(), '/data', os.path.join(os.path.dirname(__file__), 'data')):
+        if not cand:
+            continue
+        try:
+            os.makedirs(cand, exist_ok=True)
+            probe = os.path.join(cand, '.w')
+            with open(probe, 'w') as _f:
+                _f.write('ok')
+            os.remove(probe)
+            return cand
+        except Exception:
+            continue
+    return os.path.dirname(__file__)
+
+
+DATA_DIR = data_dir()
 
 
 # ==================== SAFETY GUARD (spend caps + audit log) ====================
@@ -655,6 +690,33 @@ class MetaAPI:
                 pass
         return None
 
+    def _to_epoch(self, scheduled_time):
+        """Convert a scheduled time (ISO string, '%Y-%m-%d %H:%M' string, or
+        numeric epoch) to an int UNIX timestamp in seconds."""
+        if scheduled_time is None or scheduled_time == '':
+            return None
+        if isinstance(scheduled_time, (int, float)):
+            ts = int(scheduled_time)
+            if ts > 10000000000:
+                ts = int(ts // 1000)
+            return ts
+        s = str(scheduled_time).strip()
+        if s.replace('.', '', 1).isdigit():
+            ts = int(float(s))
+            if ts > 10000000000:
+                ts = int(ts // 1000)
+            return ts
+        s = s.replace('Z', '+00:00')
+        for fmt in ('%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M'):
+            try:
+                return int(datetime.strptime(s, fmt).timestamp())
+            except (ValueError, TypeError):
+                continue
+        try:
+            return int(datetime.fromisoformat(s).timestamp())
+        except (ValueError, TypeError):
+            return None
+
     def create_facebook_post(self, page_id, message, media_url=None, scheduled_time=None, page_token=None):
         token = page_token or self.page_token or self.access_token
         url = f"{self.base_url}/{page_id}/feed"
@@ -666,23 +728,31 @@ class MetaAPI:
             params['message'] = message
         if scheduled_time:
             params['published'] = 'false'
-            params['scheduled_publish_time'] = int(scheduled_time)
+            params['scheduled_publish_time'] = self._to_epoch(scheduled_time)
         try:
             response = self.session.post(url, params=params)
             return response.json()
         except Exception as e:
             return {'error': str(e)}
 
-    def create_facebook_photo_post(self, page_id, image_path, caption='', page_token=None):
+    def create_facebook_photo_post(self, page_id, image_path, caption='', page_token=None, scheduled_time=None):
         token = page_token or self.page_token or self.access_token
         url = f"{self.base_url}/{page_id}/photos"
-        full_path = os.path.join(os.path.dirname(__file__), image_path.lstrip('/'))
+        full_path = os.path.join(DATA_DIR, 'uploads', os.path.basename(image_path))
+        if not os.path.exists(full_path):
+            # legacy: file may live next to the repo (pre-DATA_DIR uploads)
+            alt = os.path.join(os.path.dirname(__file__), 'uploads', os.path.basename(image_path))
+            if os.path.exists(alt):
+                full_path = alt
         if not os.path.exists(full_path):
             return {'error': f'Image not found: {full_path}'}
         try:
             with open(full_path, 'rb') as f:
                 files = {'source': f}
                 params = {'access_token': token, 'caption': caption}
+                if scheduled_time:
+                    params['published'] = 'false'
+                    params['scheduled_publish_time'] = self._to_epoch(scheduled_time)
                 response = self.session.post(url, params=params, files=files)
                 return response.json()
         except Exception as e:
@@ -715,7 +785,7 @@ class MetaAPI:
         params = {'access_token': token, 'message': message, 'attached_media': json.dumps([{'media_fbid': mid} for mid in media_ids])}
         if scheduled_time:
             params['published'] = 'false'
-            params['scheduled_publish_time'] = int(scheduled_time)
+            params['scheduled_publish_time'] = self._to_epoch(scheduled_time)
         try:
             r = self.session.post(f"{self.base_url}/{page_id}/feed", params=params)
             return r.json()
@@ -733,7 +803,7 @@ class MetaAPI:
                 params = {'access_token': token, 'description': description}
                 if scheduled_time:
                     params['published'] = 'false'
-                    params['scheduled_publish_time'] = int(scheduled_time)
+                    params['scheduled_publish_time'] = self._to_epoch(scheduled_time)
                 r = self.session.post(f"{self.base_url}/{page_id}/videos", params=params, files=files)
                 return r.json()
         except Exception as e:
@@ -792,7 +862,9 @@ class MetaAPI:
         return self.page_token or self.access_token
 
     def _upload_to_facebook_for_ig(self, image_path, page_id, token):
-        full_path = os.path.join(os.path.dirname(__file__), image_path.lstrip('/'))
+        full_path = os.path.join(DATA_DIR, 'uploads', os.path.basename(image_path.lstrip('/')))
+        if not os.path.exists(full_path):
+            full_path = os.path.join(os.path.dirname(__file__), image_path.lstrip('/'))
         if not os.path.exists(full_path):
             return None
         try:
@@ -902,7 +974,7 @@ class MetaAPI:
         }
         if scheduled_time:
             params['published'] = 'false'
-            params['scheduled_publish_time'] = int(scheduled_time)
+            params['scheduled_publish_time'] = self._to_epoch(scheduled_time)
         try:
             container_resp = self.session.post(container_url, params=params)
             container_data = container_resp.json()
@@ -955,7 +1027,7 @@ class MetaAPI:
         }
         if scheduled_time:
             params['published'] = 'false'
-            params['scheduled_publish_time'] = int(scheduled_time)
+            params['scheduled_publish_time'] = self._to_epoch(scheduled_time)
         try:
             container_resp = self.session.post(container_url, params=params)
             container_data = container_resp.json()
@@ -2083,15 +2155,49 @@ class ContentScheduler:
             return {'error': 'Post not found'}
         if post['status'] == 'published':
             return {'error': 'Already published'}
-        result = self._execute_publish(post)
+        import copy
+        p = copy.deepcopy(post)
+        p['scheduled_time'] = None
+        result = self._execute_publish(p)
         if 'error' not in result:
             post['status'] = 'published'
+            post['scheduled_time'] = None
             post['published_at'] = datetime.now().strftime('%Y-%m-%d %H:%M')
             post['meta_response'] = result
+            post.pop('meta_scheduled_id', None)
+            post.pop('meta_scheduled', None)
             self._save_posts()
         elif 'error' in result and isinstance(result['error'], dict):
             result['error'] = self._extract_meta_error(result['error'])
         return result
+
+    def schedule_in_meta(self, post_id):
+        """Hand the scheduled post to Meta directly so Meta publishes it at the
+        scheduled time even if this app is asleep. Returns the Meta object id
+        (post id / media container id) on success."""
+        post = self.posts.get(post_id)
+        if not post:
+            return {'error': 'Post not found'}
+        sched = post.get('scheduled_time')
+        if not sched:
+            return {'error': 'Post has no scheduled time'}
+        epoch = self.meta_api._to_epoch(sched)
+        if epoch is None:
+            return {'error': 'Invalid scheduled time'}
+        if epoch <= int(time.time()):
+            return {'error': 'Scheduled time must be in the future to use Meta scheduling'}
+        result = self._execute_publish(post)
+        if 'error' in result:
+            if isinstance(result['error'], dict):
+                result['error'] = self._extract_meta_error(result['error'])
+            return result
+        mid = result.get('id') or result.get('container_id') or result.get('post_id')
+        if not mid:
+            return {'error': 'Meta accepted the schedule but returned no id'}
+        post['meta_scheduled_id'] = mid
+        post['meta_response'] = result
+        self._save_posts()
+        return {'success': True, 'meta_scheduled_id': mid, 'response': result}
 
     def publish_due_posts(self):
         now = datetime.now()
@@ -2111,6 +2217,14 @@ class ContentScheduler:
                 continue
             if sched_dt <= now:
                 saved_sched = post.get('scheduled_time')
+                if post.get('meta_scheduled_id'):
+                    post['status'] = 'published'
+                    post['published_at'] = sched_dt.strftime('%Y-%m-%d %H:%M')
+                    post['published_by'] = 'meta_scheduler'
+                    self._save_posts()
+                    published.append(pid)
+                    print(f"[AUTO-PUBLISH] Post {pid} was scheduled in Meta; marked published")
+                    continue
                 post['scheduled_time'] = None
                 result = self._execute_publish(post)
                 post['scheduled_time'] = saved_sched
@@ -2198,7 +2312,7 @@ class ContentScheduler:
             elif media_url:
                 return self.meta_api.create_instagram_post(ig_id, media_url, message, scheduled, page_id=page_id)
             elif media_file:
-                return self.meta_api.create_instagram_post(ig_id, f"{os.path.dirname(__file__).replace(chr(92), '/')}/uploads/{os.path.basename(media_file)}", message, scheduled, page_id=page_id)
+                return self.meta_api.create_instagram_post(ig_id, f"/uploads/{os.path.basename(media_file)}", message, scheduled, page_id=page_id)
             else:
                 return {'error': 'Instagram requires an image or video'}
         else:
@@ -2209,7 +2323,7 @@ class ContentScheduler:
                 video_path = media_file if media_file else media_url
                 return self.meta_api.create_facebook_video_post(page_id, video_path, message, scheduled, page_token=pt)
             elif media_file:
-                return self.meta_api.create_facebook_photo_post(page_id, media_file, message, page_token=pt)
+                return self.meta_api.create_facebook_photo_post(page_id, media_file, message, page_token=pt, scheduled_time=scheduled)
             elif media_url:
                 return self.meta_api.create_facebook_post(page_id, message, media_url, scheduled, page_token=pt)
             else:
@@ -2418,7 +2532,7 @@ class MultiPlatformScheduler:
             return self.meta_api.create_instagram_post(ig_id, media[0], message, scheduled, page_id=pid)
         return {'error': 'Instagram requires media'}
 
-    def publish_item(self, item_id):
+    def publish_item(self, item_id, clear_schedule=False):
         item = None
         for q in self.queue['items']:
             if q['id'] == item_id:
@@ -2427,6 +2541,8 @@ class MultiPlatformScheduler:
         if not item:
             return {'error': 'Item not found'}
         results = {}
+        if clear_schedule:
+            item['scheduled_time'] = None
         for platform in item['platforms']:
             platform = platform.lower().strip()
             if platform in ('facebook', 'fb'):
@@ -2444,13 +2560,75 @@ class MultiPlatformScheduler:
         item['results'] = results
         all_success = all('error' not in r for r in results.values())
         item['status'] = 'published' if all_success else 'partial'
+        if clear_schedule:
+            item['scheduled_time'] = None
+            item.pop('meta_scheduled_ids', None)
         self._save_queue()
         return results
+
+    def schedule_item_in_meta(self, item_id):
+        """Hand a pending scheduled item to Meta so Meta publishes it at the
+        scheduled time even if this app is asleep."""
+        item = None
+        for q in self.queue['items']:
+            if q['id'] == item_id:
+                item = q
+                break
+        if not item:
+            return {'error': 'Item not found'}
+        sched = item.get('scheduled_time')
+        if not sched:
+            return {'error': 'Item has no scheduled time'}
+        epoch = self.meta_api._to_epoch(sched)
+        if epoch is None:
+            return {'error': 'Invalid scheduled time'}
+        if epoch <= int(time.time()):
+            return {'error': 'Scheduled time must be in the future to use Meta scheduling'}
+        results = {}
+        for platform in item['platforms']:
+            platform = platform.lower().strip()
+            if platform in ('facebook', 'fb'):
+                r = self.publish_to_facebook(item)
+                results['facebook'] = r
+            elif platform in ('instagram', 'ig'):
+                r = self.publish_to_instagram(item)
+                results['instagram'] = r
+            else:
+                results[platform] = {'error': f'Platform not supported: {platform}'}
+        item['results'] = results
+        ok_ids = {p: r.get('id') or r.get('container_id') or r.get('post_id')
+                  for p, r in results.items() if 'error' not in r}
+        targets = [pl.lower().strip() for pl in item['platforms']]
+        if ok_ids and len(ok_ids) >= len([t for t in targets if t in ('facebook', 'fb', 'instagram', 'ig')]):
+            item['meta_scheduled_ids'] = ok_ids
+            item['status'] = 'scheduled_meta'
+            self._save_queue()
+            return {'success': True, 'meta_scheduled_ids': ok_ids}
+        self._save_queue()
+        first_err = next((r.get('error') for r in results.values() if 'error' in r), 'Unknown error')
+        if isinstance(first_err, dict):
+            first_err = first_err.get('message', str(first_err))
+        return {'error': str(first_err)}
 
     def publish_pending(self):
         now = datetime.now()
         results = []
         for item in self.queue['items']:
+            if item['status'] == 'scheduled_meta':
+                sched = item.get('scheduled_time')
+                if not sched:
+                    continue
+                try:
+                    sched_dt = datetime.strptime(str(sched).replace('T', ' ')[:16], '%Y-%m-%d %H:%M')
+                except Exception:
+                    continue
+                if sched_dt <= now:
+                    item['status'] = 'published'
+                    item['published_by'] = 'meta_scheduler'
+                    item['published_at'] = sched_dt.strftime('%Y-%m-%d %H:%M')
+                    self._save_queue()
+                    results.append({'id': item['id'], 'result': {'meta_scheduled': True}})
+                continue
             if item['status'] != 'pending':
                 continue
             sched = item.get('scheduled_time')
@@ -6166,6 +6344,7 @@ translateDOM();
                           p.status === 'scheduled' ? '<span style="color:#1877f2;font-weight:700;">' + _t('scheduled') + '</span>' :
                           p.status === 'draft' ? '<span style="color:#f59e0b;font-weight:700;">' + _t('drafts') + '</span>' :
                           '<span style="color:#dc2626;font-weight:700;">🗑 ' + _t('trash') + '</span>';
+        if (p.status === 'scheduled' && (p.meta_scheduled_id || p.meta_scheduled)) statusBadge += ' <span title="Programado en Meta; se publica solo" style="color:#1877f2;font-weight:700;">⏰ Meta</span>';
         var sched = p.status === 'published' ? fmtDT(p.published_at) : (p.scheduled_time ? fmtDT(p.scheduled_time) : '-');
         var msg = (p.message || '').substring(0, 60) + ((p.message || '').length > 60 ? '...' : '');
         var checked = (_selectedPostIds.indexOf(p.id) !== -1) ? ' checked' : '';
@@ -7106,6 +7285,8 @@ translateDOM();
           if (d.success) {
             statusEl.innerHTML = successMsg;
             if (d.published) showToast(_t('post_published'));
+            else if (d.meta_scheduled) showToast('⏰ ' + _t('scheduled') + ' (Meta se encarga de publicarlo)');
+            else if (d.warning) showToast('⚠️ ' + d.warning, 8000);
             setTimeout(function() { closeCreatePostModal(); loadPosts(); }, 1000);
           } else {
             statusEl.innerHTML = _t('error') + ': ' + (d.error || 'Unknown');
@@ -7142,7 +7323,7 @@ translateDOM();
       fetch('/api/posts/create', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(p2)})
         .then(function(r) { return r.json(); })
         .then(function(d) {
-          if (d.success) { results.push(pl); }
+          if (d.success) { results.push(pl); if (d.warning) errors.push(pl + ': ' + d.warning); }
           else { errors.push(pl + ': ' + (d.error || 'error')); }
           postNext(index + 1);
         }).catch(function(e) {
@@ -9178,7 +9359,7 @@ def create_web_interface(ads_agent, tenant_manager=None):
             return jsonify({'error': 'Campaign not found'}), 404
         return jsonify(perf)
 
-    UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), 'uploads')
+    UPLOAD_FOLDER = os.path.join(DATA_DIR, 'uploads')
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
     @app.route('/uploads/<filename>')
@@ -9784,6 +9965,9 @@ def create_web_interface(ads_agent, tenant_manager=None):
                 if created:
                     time.sleep(0.01)
                 post = scheduler.create_post(post_data)
+                sched = scheduler.schedule_in_meta(post['id'])
+                if sched.get('success'):
+                    post['meta_scheduled'] = True
                 created.append(post)
         return jsonify({'success': True, 'count': len(created), 'posts': created})
 
@@ -9819,6 +10003,7 @@ def create_web_interface(ads_agent, tenant_manager=None):
             post_data['status'] = 'scheduled'
         post = scheduler.create_post(post_data)
         published = False
+        meta_scheduled = False
         if publish_now:
             result = scheduler.publish_now(post['id'])
             if 'error' not in result:
@@ -9828,7 +10013,18 @@ def create_web_interface(ads_agent, tenant_manager=None):
                 if isinstance(err, dict):
                     err = err.get('message', str(err))
                 return jsonify({'success': False, 'error': err, 'post': post}), 400
-        return jsonify({'success': True, 'post': post, 'published': published})
+        elif post_data.get('scheduled_time'):
+            sched = scheduler.schedule_in_meta(post['id'])
+            if sched.get('success'):
+                meta_scheduled = True
+            else:
+                err = sched.get('error')
+                if isinstance(err, dict):
+                    err = err.get('message', str(err))
+                return jsonify({'success': True, 'post': post, 'published': False,
+                                'meta_scheduled': False,
+                                'warning': 'Post guardado. Meta no pudo agendar: ' + str(err)}), 200
+        return jsonify({'success': True, 'post': post, 'published': published, 'meta_scheduled': meta_scheduled})
 
     @app.route('/api/posts/publish/<post_id>', methods=['POST'])
     @require_tenant_auth
@@ -9997,6 +10193,9 @@ def create_web_interface(ads_agent, tenant_manager=None):
             item = multi_scheduler.schedule_post(
                 platforms,
                 data.get('message', ''),
+                media_urls=source.get('media_urls') or [],
+                media_file=source.get('media_file', ''),
+                media_files=source.get('media_files') or [],
                 scheduled_time=t,
                 content_type=source.get('content_type', 'image'),
                 link_url=data.get('link_url', ''),
@@ -10004,6 +10203,9 @@ def create_web_interface(ads_agent, tenant_manager=None):
                 ai_instruction=data.get('ai_instruction', ''),
                 cta=data.get('cta', '')
             )
+            sched = multi_scheduler.schedule_item_in_meta(item['id'])
+            if sched.get('success'):
+                item['meta_scheduled'] = True
             created.append(item)
         return jsonify({'success': True, 'count': len(created), 'items': created})
 
@@ -10025,12 +10227,16 @@ def create_web_interface(ads_agent, tenant_manager=None):
         ai_instruction = data.get('ai_instruction', '')
         cta = data.get('cta', '')
         item = multi_scheduler.schedule_post(platforms, message, media_urls, scheduled_time, content_type=content_type, link_url=link_url, media_file=media_file, media_files=media_files, headline=headline, ai_instruction=ai_instruction, cta=cta)
-        return jsonify({'success': True, 'item': item})
+        meta = multi_scheduler.schedule_item_in_meta(item['id'])
+        if meta.get('success'):
+            item['meta_scheduled'] = True
+        return jsonify({'success': True, 'item': item, 'meta_scheduled': meta.get('success', False),
+                        'warning': None if meta.get('success') else meta.get('error')})
 
     @app.route('/api/multi-scheduler/publish/<item_id>', methods=['POST'])
     @require_tenant_auth
     def api_multi_publish(item_id):
-        results = multi_scheduler.publish_item(item_id)
+        results = multi_scheduler.publish_item(item_id, clear_schedule=True)
         return jsonify({'success': True, 'results': results})
 
     @app.route('/api/multi-scheduler/publish-pending', methods=['POST'])

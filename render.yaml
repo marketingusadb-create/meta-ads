@@ -12,6 +12,8 @@ services:
         value: "3.11.0"
       - key: SECRET_KEY
         generateValue: true
+      - key: PUBLIC_BASE_URL
+        value: "https://meta-ads-guco.onrender.com"
     autoDeploy: true
     healthCheckPath: /api/whoami
     disk:
