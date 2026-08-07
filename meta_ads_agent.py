@@ -3485,7 +3485,7 @@ HTML_TEMPLATE = """
     </div>
     <div style="display:flex;gap:8px;margin-top:16px;">
       <button class="btn" onclick="closeCpPreview()" style="flex:1;" data-i18n="back_edit">Back</button>
-      <button class="btn btn-warn" onclick="publishFromPreview()" style="flex:1;" data-i18n="publish_post">Publish Now</button>
+      <button class="btn btn-warn" id="cpv-publish-btn" onclick="publishFromPreview()" style="flex:1;" data-i18n="publish_post">Publish Now</button>
     </div>
   </div>
 </div>
@@ -6420,6 +6420,7 @@ translateDOM();
             actionsHtml = '<button class="btn btn-sm btn-primary" onclick="publishPost(' + "'" + p.id + "'" + ')" style="margin-right:4px;">' + _t('publish_now') + '</button>';
           }
           actionsHtml += '<button class="btn btn-sm" onclick="showPostDetail(' + "'" + p.id + "'" + ')" style="margin-right:4px;background:#e4e6eb;">' + _t('view') + '</button>';
+          actionsHtml += '<button class="btn btn-sm" onclick="previewPublishedPost(' + "'" + p.id + "'" + ')" style="margin-right:4px;" title="' + _t('preview_post') + '">👁</button>';
           actionsHtml += '<button class="btn btn-sm btn-primary" onclick="openRepeatModal(' + "'" + p.id + "'" + ')" style="margin-right:4px;" title="' + _t('repeat') + '">🔁</button>';
           actionsHtml += '<button class="btn btn-sm btn-warn" onclick="deletePost(' + "'" + p.id + "'" + ')">🗑</button>';
         }
@@ -6578,6 +6579,11 @@ translateDOM();
       else if (item.media_urls && item.media_urls.length) mediaInfo = '📑 ' + item.media_urls.length + ' ' + _t('images');
       else mediaInfo = _t('no_media');
       document.getElementById('rpt-media-info').textContent = mediaInfo;
+      _rptSourceContentType = item.content_type || 'image';
+      _rptSourceMediaFile = item.media_file || '';
+      _rptSourceMediaUrl = (item.media_urls && item.media_urls.length) ? item.media_urls[0] : _rptSourceMediaFile;
+      _rptSourceMediaUrls = (item.media_urls && item.media_urls.length) ? item.media_urls.slice() : [];
+      _rptSourceMediaFiles = (item.media_files && item.media_files.length) ? item.media_files.slice() : [];
       resetRptPreview();
       document.getElementById('rpt-times-list').innerHTML = '';
       document.getElementById('rpt-times-empty').style.display = '';
@@ -7320,6 +7326,8 @@ translateDOM();
 
   function closeCpPreview() {
     document.getElementById('cp-preview-modal').classList.remove('open');
+    var pubBtn = document.getElementById('cpv-publish-btn');
+    if (pubBtn) pubBtn.style.display = '';
     if (typeof _mpPreviewActive !== 'undefined') _mpPreviewActive = false;
   }
 
@@ -7762,7 +7770,8 @@ translateDOM();
     if (!tbody) return;
     var q = (document.getElementById('multi-search').value || '').toLowerCase();
     var filtered = _allMultiItems;
-    if (multiTrashFilter === 'scheduled') filtered = filtered.filter(function(it) { return it.status === 'pending' || it.status === 'scheduled_meta'; });
+    if (multiTrashFilter === 'all') filtered = filtered.filter(function(it) { return it.status !== 'trashed'; });
+    else if (multiTrashFilter === 'scheduled') filtered = filtered.filter(function(it) { return it.status === 'pending' || it.status === 'scheduled_meta'; });
     else if (multiTrashFilter !== 'all') filtered = filtered.filter(function(it) { return it.status === multiTrashFilter; });
     if (q) filtered = filtered.filter(function(it) { return ((it.message || '') + ' ' + (it.platforms || []).join(' ')).toLowerCase().indexOf(q) !== -1; });
     filtered.sort(function(a, b) {
@@ -7795,6 +7804,7 @@ translateDOM();
         (item.status === 'trashed' ? '<button class="btn btn-sm btn-primary" onclick="restoreMultiItem(\\'' + item.id + '\\')">' + _t('restore') + '</button> ' : '') +
         (item.results && item.results.facebook ? '<span style="font-size:11px;color:#65676b;">FB:' + (item.results.facebook.error || 'OK') + '</span> ' : '') +
         (item.results && item.results.instagram ? '<span style="font-size:11px;color:#65676b;">IG:' + (item.results.instagram.error || 'OK') + '</span>' : '') +
+        '<button class="btn btn-sm" onclick="previewMultiItem(\\'' + item.id + '\\')" style="margin-left:4px;" title="' + _t('preview_post') + '">👁</button>' +
         (item.status !== 'trashed' ? '<button class="btn btn-sm btn-primary" onclick="openMultiRepeatModal(\\'' + item.id + '\\')" style="margin-left:4px;" title="' + _t('repeat') + '">🔁</button>' : '') +
         '<button class="btn btn-sm btn-danger" onclick="trashMultiItem(\\'' + item.id + '\\')" style="margin-left:4px;">' + (item.status === 'trashed' ? _t('delete_forever') : _t('delete')) + '</button>' +
         '</td></tr>';
@@ -8154,6 +8164,57 @@ translateDOM();
     document.getElementById('cp-preview-modal').classList.add('open');
   }
   var _mpPreviewActive = false;
+
+  function openReadonlyPreview(item, platforms) {
+    var plats = platforms || (item.platforms || (item.platform ? [item.platform] : ['facebook']));
+    document.getElementById('cpv-platform').textContent = plats.join(' + ');
+    document.getElementById('cpv-message').textContent = item.message || '(no message)';
+    var mediaBox = document.getElementById('cpv-media');
+    mediaBox.innerHTML = '';
+    var media = item.media_urls && item.media_urls.length ? item.media_urls : (item.media_file ? [item.media_file] : (item.media_url ? [item.media_url] : (item.media_files || [])));
+    if (media.length) {
+      var isVideo = (item.content_type === 'video') && media.length === 1;
+      media.forEach(function(src) {
+        if (isVideo) {
+          var vid = document.createElement('video');
+          vid.src = src;
+          vid.controls = true;
+          vid.style.cssText = 'max-width:100%;max-height:280px;border-radius:8px;display:block;';
+          mediaBox.appendChild(vid);
+        } else {
+          var img = document.createElement('img');
+          img.src = src;
+          img.style.cssText = 'max-width:100%;max-height:280px;border-radius:8px;object-fit:cover;display:block;';
+          img.onerror = function() { this.style.display = 'none'; };
+          mediaBox.appendChild(img);
+        }
+      });
+    }
+    var linkCard = document.getElementById('cpv-linkcard');
+    if (item.link_url) {
+      linkCard.style.display = 'block';
+      document.getElementById('cpv-headline').textContent = item.headline || 'Learn More';
+      document.getElementById('cpv-link').textContent = item.link_url;
+    } else {
+      linkCard.style.display = 'none';
+    }
+    var pubBtn = document.getElementById('cpv-publish-btn');
+    if (pubBtn) pubBtn.style.display = 'none';
+    _mpPreviewActive = false;
+    document.getElementById('cp-preview-modal').classList.add('open');
+  }
+
+  function previewPublishedPost(postId) {
+    var p = (allPosts || []).find(function(x) { return x.id === postId; });
+    if (!p) return;
+    openReadonlyPreview(p, p.platform ? [p.platform] : ['facebook']);
+  }
+
+  function previewMultiItem(itemId) {
+    var item = (_allMultiItems || []).find(function(x) { return x.id === itemId; });
+    if (!item) return;
+    openReadonlyPreview(item, item.platforms || ['facebook']);
+  }
 
   function publishFromMpPreview() {
     closeCpPreview();
