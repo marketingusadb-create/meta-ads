@@ -2661,6 +2661,22 @@ class MultiPlatformScheduler:
         self.queue['items'] = [q for q in self.queue['items'] if q['id'] != item_id]
         self._save_queue()
 
+    def batch_set_status(self, ids, status):
+        count = 0
+        for q in self.queue['items']:
+            if q['id'] in ids:
+                q['status'] = status
+                count += 1
+        self._save_queue()
+        return count
+
+    def batch_delete_forever(self, ids):
+        ids = set(ids)
+        before = len(self.queue['items'])
+        self.queue['items'] = [q for q in self.queue['items'] if q['id'] not in ids]
+        self._save_queue()
+        return before - len(self.queue['items'])
+
     def start_auto_publish(self, interval=60):
         self.running = True
         def _loop():
@@ -6690,8 +6706,7 @@ translateDOM();
     var startToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
     var container = document.getElementById('rpt-times-list');
     document.getElementById('rpt-times-empty').style.display = 'none';
-    var count = 0;
-    _rptWeekdays.sort(function(a, b) { return a - b; });
+    var slots = [];
     for (var w = 0; w < weeks; w++) {
       for (var k = 0; k < _rptWeekdays.length; k++) {
         var jsd = _rptWeekdays[k];
@@ -6703,16 +6718,21 @@ translateDOM();
         var d = String(dateObj.getDate()).padStart(2, '0');
         var dateStr = y + '-' + m + '-' + d;
         for (var h = 0; h < hours.length; h++) {
-          var idx = _rptTimeIndex++;
-          var div = document.createElement('div');
-          div.id = 'rpt-time-' + idx;
-          div.style.cssText = 'display:flex;gap:8px;align-items:center;margin-bottom:6px;';
-          div.innerHTML = '<input type="datetime-local" id="rpt-dt-' + idx + '" value="' + dateStr + 'T' + hours[h] + '" style="flex:1;padding:8px;border:1px solid #ddd;border-radius:6px;">' +
-            '<button class="btn btn-sm btn-danger" onclick="removeRepeatTime(' + idx + ')" title="' + _t('remove_time') + '">x</button>';
-          container.appendChild(div);
-          count++;
+          slots.push(dateStr + 'T' + hours[h]);
         }
       }
+    }
+    slots.sort();
+    var count = 0;
+    for (var s = 0; s < slots.length; s++) {
+      var idx = _rptTimeIndex++;
+      var div = document.createElement('div');
+      div.id = 'rpt-time-' + idx;
+      div.style.cssText = 'display:flex;gap:8px;align-items:center;margin-bottom:6px;';
+      div.innerHTML = '<input type="datetime-local" id="rpt-dt-' + idx + '" value="' + slots[s] + '" style="flex:1;padding:8px;border:1px solid #ddd;border-radius:6px;">' +
+        '<button class="btn btn-sm btn-danger" onclick="removeRepeatTime(' + idx + ')" title="' + _t('remove_time') + '">x</button>';
+      container.appendChild(div);
+      count++;
     }
     showToast(count + ' ' + _t('slots_generated'));
   }
@@ -7285,11 +7305,17 @@ translateDOM();
 
   function closeCpPreview() {
     document.getElementById('cp-preview-modal').classList.remove('open');
+    if (typeof _mpPreviewActive !== 'undefined') _mpPreviewActive = false;
   }
 
   function publishFromPreview() {
     closeCpPreview();
-    publishPostNow();
+    if (typeof _mpPreviewActive !== 'undefined' && _mpPreviewActive) {
+      _mpPreviewActive = false;
+      publishMultiNow();
+    } else {
+      publishPostNow();
+    }
   }
 
   function submitPost(payload, successMsg) {
@@ -7688,37 +7714,169 @@ translateDOM();
   // ================================================================
   // MULTI-PLATFORM SCHEDULER FUNCTIONS
   // ================================================================
+  var _allMultiItems = [];
+  var _selectedMultiIds = [];
+  var multiSortDesc = true;
+  var multiTrashFilter = 'all';
+
+  function multiSortKey(item) {
+    return item.published_at || item.scheduled_time || item.created_at || '';
+  }
+
+  function updateMultiSortBtn() {
+    var btn = document.getElementById('multi-sort-btn');
+    if (!btn) return;
+    btn.textContent = multiSortDesc ? '↓ ' + _t('newest_first') : '↑ ' + _t('oldest_first');
+  }
+
+  function toggleMultiSort() {
+    multiSortDesc = !multiSortDesc;
+    renderMultiQueue();
+  }
+
+  function setMultiTrashFilter(f) {
+    multiTrashFilter = f;
+    document.querySelectorAll('.multi-trash-tab').forEach(function(b) { b.classList.remove('active'); });
+    var tab = document.querySelector('.multi-trash-tab[data-filter="' + f + '"]');
+    if (tab) tab.classList.add('active');
+    renderMultiQueue();
+  }
+
+  function renderMultiQueue() {
+    var tbody = document.getElementById('multi-queue-table');
+    if (!tbody) return;
+    var q = (document.getElementById('multi-search').value || '').toLowerCase();
+    var filtered = _allMultiItems;
+    if (multiTrashFilter === 'scheduled') filtered = filtered.filter(function(it) { return it.status === 'pending' || it.status === 'scheduled_meta'; });
+    else if (multiTrashFilter !== 'all') filtered = filtered.filter(function(it) { return it.status === multiTrashFilter; });
+    if (q) filtered = filtered.filter(function(it) { return ((it.message || '') + ' ' + (it.platforms || []).join(' ')).toLowerCase().indexOf(q) !== -1; });
+    filtered.sort(function(a, b) {
+      var ka = multiSortKey(a), kb = multiSortKey(b);
+      return multiSortDesc ? String(kb).localeCompare(String(ka)) : String(ka).localeCompare(String(kb));
+    });
+    updateMultiSortBtn();
+    if (!filtered.length) {
+      tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#65676b;padding:30px;">' + _t('no_scheduled_posts') + '</td></tr>';
+      updateMultiBulkBar();
+      return;
+    }
+    var html = '';
+    filtered.forEach(function(item) {
+      var platforms = (item.platforms || []).join(', ');
+      var sched = item.scheduled_time ? new Date(item.scheduled_time).toLocaleString() : 'Now';
+      var statusClass = item.status === 'published' ? 'badge badge-success' : item.status === 'partial' ? 'badge badge-warning' : item.status === 'trashed' ? 'badge badge-danger' : 'badge';
+      var ctype = item.content_type || 'image';
+      var hasMedia = (item.media_file || item.media_files || []).length > 0;
+      var checked = (_selectedMultiIds.indexOf(item.id) !== -1) ? ' checked' : '';
+      html += '<tr>' +
+        '<td><input type="checkbox" value="' + item.id + '"' + checked + ' onchange="onMultiSelect(this)"></td>' +
+        '<td>' + _esc(platforms) + '</td>' +
+        '<td>' + _esc((item.message || '').substring(0, 50)) + '</td>' +
+        '<td>' + (ctype === 'video' ? _t('video') : ctype === 'carousel' ? _t('carousel') : _t('image')) + (hasMedia ? ' 📎' : '') + '</td>' +
+        '<td>' + sched + '</td>' +
+        '<td><span class="' + statusClass + '">' + _esc(item.status) + '</span></td>' +
+        '<td>' +
+        (item.status === 'pending' ? '<button class="btn btn-sm btn-primary" onclick="publishMultiItem(\\'' + item.id + '\\')">' + _t('publish') + '</button> ' : '') +
+        (item.status === 'trashed' ? '<button class="btn btn-sm btn-primary" onclick="restoreMultiItem(\\'' + item.id + '\\')">' + _t('restore') + '</button> ' : '') +
+        (item.results && item.results.facebook ? '<span style="font-size:11px;color:#65676b;">FB:' + (item.results.facebook.error || 'OK') + '</span> ' : '') +
+        (item.results && item.results.instagram ? '<span style="font-size:11px;color:#65676b;">IG:' + (item.results.instagram.error || 'OK') + '</span>' : '') +
+        (item.status !== 'trashed' ? '<button class="btn btn-sm btn-primary" onclick="openMultiRepeatModal(\\'' + item.id + '\\')" style="margin-left:4px;" title="' + _t('repeat') + '">🔁</button>' : '') +
+        '<button class="btn btn-sm btn-danger" onclick="trashMultiItem(\\'' + item.id + '\\')" style="margin-left:4px;">' + (item.status === 'trashed' ? _t('delete_forever') : _t('delete')) + '</button>' +
+        '</td></tr>';
+    });
+    tbody.innerHTML = html;
+    updateMultiBulkBar();
+  }
+
   function loadMultiQueue() {
     fetch('/api/multi-scheduler/queue').then(function(r) { return r.json(); }).then(function(d) {
-      var items = d.items || [];
-      var tbody = document.getElementById('multi-queue-table');
-      if (!items.length) {
-        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#65676b;padding:30px;">' + _t('no_scheduled_posts') + '</td></tr>';
-        return;
-      }
-      var html = '';
-      items.forEach(function(item) {
-        var platforms = (item.platforms || []).join(', ');
-        var sched = item.scheduled_time ? new Date(item.scheduled_time).toLocaleString() : 'Now';
-        var statusClass = item.status === 'published' ? 'badge badge-success' : item.status === 'partial' ? 'badge badge-warning' : 'badge';
-        var ctype = item.content_type || 'image';
-        var hasMedia = (item.media_file || item.media_files || []).length > 0;
-        html += '<tr>' +
-          '<td>' + _esc(platforms) + '</td>' +
-          '<td>' + _esc((item.message || '').substring(0, 50)) + '</td>' +
-          '<td>' + (ctype === 'video' ? _t('video') : ctype === 'carousel' ? _t('carousel') : _t('image')) + (hasMedia ? ' 📎' : '') + '</td>' +
-          '<td>' + sched + '</td>' +
-          '<td><span class="' + statusClass + '">' + _esc(item.status) + '</span></td>' +
-          '<td>' +
-          (item.status === 'pending' ? '<button class="btn btn-sm btn-primary" onclick="publishMultiItem(\\'' + item.id + '\\')">' + _t('publish') + '</button> ' : '') +
-          (item.results && item.results.facebook ? '<span style="font-size:11px;color:#65676b;">FB:' + (item.results.facebook.error || 'OK') + '</span> ' : '') +
-          (item.results && item.results.instagram ? '<span style="font-size:11px;color:#65676b;">IG:' + (item.results.instagram.error || 'OK') + '</span>' : '') +
-          '<button class="btn btn-sm btn-primary" onclick="openMultiRepeatModal(\\'' + item.id + '\\')" style="margin-left:4px;" title="' + _t('repeat') + '">🔁</button>' +
-          '<button class="btn btn-sm btn-danger" onclick="deleteMultiItem(\\'' + item.id + '\\')" style="margin-left:4px;">' + _t('delete') + '</button>' +
-          '</td></tr>';
-      });
-      tbody.innerHTML = html;
+      _allMultiItems = d.items || [];
+      _selectedMultiIds = [];
+      renderMultiQueue();
     }).catch(function() {});
+  }
+
+  function getSelectedMultiIds() {
+    var ids = [];
+    document.querySelectorAll('#multi-queue-table input[type="checkbox"]').forEach(function(cb) {
+      if (cb.checked && cb.value) ids.push(cb.value);
+    });
+    return ids;
+  }
+
+  function updateMultiBulkBar() {
+    var ids = getSelectedMultiIds();
+    var bar = document.getElementById('multi-bulk-bar');
+    var count = document.getElementById('multi-bulk-count');
+    if (count) count.textContent = ids.length;
+    if (bar) bar.style.display = ids.length ? 'flex' : 'none';
+    var isTrash = multiTrashFilter === 'trashed';
+    var trashBtn = document.getElementById('multi-bulk-trash-btn');
+    var restoreBtn = document.getElementById('multi-bulk-restore-btn');
+    var foreverBtn = document.getElementById('multi-bulk-forever-btn');
+    if (trashBtn) trashBtn.style.display = isTrash ? 'none' : '';
+    if (restoreBtn) restoreBtn.style.display = isTrash ? '' : 'none';
+    if (foreverBtn) foreverBtn.style.display = isTrash ? '' : 'none';
+    var selAll = document.getElementById('multi-select-all');
+    if (selAll) {
+      var checks = document.querySelectorAll('#multi-queue-table input[type="checkbox"]');
+      var allChecked = checks.length > 0;
+      for (var j = 0; j < checks.length; j++) { if (!checks[j].checked) { allChecked = false; break; } }
+      selAll.checked = allChecked && checks.length > 0;
+    }
+  }
+
+  function onMultiSelect() {
+    updateMultiBulkBar();
+  }
+
+  function toggleMultiSelectAll(cb) {
+    var checks = document.querySelectorAll('#multi-queue-table input[type="checkbox"]');
+    for (var i = 0; i < checks.length; i++) {
+      if (checks[i].value) checks[i].checked = cb.checked;
+    }
+    updateMultiBulkBar();
+  }
+
+  function clearMultiSelection() {
+    var checks = document.querySelectorAll('#multi-queue-table input[type="checkbox"]');
+    for (var i = 0; i < checks.length; i++) checks[i].checked = false;
+    updateMultiBulkBar();
+  }
+
+  function multiBulkAction(url, ids, successMsg) {
+    fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ids: ids})})
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        if (d.success) {
+          showToast(successMsg + ' (' + d.count + ')');
+          _selectedMultiIds = [];
+          loadMultiQueue();
+        } else {
+          showToast(_t('error') + ': ' + (d.error || ''));
+        }
+      }).catch(function(e) { showToast(_t('error') + ': ' + e.message); });
+  }
+
+  function trashMultiSelected() {
+    var ids = getSelectedMultiIds();
+    if (!ids.length) return;
+    if (!confirm((_t('confirm_trash_selected') || 'Move to trash?') + ' (' + ids.length + ')')) return;
+    multiBulkAction('/api/multi-scheduler/batch-trash', ids, _t('moved_to_trash'));
+  }
+
+  function restoreMultiSelected() {
+    var ids = getSelectedMultiIds();
+    if (!ids.length) return;
+    if (!confirm((_t('confirm_restore_selected') || 'Restore?') + ' (' + ids.length + ')')) return;
+    multiBulkAction('/api/multi-scheduler/batch-restore', ids, _t('post_restored'));
+  }
+
+  function deleteMultiSelectedForever() {
+    var ids = getSelectedMultiIds();
+    if (!ids.length) return;
+    if (!confirm((_t('confirm_delete_forever_selected') || 'Delete forever?') + ' (' + ids.length + ')')) return;
+    multiBulkAction('/api/multi-scheduler/batch-delete-forever', ids, _t('post_deleted_permanent'));
   }
 
   function publishMultiItem(itemId) {
@@ -7729,8 +7887,23 @@ translateDOM();
       }).catch(function() {});
   }
 
+  function trashMultiItem(itemId) {
+    if (!confirm((_t('move_trash') || 'Move to trash?') + '?')) return;
+    fetch('/api/multi-scheduler/batch-trash', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ids: [itemId]})})
+      .then(function(r) { return r.json(); }).then(function(d) {
+        if (d.success) { showToast(_t('moved_to_trash')); loadMultiQueue(); }
+      }).catch(function() {});
+  }
+
+  function restoreMultiItem(itemId) {
+    fetch('/api/multi-scheduler/batch-restore', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ids: [itemId]})})
+      .then(function(r) { return r.json(); }).then(function(d) {
+        if (d.success) { showToast(_t('post_restored')); loadMultiQueue(); }
+      }).catch(function() {});
+  }
+
   function deleteMultiItem(itemId) {
-    if (!confirm('Delete this scheduled post?')) return;
+    if (!confirm((_t('delete_forever') || 'Delete forever?') + '?')) return;
     fetch('/api/multi-scheduler/delete/' + itemId, {method:'POST'})
       .then(function(r) { return r.json(); }).then(function(d) {
         if (d.success) { showToast(_t('deleted')); loadMultiQueue(); }
@@ -7858,20 +8031,30 @@ translateDOM();
       }).catch(function() { document.getElementById('rpt-status').innerHTML = _t('error'); });
   }
 
-  function submitMultiPost(statusOverride) {
+  function getMpScheduleValue() {
+    var date = document.getElementById('mp-schedule-date').value;
+    var hour = document.getElementById('mp-schedule-hour').value;
+    var min = document.getElementById('mp-schedule-min').value;
+    var ampm = document.getElementById('mp-schedule-ampm').value;
+    if (!date || !hour || !min) return '';
+    var h = parseInt(hour, 10);
+    var h24 = (ampm === 'PM' && h !== 12) ? h + 12 : (ampm === 'AM' && h === 12 ? 0 : h);
+    return date + 'T' + String(h24).padStart(2, '0') + ':' + min;
+  }
+
+  function getMpPayload() {
     var platforms = [];
     document.querySelectorAll('.mp-platform:checked').forEach(function(cb) { platforms.push(cb.value); });
-    if (!platforms.length) { showToast(_t('select_platform')); return; }
     var headline = document.getElementById('mp-headline').value.trim();
     var message = document.getElementById('mp-message').value.trim();
     var aiInstruction = document.getElementById('mp-ai-instruction').value.trim();
     var cta = document.getElementById('mp-cta').value;
     var linkUrl = document.getElementById('mp-link').value.trim();
-    var schedule = document.getElementById('mp-schedule').value;
+    var schedule = document.getElementById('mp-schedule').value || getMpScheduleValue();
     var singleImg = (_mpCarouselUrls.length === 1) ? _mpCarouselUrls[0] : '';
     var isCarousel = _mpCarouselUrls.length > 1;
     var isVideo = !isCarousel && (_mpUploadedMedia || singleImg) && document.getElementById('mp-preview-video').style.display !== 'none' && document.getElementById('mp-preview-video').style.display !== '';
-    var payload = {
+    return {
       platforms: platforms,
       headline: headline,
       message: message,
@@ -7885,6 +8068,11 @@ translateDOM();
       media_files: _mpCarouselUrls,
       scheduled_time: schedule || null
     };
+  }
+
+  function submitMultiPost(statusOverride) {
+    var payload = getMpPayload();
+    if (!payload.platforms.length) { showToast(_t('select_platform')); return; }
     if (statusOverride === 'draft') {
       payload.scheduled_time = null;
     }
@@ -7905,9 +8093,57 @@ translateDOM();
   function saveMultiSchedule() { submitMultiPost(null); }
 
   function publishMultiNow() {
-    var scheduleEl = document.getElementById('mp-schedule');
-    scheduleEl.value = '';
+    document.getElementById('mp-schedule').value = '';
+    document.getElementById('mp-schedule-date').value = '';
+    document.getElementById('mp-schedule-hour').value = '';
+    document.getElementById('mp-schedule-min').value = '';
     submitMultiPost(null);
+  }
+
+  function previewMpPost() {
+    var payload = getMpPayload();
+    var platforms = payload.platforms;
+    if (!platforms.length) { showToast(_t('select_platform')); return; }
+    document.getElementById('cpv-platform').textContent = platforms.join(' + ');
+    document.getElementById('cpv-message').textContent = payload.message || '(no message)';
+    var mediaBox = document.getElementById('cpv-media');
+    mediaBox.innerHTML = '';
+    var media = payload.media_urls && payload.media_urls.length ? payload.media_urls : (payload.media_url ? [payload.media_url] : []);
+    if (media.length) {
+      var isVideo = payload.content_type === 'video' && media.length === 1;
+      media.forEach(function(src) {
+        if (isVideo) {
+          var vid = document.createElement('video');
+          vid.src = src;
+          vid.controls = true;
+          vid.style.cssText = 'max-width:100%;max-height:280px;border-radius:8px;display:block;';
+          mediaBox.appendChild(vid);
+        } else {
+          var img = document.createElement('img');
+          img.src = src;
+          img.style.cssText = 'max-width:100%;max-height:280px;border-radius:8px;object-fit:cover;display:block;';
+          img.onerror = function() { this.style.display = 'none'; };
+          mediaBox.appendChild(img);
+        }
+      });
+    }
+    var linkCard = document.getElementById('cpv-linkcard');
+    if (payload.link_url) {
+      linkCard.style.display = 'block';
+      document.getElementById('cpv-headline').textContent = payload.headline || 'Learn More';
+      document.getElementById('cpv-link').textContent = payload.link_url;
+    } else {
+      linkCard.style.display = 'none';
+    }
+    _mpPreviewActive = true;
+    document.getElementById('cp-preview-modal').classList.add('open');
+  }
+  var _mpPreviewActive = false;
+
+  function publishFromMpPreview() {
+    closeCpPreview();
+    _mpPreviewActive = false;
+    publishMultiNow();
   }  // AUTO RESPONDER FUNCTIONS
   // ================================================================
   function loadResponder() {
@@ -8124,10 +8360,29 @@ translateDOM();
     </div>
   </div>
   <div class="section" style="overflow-x:auto;">
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px;">
+      <div style="display:flex;gap:4px;flex-wrap:wrap;" id="multi-tabs">
+        <button class="btn btn-sm multi-trash-tab active" data-filter="all" onclick="setMultiTrashFilter('all')" data-i18n="todos">Todos</button>
+        <button class="btn btn-sm multi-trash-tab" data-filter="published" onclick="setMultiTrashFilter('published')" data-i18n="published">Publicados</button>
+        <button class="btn btn-sm multi-trash-tab" data-filter="pending" onclick="setMultiTrashFilter('pending')" data-i18n="scheduled">Programados</button>
+        <button class="btn btn-sm multi-trash-tab" data-filter="trashed" onclick="setMultiTrashFilter('trashed')" data-i18n="trash">🗑 Papelera</button>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px;">
+      <input type="text" id="multi-search" data-i18n-placeholder="search_posts" placeholder="Buscar..." oninput="renderMultiQueue()" style="padding:6px;border:1px solid #ddd;border-radius:6px;font-size:13px;flex:1;min-width:150px;">
+      <button id="multi-sort-btn" onclick="toggleMultiSort()" style="padding:6px 10px;border:1px solid #ddd;border-radius:6px;font-size:13px;background:#fff;cursor:pointer;" title="Cambiar orden"></button>
+    </div>
+    <div id="multi-bulk-bar" style="display:none;align-items:center;gap:8px;padding:10px 12px;background:#e7f3ff;border-radius:8px;margin-bottom:10px;">
+      <span style="font-weight:700;flex:1;"><span id="multi-bulk-count">0</span> <span data-i18n="selected_posts">selected</span></span>
+      <button class="btn btn-sm btn-danger" id="multi-bulk-trash-btn" onclick="trashMultiSelected()" data-i18n="move_trash">Move to trash</button>
+      <button class="btn btn-sm btn-primary" id="multi-bulk-restore-btn" style="display:none;" onclick="restoreMultiSelected()" data-i18n="restore">Restore</button>
+      <button class="btn btn-sm btn-danger" id="multi-bulk-forever-btn" style="display:none;" onclick="deleteMultiSelectedForever()" data-i18n="delete_forever">Delete forever</button>
+      <button class="btn btn-sm" onclick="clearMultiSelection()" style="background:#e4e6eb;" data-i18n="clear_sel">Clear</button>
+    </div>
     <table>
-      <thead><tr><th data-i18n="platforms">Platforms</th><th data-i18n="message">Message</th><th data-i18n="type">Type</th><th data-i18n="scheduled">Scheduled</th><th data-i18n="status">Status</th><th data-i18n="actions">Actions</th></tr></thead>
+      <thead><tr><th style="width:30px;"><input type="checkbox" id="multi-select-all" onclick="toggleMultiSelectAll(this)" title="Select all"></th><th data-i18n="platforms">Platforms</th><th data-i18n="message">Message</th><th data-i18n="type">Type</th><th data-i18n="scheduled">Scheduled</th><th data-i18n="status">Status</th><th data-i18n="actions">Actions</th></tr></thead>
       <tbody id="multi-queue-table">
-        <tr><td colspan="6" style="text-align:center;color:#65676b;padding:30px;" data-i18n="no_scheduled_posts">No scheduled posts.</td></tr>
+        <tr><td colspan="7" style="text-align:center;color:#65676b;padding:30px;" data-i18n="no_scheduled_posts">No scheduled posts.</td></tr>
       </tbody>
     </table>
   </div>
@@ -8219,6 +8474,7 @@ translateDOM();
       <input type="hidden" id="mp-schedule" value="">
     </div>
     <div class="form-group" style="display:flex;gap:8px;flex-wrap:wrap;">
+      <button class="btn btn-outline" onclick="previewMpPost()" style="flex:1;background:#1c1e21;color:#fff;border-color:#1c1e21;" data-i18n="preview_post">Preview</button>
       <button class="btn btn-primary" onclick="saveMultiDraft()" style="flex:1;" data-i18n="save_draft">Save as Draft</button>
       <button class="btn btn-success" onclick="saveMultiSchedule()" style="flex:1;" data-i18n="schedule_post">Schedule</button>
       <button class="btn btn-warn" onclick="publishMultiNow()" style="flex:1;" data-i18n="publish_post">Publish Now</button>
@@ -9974,7 +10230,16 @@ def create_web_interface(ads_agent, tenant_manager=None):
         if not platforms:
             platforms = ['facebook']
         created = []
+        skipped = 0
+        now_epoch = int(time.time())
         for i, t in enumerate(times):
+            try:
+                te = scheduler.meta_api._to_epoch(t)
+            except Exception:
+                te = None
+            if te is None or te <= now_epoch:
+                skipped += 1
+                continue
             for plat in platforms:
                 post_data = {
                     'platform': plat,
@@ -9999,7 +10264,10 @@ def create_web_interface(ads_agent, tenant_manager=None):
                 if sched.get('success'):
                     post['meta_scheduled'] = True
                 created.append(post)
-        return jsonify({'success': True, 'count': len(created), 'posts': created})
+        warning = ''
+        if skipped > 0:
+            warning = f'{skipped} hora(s) ya pasaron y no se programaron.'
+        return jsonify({'success': True, 'count': len(created), 'posts': created, 'skipped': skipped, 'warning': warning})
 
     @app.route('/api/posts/create', methods=['POST'])
     @require_tenant_auth
@@ -10217,9 +10485,18 @@ def create_web_interface(ads_agent, tenant_manager=None):
             return jsonify({'success': False, 'error': 'Source not found'}), 404
         platforms = source.get('platforms', ['facebook'])
         created = []
+        skipped = 0
+        now_epoch = int(time.time())
         for i, t in enumerate(times):
             if i > 0:
                 time.sleep(0.01)
+            try:
+                te = multi_scheduler.meta_api._to_epoch(t)
+            except Exception:
+                te = None
+            if te is None or te <= now_epoch:
+                skipped += 1
+                continue
             item = multi_scheduler.schedule_post(
                 platforms,
                 data.get('message', ''),
@@ -10237,7 +10514,10 @@ def create_web_interface(ads_agent, tenant_manager=None):
             if sched.get('success'):
                 item['meta_scheduled'] = True
             created.append(item)
-        return jsonify({'success': True, 'count': len(created), 'items': created})
+        warning = ''
+        if skipped > 0:
+            warning = f'{skipped} hora(s) ya pasaron y no se programaron.'
+        return jsonify({'success': True, 'count': len(created), 'items': created, 'skipped': skipped, 'warning': warning})
 
     @app.route('/api/multi-scheduler/schedule', methods=['POST'])
     @require_tenant_auth
@@ -10280,6 +10560,30 @@ def create_web_interface(ads_agent, tenant_manager=None):
     def api_multi_delete(item_id):
         multi_scheduler.delete_item(item_id)
         return jsonify({'success': True})
+
+    @app.route('/api/multi-scheduler/batch-trash', methods=['POST'])
+    @require_tenant_auth
+    def api_multi_batch_trash():
+        data = request.get_json() or {}
+        ids = data.get('ids', [])
+        count = multi_scheduler.batch_set_status(ids, 'trashed')
+        return jsonify({'success': True, 'count': count})
+
+    @app.route('/api/multi-scheduler/batch-restore', methods=['POST'])
+    @require_tenant_auth
+    def api_multi_batch_restore():
+        data = request.get_json() or {}
+        ids = data.get('ids', [])
+        count = multi_scheduler.batch_set_status(ids, 'pending')
+        return jsonify({'success': True, 'count': count})
+
+    @app.route('/api/multi-scheduler/batch-delete-forever', methods=['POST'])
+    @require_tenant_auth
+    def api_multi_batch_delete_forever():
+        data = request.get_json() or {}
+        ids = data.get('ids', [])
+        count = multi_scheduler.batch_delete_forever(ids)
+        return jsonify({'success': True, 'count': count})
 
     # Lead Management routes
     lead_mgmt = AdvancedLeadManagement(ads_agent.meta_api)
