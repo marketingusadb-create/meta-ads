@@ -3616,7 +3616,7 @@ HTML_TEMPLATE = """
       <div id="rpt-times-list" style="margin-top:6px;"></div>
       <div id="rpt-times-empty" style="color:#65676b;font-size:.85rem;text-align:center;padding:12px;" data-i18n="no_times">No times added. Use Quick Schedule presets or add manually.</div>
     </div>
-    <div class="form-group" style="text-align:right;display:flex;gap:8px;justify-content:flex-end;">
+    <div class="form-group" style="text-align:right;display:flex;gap:8px;justify-content:flex-end;position:sticky;bottom:0;background:#fff;padding-top:10px;border-top:1px solid #e4e6eb;">
       <button class="btn btn-outline" onclick="previewRptPost()" style="background:#1c1e21;color:#fff;border-color:#1c1e21;font-weight:700;" data-i18n="preview_post">Preview</button>
       <button class="btn btn-success" onclick="scheduleRepeatCopies()" style="font-weight:700;" data-i18n="schedule_all">Schedule All</button>
     </div>
