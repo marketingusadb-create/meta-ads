@@ -2514,11 +2514,19 @@ class MultiPlatformScheduler:
             return {'error': 'No page ID'}
         pt = self.meta_api.page_token or self.meta_api.access_token
         message = item['message']
-        media = item.get('media_urls', [])
+        media = [u for u in item.get('media_urls', []) if u]
+        media_file = item.get('media_file') or (media[0] if media else '')
+        media_files = [u for u in item.get('media_files', []) if u]
+        ctype = item.get('content_type', 'image')
         scheduled = item.get('scheduled_time')
+        if ctype == 'carousel' and len(media) >= 2:
+            return self.meta_api.create_facebook_carousel_post(pid, media, message, scheduled, page_token=pt)
+        if ctype == 'video' and media_file:
+            return self.meta_api.create_facebook_video_post(pid, media_file, message, scheduled, page_token=pt)
+        if media_file:
+            return self.meta_api.create_facebook_photo_post(pid, media_file, message, page_token=pt, scheduled_time=scheduled)
         if media:
-            url = media[0]
-            return self.meta_api.create_facebook_post(pid, message, url, scheduled, page_token=pt)
+            return self.meta_api.create_facebook_post(pid, message, media[0], scheduled, page_token=pt)
         return self.meta_api.create_facebook_post(pid, message, scheduled_time=scheduled, page_token=pt)
 
     def publish_to_instagram(self, item, page_id=None):
@@ -2528,11 +2536,17 @@ class MultiPlatformScheduler:
         ig_id = item.get('ig_id') or self.meta_api.get_instagram_business_account_id(pid)
         if not ig_id:
             return {'error': 'No Instagram Business ID'}
-        media = item.get('media_urls', [])
+        media = [u for u in item.get('media_urls', []) if u]
+        media_file = item.get('media_file') or (media[0] if media else '')
         message = item['message']
         scheduled = item.get('scheduled_time')
-        if media:
-            return self.meta_api.create_instagram_post(ig_id, media[0], message, scheduled, page_id=pid)
+        ctype = item.get('content_type', 'image')
+        if ctype == 'carousel' and len(media) >= 2:
+            return self.meta_api.create_instagram_carousel_post(ig_id, media, message, scheduled, page_id=pid)
+        if media_file:
+            if media_file.startswith('http'):
+                return self.meta_api.create_instagram_post(ig_id, media_file, message, scheduled, page_id=pid)
+            return self.meta_api.create_instagram_post(ig_id, f"/uploads/{media_file.replace('\\', '/').split('/')[-1]}", message, scheduled, page_id=pid)
         return {'error': 'Instagram requires media'}
 
     def publish_item(self, item_id, clear_schedule=False):
