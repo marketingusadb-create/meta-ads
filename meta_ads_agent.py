@@ -2972,6 +2972,7 @@ HTML_TEMPLATE = """
   .badge-warn { background: #fff8e1; color: #e67e22; }
   .modal-bg { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.5); z-index: 100; align-items: center; justify-content: center; }
   .modal-bg.open { display: flex; }
+  #cp-preview-modal.open { z-index: 300; }
   .modal { background: white; border-radius: 12px; padding: 24px; width: 100%; max-width: 700px; max-height: 90vh; overflow-y: auto; }
   .modal h3 { margin-bottom: 16px; font-size: 1.1rem; }
   .form-group { margin-bottom: 14px; }
