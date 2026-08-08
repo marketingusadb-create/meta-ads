@@ -6622,6 +6622,7 @@ translateDOM();
       if (rpIg) rpIg.checked = srcPlatforms.indexOf('instagram') !== -1;
       if (rpFb || rpIg) toggleRptPlatform();
       resetRptPreview();
+      showRptSourceMedia();
       document.getElementById('rpt-times-list').innerHTML = '';
       document.getElementById('rpt-times-empty').style.display = '';
       document.getElementById('rpt-hours-list').innerHTML = '';
@@ -6658,6 +6659,7 @@ translateDOM();
       _rptSourceMediaUrls = (item.media_urls && item.media_urls.length) ? item.media_urls.slice() : [];
       _rptSourceMediaFiles = (item.media_files && item.media_files.length) ? item.media_files.slice() : [];
       resetRptPreview();
+      showRptSourceMedia();
       document.getElementById('rpt-times-list').innerHTML = '';
       document.getElementById('rpt-times-empty').style.display = '';
       document.getElementById('rpt-hours-list').innerHTML = '';
@@ -7065,6 +7067,23 @@ translateDOM();
     document.getElementById('rpt-img-count').textContent = '0';
     _rptUploadedMedia = '';
     _rptCarouselUrls = [];
+  }
+
+  function showRptSourceMedia() {
+    var media = [];
+    if (_rptSourceMediaUrls && _rptSourceMediaUrls.length) media = _rptSourceMediaUrls.slice();
+    else if (_rptSourceMediaFile) media = [_rptSourceMediaFile];
+    else if (_rptSourceMediaUrl) media = [_rptSourceMediaUrl];
+    else if (_rptSourceMediaFiles && _rptSourceMediaFiles.length) media = _rptSourceMediaFiles.slice();
+    if (!media.length) return;
+    var isVideo = _rptSourceContentType === 'video' && media.length === 1;
+    document.getElementById('rpt-upload-placeholder').style.display = 'none';
+    document.getElementById('rpt-upload-preview').style.display = '';
+    document.getElementById('rpt-carousel-thumbs').innerHTML = media.map(function(u) {
+      return '<div style="position:relative;display:inline-block;"><img src="' + u + '" style="width:80px;height:80px;object-fit:cover;border-radius:6px;border:2px solid #ddd;"></div>';
+    }).join('');
+    document.getElementById('rpt-img-count').textContent = media.length;
+    document.getElementById('rpt-preview-filename').textContent = media.length + ' ' + _t('images') + (isVideo ? ' (' + _t('video') + ')' : '');
   }
 
   function handleRptMediaUpload(files) {
