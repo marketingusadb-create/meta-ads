@@ -687,25 +687,20 @@ class MetaAPI:
         if '..' in safe or safe.startswith('/'):
             print(f"Image path rejected (possible traversal): {image_path}")
             return None
-        full_path = os.path.join(os.path.dirname(__file__), safe)
-        full_path = os.path.normpath(full_path)
-        if not full_path.startswith(os.path.normpath(os.path.dirname(__file__))):
-            print(f"Image path rejected (outside app dir): {full_path}")
-            return None
-        if not os.path.exists(full_path):
-            print(f"Image file not found: {full_path}")
+        media_bytes, fname = self._read_media_bytes(image_path)
+        if media_bytes is None:
+            print(f"Image file not found: {os.path.join(DATA_DIR, 'uploads', os.path.basename(image_path))}")
             return None
         try:
-            with open(full_path, 'rb') as f:
-                files = {'filename': f}
-                params = {'access_token': self.access_token}
-                response = self.session.post(url, params=params, files=files)
-                result = response.json()
-                print(f"Meta upload_image response: {json.dumps(result, indent=2)[:500]}")
-                if 'images' in result:
-                    for fname, info in result['images'].items():
-                        return info.get('hash')
-                return None
+            files = {'filename': (fname, media_bytes)}
+            params = {'access_token': self.access_token}
+            response = self.session.post(url, params=params, files=files)
+            result = response.json()
+            print(f"Meta upload_image response: {json.dumps(result, indent=2)[:500]}")
+            if 'images' in result:
+                for fname2, info in result['images'].items():
+                    return info.get('hash')
+            return None
         except Exception as e:
             print(f"Meta upload_image error: {e}")
             return None
@@ -716,20 +711,15 @@ class MetaAPI:
         if '..' in safe or safe.startswith('/'):
             print(f"Video path rejected (possible traversal): {video_path}")
             return None
-        full_path = os.path.join(os.path.dirname(__file__), safe)
-        full_path = os.path.normpath(full_path)
-        if not full_path.startswith(os.path.normpath(os.path.dirname(__file__))):
-            print(f"Video path rejected (outside app dir): {full_path}")
-            return None
-        if not os.path.exists(full_path):
-            print(f"Video file not found: {full_path}")
+        media_bytes, fname = self._read_media_bytes(video_path)
+        if media_bytes is None:
+            print(f"Video file not found: {os.path.join(DATA_DIR, 'uploads', os.path.basename(video_path))}")
             return None
         try:
             params = {'access_token': self.access_token}
-            with open(full_path, 'rb') as f:
-                files = {'source': f}
-                response = self.session.post(url, params=params, files=files)
-                result = response.json()
+            files = {'source': (fname, media_bytes)}
+            response = self.session.post(url, params=params, files=files)
+            result = response.json()
             print(f"Meta upload_video response: {json.dumps(result, indent=2)[:500]}")
             if 'id' in result:
                 return result['id']
@@ -808,26 +798,39 @@ class MetaAPI:
         except Exception as e:
             return {'error': str(e)}
 
+    def _read_media_bytes(self, media_path):
+        """Return the raw bytes for a media path. Tries local disk first, then
+        Supabase Storage (survives Render redeploys). Returns None if missing."""
+        name = os.path.basename(media_path)
+        for cand in (os.path.join(DATA_DIR, 'uploads', name),
+                     os.path.join(os.path.dirname(__file__), 'uploads', name)):
+            if os.path.exists(cand):
+                try:
+                    with open(cand, 'rb') as _f:
+                        return _f.read(), name
+                except Exception:
+                    pass
+        if persistent_store.enabled:
+            data = persistent_store.download_media(name)
+            if data is not None:
+                return data, name
+        return None, name
+
     def create_facebook_photo_post(self, page_id, image_path, caption='', page_token=None, scheduled_time=None):
         token = page_token or self.page_token or self.access_token
         url = f"{self.base_url}/{page_id}/photos"
-        full_path = os.path.join(DATA_DIR, 'uploads', os.path.basename(image_path))
-        if not os.path.exists(full_path):
-            # legacy: file may live next to the repo (pre-DATA_DIR uploads)
-            alt = os.path.join(os.path.dirname(__file__), 'uploads', os.path.basename(image_path))
-            if os.path.exists(alt):
-                full_path = alt
-        if not os.path.exists(full_path):
+        media_bytes, fname = self._read_media_bytes(image_path)
+        if media_bytes is None:
+            full_path = os.path.join(DATA_DIR, 'uploads', os.path.basename(image_path))
             return {'error': f'Image not found: {full_path}'}
         try:
-            with open(full_path, 'rb') as f:
-                files = {'source': f}
-                params = {'access_token': token, 'caption': caption}
-                if scheduled_time:
-                    params['published'] = 'false'
-                    params['scheduled_publish_time'] = self._to_epoch(scheduled_time)
-                response = self.session.post(url, params=params, files=files)
-                return response.json()
+            files = {'source': (fname, media_bytes)}
+            params = {'access_token': token, 'caption': caption}
+            if scheduled_time:
+                params['published'] = 'false'
+                params['scheduled_publish_time'] = self._to_epoch(scheduled_time)
+            response = self.session.post(url, params=params, files=files)
+            return response.json()
         except Exception as e:
             return {'error': str(e)}
 
@@ -841,13 +844,12 @@ class MetaAPI:
                         'access_token': token, 'url': url, 'published': 'false'
                     })
                 else:
-                    full_path = os.path.join(os.path.dirname(__file__), url.lstrip('/'))
-                    if not os.path.exists(full_path):
+                    media_bytes, fname = self._read_media_bytes(url)
+                    if media_bytes is None:
                         continue
-                    with open(full_path, 'rb') as f:
-                        r = self.session.post(f"{self.base_url}/{page_id}/photos", params={
-                            'access_token': token, 'published': 'false'
-                        }, files={'source': f})
+                    r = self.session.post(f"{self.base_url}/{page_id}/photos", params={
+                        'access_token': token, 'published': 'false'
+                    }, files={'source': (fname, media_bytes)})
                 data = r.json()
                 if data.get('id'):
                     media_ids.append(data['id'])
@@ -867,18 +869,18 @@ class MetaAPI:
 
     def create_facebook_video_post(self, page_id, video_path, description='', scheduled_time=None, page_token=None):
         token = page_token or self.page_token or self.access_token
-        full_path = os.path.join(os.path.dirname(__file__), video_path.lstrip('/'))
-        if not os.path.exists(full_path):
+        media_bytes, fname = self._read_media_bytes(video_path)
+        if media_bytes is None:
+            full_path = os.path.join(os.path.dirname(__file__), video_path.lstrip('/'))
             return {'error': f'Video not found: {full_path}'}
         try:
-            with open(full_path, 'rb') as f:
-                files = {'source': f}
-                params = {'access_token': token, 'description': description}
-                if scheduled_time:
-                    params['published'] = 'false'
-                    params['scheduled_publish_time'] = self._to_epoch(scheduled_time)
-                r = self.session.post(f"{self.base_url}/{page_id}/videos", params=params, files=files)
-                return r.json()
+            files = {'source': (fname, media_bytes)}
+            params = {'access_token': token, 'description': description}
+            if scheduled_time:
+                params['published'] = 'false'
+                params['scheduled_publish_time'] = self._to_epoch(scheduled_time)
+            r = self.session.post(f"{self.base_url}/{page_id}/videos", params=params, files=files)
+            return r.json()
         except Exception as e:
             return {'error': str(e)}
 
@@ -935,20 +937,17 @@ class MetaAPI:
         return self.page_token or self.access_token
 
     def _upload_to_facebook_for_ig(self, image_path, page_id, token):
-        full_path = os.path.join(DATA_DIR, 'uploads', os.path.basename(image_path.lstrip('/')))
-        if not os.path.exists(full_path):
-            full_path = os.path.join(os.path.dirname(__file__), image_path.lstrip('/'))
-        if not os.path.exists(full_path):
+        media_bytes, fname = self._read_media_bytes(image_path)
+        if media_bytes is None:
             return None
         try:
-            with open(full_path, 'rb') as f:
-                r = self.session.post(f"{self.base_url}/{page_id}/photos", params={
-                    'access_token': token, 'published': 'false'
-                }, files={'source': f})
-                data = r.json()
-                if data.get('id'):
-                    return f"{self.base_url}/{data['id']}/picture?access_token={token}"
-        except:
+            r = self.session.post(f"{self.base_url}/{page_id}/photos", params={
+                'access_token': token, 'published': 'false'
+            }, files={'source': (fname, media_bytes)})
+            data = r.json()
+            if data.get('id'):
+                return f"{self.base_url}/{data['id']}/picture?access_token={token}"
+        except Exception:
             pass
         return None
 
@@ -990,6 +989,10 @@ class MetaAPI:
             pub = self._public_upload_url(media_url)
             if pub:
                 return pub
+            if persistent_store.enabled:
+                sb = persistent_store.media_public_url(os.path.basename(media_url.rstrip('/')))
+                if sb:
+                    return sb
             fb_url = self._upload_to_facebook_for_ig(media_url, page_id, token)
             if fb_url:
                 return fb_url
@@ -2549,6 +2552,7 @@ class MultiPlatformScheduler:
         self.queue = self._load_queue()
         self.thread = None
         self.running = False
+        self._lock = threading.RLock()
 
     def _load_queue(self):
         return persistent_store.load('multi_queue', self.queue_file, {'items': []})
@@ -2622,118 +2626,210 @@ class MultiPlatformScheduler:
             return self.meta_api.create_instagram_post(ig_id, f"/uploads/{media_file.replace('\\', '/').split('/')[-1]}", message, scheduled, page_id=pid)
         return {'error': 'Instagram requires media'}
 
-    def publish_item(self, item_id, clear_schedule=False):
-        item = None
-        for q in self.queue['items']:
-            if q['id'] == item_id:
-                item = q
-                break
-        if not item:
-            return {'error': 'Item not found'}
-        results = {}
-        if clear_schedule:
-            item['scheduled_time'] = None
-        for platform in item['platforms']:
-            platform = platform.lower().strip()
-            if platform in ('facebook', 'fb'):
-                r = self.publish_to_facebook(item)
-                results['facebook'] = r
-            elif platform in ('instagram', 'ig'):
-                r = self.publish_to_instagram(item)
-                results['instagram'] = r
-            elif platform == 'twitter':
-                results['twitter'] = {'error': 'Twitter API not configured'}
-            elif platform == 'linkedin':
-                results['linkedin'] = {'error': 'LinkedIn API not configured'}
-            else:
-                results[platform] = {'error': f'Unknown platform: {platform}'}
-        item['results'] = results
-        all_success = all('error' not in r for r in results.values())
-        item['status'] = 'published' if all_success else 'partial'
-        if clear_schedule:
-            item['scheduled_time'] = None
-            item.pop('meta_scheduled_ids', None)
-        self._save_queue()
-        return results
+    def _canonical(self, platform):
+        p = str(platform).lower().strip()
+        if p in ('facebook', 'fb'):
+            return 'facebook'
+        if p in ('instagram', 'ig'):
+            return 'instagram'
+        return p
+
+    def _missing_platforms(self, item):
+        """Platforms in the item that have NOT been successfully published or
+        handed to Meta yet. Used to retry only what is still missing (avoids
+        duplicate posts)."""
+        already = set()
+        for p in (item.get('meta_scheduled_ids') or {}):
+            already.add(self._canonical(p))
+        for p, r in (item.get('results') or {}).items():
+            if 'error' not in r and (r.get('id') or r.get('container_id') or r.get('post_id')):
+                already.add(self._canonical(p))
+        missing = []
+        for p in item['platforms']:
+            c = self._canonical(p)
+            if c in ('facebook', 'instagram') and c not in already:
+                missing.append(c)
+        return missing or None
+
+    def publish_item(self, item_id, clear_schedule=False, platforms=None):
+        with self._lock:
+            item = None
+            for q in self.queue['items']:
+                if q['id'] == item_id:
+                    item = q
+                    break
+            if not item:
+                return {'error': 'Item not found'}
+            if clear_schedule:
+                item['scheduled_time'] = None
+                item.pop('meta_scheduled_ids', None)
+            results = dict(item.get('results') or {})
+            targets = [self._canonical(p) for p in item['platforms']]
+            if platforms is not None:
+                wanted = {self._canonical(p) for p in platforms}
+                targets = [t for t in targets if t in wanted]
+            for platform in targets:
+                if platform == 'facebook':
+                    r = self.publish_to_facebook(item)
+                    results['facebook'] = r
+                elif platform == 'instagram':
+                    r = self.publish_to_instagram(item)
+                    results['instagram'] = r
+                elif platform == 'twitter':
+                    results['twitter'] = {'error': 'Twitter API not configured'}
+                elif platform == 'linkedin':
+                    results['linkedin'] = {'error': 'LinkedIn API not configured'}
+                else:
+                    results[platform] = {'error': f'Unknown platform: {platform}'}
+            item['results'] = results
+            meta_ids = item.get('meta_scheduled_ids') or {}
+            desired = {self._canonical(p) for p in item['platforms']}
+            all_ok = True
+            for p in desired:
+                if p in meta_ids:
+                    continue
+                rr = results.get(p)
+                if not rr or 'error' in rr:
+                    all_ok = False
+            item['status'] = 'published' if all_ok else 'partial'
+            self._save_queue()
+            return results
 
     def schedule_item_in_meta(self, item_id):
         """Hand a pending scheduled item to Meta so Meta publishes it at the
-        scheduled time even if this app is asleep."""
-        item = None
-        for q in self.queue['items']:
-            if q['id'] == item_id:
-                item = q
-                break
-        if not item:
-            return {'error': 'Item not found'}
-        sched = item.get('scheduled_time')
+        scheduled time even if this app is asleep. Platforms that Meta refuses
+        to schedule (e.g. Instagram on a Development-mode app) stay pending and
+        are published by the local thread when the time arrives."""
+        with self._lock:
+            item = None
+            for q in self.queue['items']:
+                if q['id'] == item_id:
+                    item = q
+                    break
+            if not item:
+                return {'error': 'Item not found'}
+            sched = item.get('scheduled_time')
+            if not sched:
+                return {'error': 'Item has no scheduled time'}
+            epoch = self.meta_api._to_epoch(sched)
+            if epoch is None:
+                return {'error': 'Invalid scheduled time'}
+            if epoch <= int(time.time()):
+                return {'error': 'Scheduled time must be in the future to use Meta scheduling'}
+            results = {}
+            for platform in item['platforms']:
+                platform = self._canonical(platform)
+                if platform == 'facebook':
+                    r = self.publish_to_facebook(item)
+                    results['facebook'] = r
+                elif platform == 'instagram':
+                    r = self.publish_to_instagram(item)
+                    results['instagram'] = r
+                else:
+                    results[platform] = {'error': f'Platform not supported: {platform}'}
+            item['results'] = results
+            ok_ids = {p: r.get('id') or r.get('container_id') or r.get('post_id')
+                      for p, r in results.items() if 'error' not in r}
+            item['meta_scheduled_ids'] = ok_ids
+            targets = [self._canonical(pl) for pl in item['platforms']]
+            targets = [t for t in targets if t in ('facebook', 'instagram')]
+            if ok_ids and len(ok_ids) >= len(targets):
+                item['status'] = 'scheduled_meta'
+                self._save_queue()
+                return {'success': True, 'meta_scheduled_ids': ok_ids}
+            if ok_ids:
+                # Partial: Meta publishes the OK ones; the rest go out via the local
+                # thread at the scheduled time (immediate publish works even when
+                # Meta native scheduling is not permitted).
+                item['status'] = 'pending'
+                self._save_queue()
+                failed = [p for p in targets if p not in ok_ids]
+                return {'success': True, 'partial': True,
+                        'meta_scheduled_ids': ok_ids,
+                        'warning': f'Meta aceptó: {", ".join(ok_ids)}. '
+                                   f'Se publicarán localmente a la hora: {", ".join(failed)}. '
+                                   f'Las plataformas ya programadas en Meta no se duplicarán.'}
+            self._save_queue()
+            first_err = next((r.get('error') for r in results.values() if 'error' in r), 'Unknown error')
+            if isinstance(first_err, dict):
+                first_err = first_err.get('message', str(first_err))
+            return {'error': str(first_err)}
+
+    def _sched_dt(self, sched):
+        """Parse a scheduled_time (epoch, ISO, 'YYYY-MM-DD HH:MM', ...) into a
+        datetime, or None if unparseable. Uses the same _to_epoch used for Meta
+        scheduling so local publishing agrees with Meta scheduling."""
         if not sched:
-            return {'error': 'Item has no scheduled time'}
+            return None
         epoch = self.meta_api._to_epoch(sched)
         if epoch is None:
-            return {'error': 'Invalid scheduled time'}
-        if epoch <= int(time.time()):
-            return {'error': 'Scheduled time must be in the future to use Meta scheduling'}
-        results = {}
-        for platform in item['platforms']:
-            platform = platform.lower().strip()
-            if platform in ('facebook', 'fb'):
-                r = self.publish_to_facebook(item)
-                results['facebook'] = r
-            elif platform in ('instagram', 'ig'):
-                r = self.publish_to_instagram(item)
-                results['instagram'] = r
-            else:
-                results[platform] = {'error': f'Platform not supported: {platform}'}
-        item['results'] = results
-        ok_ids = {p: r.get('id') or r.get('container_id') or r.get('post_id')
-                  for p, r in results.items() if 'error' not in r}
-        targets = [pl.lower().strip() for pl in item['platforms']]
-        if ok_ids and len(ok_ids) >= len([t for t in targets if t in ('facebook', 'fb', 'instagram', 'ig')]):
-            item['meta_scheduled_ids'] = ok_ids
-            item['status'] = 'scheduled_meta'
-            self._save_queue()
-            return {'success': True, 'meta_scheduled_ids': ok_ids}
-        self._save_queue()
-        first_err = next((r.get('error') for r in results.values() if 'error' in r), 'Unknown error')
-        if isinstance(first_err, dict):
-            first_err = first_err.get('message', str(first_err))
-        return {'error': str(first_err)}
+            return None
+        return datetime.fromtimestamp(epoch)
 
     def publish_pending(self):
-        now = datetime.now()
-        results = []
-        for item in self.queue['items']:
-            if item['status'] == 'scheduled_meta':
-                sched = item.get('scheduled_time')
-                if not sched:
+        with self._lock:
+            now = datetime.now()
+            results = []
+            for item in self.queue['items']:
+                if item['status'] == 'scheduled_meta':
+                    sched_dt = self._sched_dt(item.get('scheduled_time'))
+                    if sched_dt is None:
+                        continue
+                    if sched_dt <= now:
+                        item['status'] = 'published'
+                        item['published_by'] = 'meta_scheduler'
+                        item['published_at'] = sched_dt.strftime('%Y-%m-%d %H:%M')
+                        self._save_queue()
+                        results.append({'id': item['id'], 'result': {'meta_scheduled': True}})
                     continue
-                try:
-                    sched_dt = datetime.strptime(str(sched).replace('T', ' ')[:16], '%Y-%m-%d %H:%M')
-                except Exception:
+                if item['status'] != 'pending':
                     continue
-                if sched_dt <= now:
+                sched_dt = self._sched_dt(item.get('scheduled_time'))
+                if sched_dt is not None:
+                    if sched_dt > now:
+                        continue
+                    if now.timestamp() - sched_dt.timestamp() > 24 * 3600:
+                        # Too old to auto-publish; keep pending so the user can
+                        # decide (or it was scheduled long ago and already meant
+                        # to be handled by Meta).
+                        continue
+                missing = self._missing_platforms(item)
+                if missing:
+                    # Publish immediately (clear_schedule=True): Meta can't accept a
+                    # scheduled_publish_time that has already passed, and immediate
+                    # publishing works for Instagram even without whitelist.
+                    r = self.publish_item(item['id'], clear_schedule=True, platforms=missing)
+                    results.append({'id': item['id'], 'result': r})
+                elif item.get('scheduled_time'):
+                    # Everything already handled (e.g. handed to Meta on an earlier run).
                     item['status'] = 'published'
                     item['published_by'] = 'meta_scheduler'
-                    item['published_at'] = sched_dt.strftime('%Y-%m-%d %H:%M')
                     self._save_queue()
                     results.append({'id': item['id'], 'result': {'meta_scheduled': True}})
-                continue
-            if item['status'] != 'pending':
-                continue
-            sched = item.get('scheduled_time')
-            if sched:
-                try:
-                    sched_dt = datetime.strptime(sched, '%Y-%m-%d %H:%M')
-                    if sched_dt <= now:
-                        r = self.publish_item(item['id'])
-                        results.append({'id': item['id'], 'result': r})
-                except:
-                    pass
-            else:
-                r = self.publish_item(item['id'])
-                results.append({'id': item['id'], 'result': r})
-        return results
+            return results
+
+    def recover_overdue(self, max_age_hours=24):
+        """On startup, publish pending items whose scheduled time already passed
+        (within max_age_hours) and were not handed to Meta. This catches posts
+        whose moment went by while the free Render instance was asleep."""
+        with self._lock:
+            now = datetime.now()
+            now_ts = now.timestamp()
+            results = []
+            for item in self.queue['items']:
+                if item['status'] != 'pending':
+                    continue
+                sched_dt = self._sched_dt(item.get('scheduled_time'))
+                if sched_dt is None or sched_dt > now:
+                    continue
+                age = now_ts - sched_dt.timestamp()
+                if age > max_age_hours * 3600:
+                    continue
+                missing = self._missing_platforms(item)
+                if missing:
+                    r = self.publish_item(item['id'], clear_schedule=True, platforms=missing)
+                    results.append({'id': item['id'], 'result': r})
+            return results
 
     def get_queue(self):
         return list(reversed(self.queue['items']))
@@ -6939,6 +7035,10 @@ translateDOM();
     if (warn) warn.style.display = 'none';
     if (sourceType === 'post') {
       times = times.map(function(t) { return new Date(t).getTime() / 1000; });
+    } else {
+      // multi queue: send epoch ms so the server/display agrees on the exact
+      // wall-clock instant regardless of server timezone.
+      times = times.map(function(t) { return new Date(t).getTime(); });
     }
     var statusEl = document.getElementById('rpt-status');
     statusEl.innerHTML = _t('saving') + '...';
@@ -8183,7 +8283,7 @@ translateDOM();
       media_url: isCarousel ? '' : (_mpUploadedMedia || singleImg),
       media_urls: isCarousel ? _mpCarouselUrls : ((_mpUploadedMedia || singleImg) ? [_mpUploadedMedia || singleImg] : []),
       media_files: _mpCarouselUrls,
-      scheduled_time: schedule || null
+      scheduled_time: schedule ? new Date(schedule).getTime() : null
     };
   }
 
@@ -10650,6 +10750,16 @@ def create_web_interface(ads_agent, tenant_manager=None):
     multi_scheduler = MultiPlatformScheduler(ads_agent.meta_api)
     multi_scheduler.start_auto_publish()
     scheduler.start_auto_publish()
+    try:
+        # Recover posts whose scheduled time passed while the instance was
+        # asleep/restarting (only within the last 24h, and never duplicating
+        # platforms already handed to Meta).
+        recovered = multi_scheduler.recover_overdue()
+        if recovered:
+            print(f"[startup] Recuperados {len(recovered)} post(s) atrasados: "
+                  f"{[r['id'] for r in recovered]}")
+    except Exception as e:
+        print(f"[startup] recover_overdue failed: {e}")
 
     @app.route('/api/multi-scheduler/queue')
     @require_tenant_auth
