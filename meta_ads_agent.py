@@ -10709,11 +10709,16 @@ def create_web_interface(ads_agent, tenant_manager=None):
         ai_instruction = data.get('ai_instruction', '')
         cta = data.get('cta', '')
         item = multi_scheduler.schedule_post(platforms, message, media_urls, scheduled_time, content_type=content_type, link_url=link_url, media_file=media_file, media_files=media_files, headline=headline, ai_instruction=ai_instruction, cta=cta)
-        meta = multi_scheduler.schedule_item_in_meta(item['id'])
-        if meta.get('success'):
-            item['meta_scheduled'] = True
-        return jsonify({'success': True, 'item': item, 'meta_scheduled': meta.get('success', False),
-                        'warning': None if meta.get('success') else meta.get('error')})
+        if scheduled_time:
+            meta = multi_scheduler.schedule_item_in_meta(item['id'])
+            if meta.get('success'):
+                item['meta_scheduled'] = True
+            return jsonify({'success': True, 'item': item, 'meta_scheduled': meta.get('success', False),
+                            'warning': None if meta.get('success') else meta.get('error')})
+        results = multi_scheduler.publish_item(item['id'])
+        item['results'] = results
+        item = multi_scheduler.get_item(item['id'])
+        return jsonify({'success': True, 'item': item, 'published': True, 'results': results})
 
     @app.route('/api/multi-scheduler/publish/<item_id>', methods=['POST'])
     @require_tenant_auth
