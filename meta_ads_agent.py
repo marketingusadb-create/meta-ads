@@ -2703,6 +2703,19 @@ class MultiPlatformScheduler:
             if not item:
                 return {'error': 'Item not found'}
             if clear_schedule:
+                # Compute what is still missing BEFORE clearing Meta hand-offs,
+                # so a retry never re-publishes platforms Meta already accepted
+                # (e.g. retrying Instagram must not duplicate the Facebook that
+                # Meta is publishing). platforms can also be passed explicitly.
+                if platforms is None:
+                    platforms = self._missing_platforms(item)
+                if not platforms:
+                    item['status'] = 'published'
+                    item['published_at'] = int(time.time() * 1000)
+                    if 'published_by' not in item:
+                        item['published_by'] = 'local'
+                    self._save_queue()
+                    return dict(item.get('results') or {})
                 item['scheduled_time'] = None
                 item.pop('meta_scheduled_ids', None)
             results = dict(item.get('results') or {})
@@ -10899,7 +10912,9 @@ def create_web_interface(ads_agent, tenant_manager=None):
     @app.route('/api/multi-scheduler/publish/<item_id>', methods=['POST'])
     @require_tenant_auth
     def api_multi_publish(item_id):
-        results = multi_scheduler.publish_item(item_id, clear_schedule=True)
+        data = request.get_json(silent=True) or {}
+        platforms = data.get('platforms')
+        results = multi_scheduler.publish_item(item_id, clear_schedule=True, platforms=platforms)
         return jsonify({'success': True, 'results': results})
 
     @app.route('/api/multi-scheduler/publish-pending', methods=['POST'])
