@@ -982,17 +982,18 @@ class MetaAPI:
 
     def _ensure_public_url(self, media_url, page_id, token):
         if media_url.startswith('/uploads/') or media_url.startswith('uploads/'):
-            # Try to build a real public URL from the app's own host (works on
-            # Render and locally). Meta must be able to download the image from
-            # this URL, so we prefer the dashboard's own /uploads/ route over
-            # the graph.facebook.com /picture trick which Instagram rejects.
-            pub = self._public_upload_url(media_url)
-            if pub:
-                return pub
+            # Prefer the direct Supabase Storage public URL (stable CDN object)
+            # over the dashboard's own /uploads/ route -- Meta's async media
+            # downloader occasionally fails on the app URL (IG error 9004), so
+            # a direct object URL is more reliable. The graph.facebook.com
+            # /picture trick stays as a last resort.
             if persistent_store.enabled:
                 sb = persistent_store.media_public_url(os.path.basename(media_url.rstrip('/')))
                 if sb:
                     return sb
+            pub = self._public_upload_url(media_url)
+            if pub:
+                return pub
             fb_url = self._upload_to_facebook_for_ig(media_url, page_id, token)
             if fb_url:
                 return fb_url
@@ -1038,36 +1039,77 @@ class MetaAPI:
             _time.sleep(4)
         return {'error': 'Timeout waiting for Instagram to process the image'}
 
+    def _media_url_candidates(self, media_url, page_id, token):
+        """Ordered list of URLs Meta can download the media from. First tries
+        the direct Supabase object URL, then the dashboard /uploads/ route,
+        then the FB-hosted /picture trick."""
+        cands = []
+        if media_url.startswith('/uploads/') or media_url.startswith('uploads/'):
+            if persistent_store.enabled:
+                cands.append(persistent_store.media_public_url(os.path.basename(media_url.rstrip('/'))))
+            pub = self._public_upload_url(media_url)
+            if pub:
+                cands.append(pub)
+            fb_url = self._upload_to_facebook_for_ig(media_url, page_id, token)
+            if fb_url:
+                cands.append(fb_url)
+        seen = set()
+        out = []
+        for c in cands:
+            if c and c not in seen:
+                seen.add(c)
+                out.append(c)
+        return out or ([media_url] if media_url else [])
+
     def create_instagram_post(self, ig_id, image_url, caption='', scheduled_time=None, page_id=None):
         token = self._ig_token()
-        if page_id:
-            image_url = self._ensure_public_url(image_url, page_id, token)
+        candidates = self._media_url_candidates(image_url, page_id, token) if page_id else ([image_url] if image_url else [])
+        if not candidates:
+            return {'error': 'No media URL available for Instagram'}
         container_url = f"{self.base_url}/{ig_id}/media"
-        params = {
-            'access_token': token,
-            'image_url': image_url,
-            'caption': caption
-        }
-        if scheduled_time:
-            params['published'] = 'false'
-            params['scheduled_publish_time'] = self._to_epoch(scheduled_time)
-        try:
-            container_resp = self.session.post(container_url, params=params)
-            container_data = container_resp.json()
-            container_id = container_data.get('id')
-            if not container_id:
-                return container_data
+        max_attempts = min(len(candidates) * 2, 4)
+        for i in range(max_attempts):
+            cand = candidates[i % len(candidates)]
+            params = {
+                'access_token': token,
+                'image_url': cand,
+                'caption': caption
+            }
             if scheduled_time:
-                return {'id': container_id, 'scheduled': True}
-            ready = self._wait_container_ready(ig_id, container_id, token)
-            if ready.get('error'):
-                return ready
-            publish_url = f"{self.base_url}/{ig_id}/media_publish"
-            pub_params = {'access_token': token, 'creation_id': container_id}
-            pub_resp = self.session.post(publish_url, params=pub_params)
-            return pub_resp.json()
-        except Exception as e:
-            return {'error': str(e)}
+                params['published'] = 'false'
+                params['scheduled_publish_time'] = self._to_epoch(scheduled_time)
+            try:
+                container_resp = self.session.post(container_url, params=params)
+                container_data = container_resp.json()
+            except Exception as e:
+                if i == max_attempts - 1:
+                    return {'error': str(e)}
+                time.sleep(6)
+                continue
+            container_id = container_data.get('id')
+            if container_id:
+                if scheduled_time:
+                    return {'id': container_id, 'scheduled': True}
+                ready = self._wait_container_ready(ig_id, container_id, token)
+                if ready.get('error'):
+                    return ready
+                publish_url = f"{self.base_url}/{ig_id}/media_publish"
+                pub_params = {'access_token': token, 'creation_id': container_id}
+                try:
+                    pub_resp = self.session.post(publish_url, params=pub_params)
+                    return pub_resp.json()
+                except Exception as e:
+                    return {'error': str(e)}
+            # Container creation failed. IG error 9004/9007 = Meta could not
+            # fetch/process the media; it's usually transient, so try the next
+            # URL source (or retry after a short delay).
+            err = container_data.get('error') if isinstance(container_data, dict) else None
+            code = err.get('code') if isinstance(err, dict) else None
+            if code in (9004, 9007) and i < max_attempts - 1:
+                time.sleep(6)
+                continue
+            return container_data
+        return {'error': 'Failed to create Instagram media container'}
 
     def create_instagram_carousel_post(self, ig_id, image_urls, caption='', scheduled_time=None, page_id=None):
         token = self._ig_token()
@@ -2692,6 +2734,10 @@ class MultiPlatformScheduler:
                 if not rr or 'error' in rr:
                     all_ok = False
             item['status'] = 'published' if all_ok else 'partial'
+            if item['status'] in ('published', 'partial'):
+                item['published_at'] = int(time.time() * 1000)
+                if 'published_by' not in item:
+                    item['published_by'] = 'local'
             self._save_queue()
             return results
 
@@ -2778,7 +2824,7 @@ class MultiPlatformScheduler:
                     if sched_dt <= now:
                         item['status'] = 'published'
                         item['published_by'] = 'meta_scheduler'
-                        item['published_at'] = sched_dt.strftime('%Y-%m-%d %H:%M')
+                        item['published_at'] = int(sched_dt.timestamp() * 1000)
                         self._save_queue()
                         results.append({'id': item['id'], 'result': {'meta_scheduled': True}})
                     continue
@@ -2804,6 +2850,7 @@ class MultiPlatformScheduler:
                     # Everything already handled (e.g. handed to Meta on an earlier run).
                     item['status'] = 'published'
                     item['published_by'] = 'meta_scheduler'
+                    item['published_at'] = int(sched_dt.timestamp() * 1000)
                     self._save_queue()
                     results.append({'id': item['id'], 'result': {'meta_scheduled': True}})
             return results
@@ -7979,7 +8026,7 @@ translateDOM();
     var html = '';
     filtered.forEach(function(item) {
       var platforms = (item.platforms || []).join(', ');
-      var sched = item.scheduled_time ? new Date(item.scheduled_time).toLocaleString() : 'Now';
+      var sched = item.published_at ? new Date(item.published_at).toLocaleString() : (item.scheduled_time ? new Date(item.scheduled_time).toLocaleString() : 'Now');
       var statusClass = item.status === 'published' ? 'badge badge-success' : item.status === 'partial' ? 'badge badge-warning' : item.status === 'trashed' ? 'badge badge-danger' : 'badge';
       var ctype = item.content_type || 'image';
       var hasMedia = (item.media_file || item.media_files || []).length > 0;
