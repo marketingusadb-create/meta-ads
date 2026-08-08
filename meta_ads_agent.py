@@ -10,9 +10,10 @@ import json
 import time
 import threading
 import re
+import mimetypes
 import requests
 from datetime import datetime
-from flask import Flask, send_from_directory, request, jsonify, session
+from flask import Flask, send_from_directory, request, jsonify, session, Response
 from werkzeug.security import generate_password_hash, check_password_hash
 
 # ==================== PERSISTENT STORE (Supabase, survives redeploys) ====================
@@ -130,6 +131,78 @@ class PersistentStore:
                     print(f"[PersistentStore] save({storage_key}) HTTP {r.status_code}: {r.text[:200]}")
             except Exception as e:
                 print(f"[PersistentStore] save({storage_key}) error: {e}")
+
+    # ---- Supabase Storage for media (survives Render redeploys) ----
+    def _storage_bucket(self):
+        return os.environ.get('SUPABASE_BUCKET', 'media').strip() or 'media'
+
+    def _storage_headers(self):
+        return {
+            "apikey": self.key,
+            "Authorization": f"Bearer {self.key}",
+        }
+
+    def ensure_media_bucket(self):
+        """Create the public media bucket if it does not exist yet."""
+        if not self.enabled:
+            return False
+        try:
+            r = requests.post(
+                f"{self.url}/storage/v1/bucket",
+                headers={"apikey": self.key, "Authorization": f"Bearer {self.key}",
+                         "Content-Type": "application/json"},
+                json={"name": self._storage_bucket(), "public": True},
+                timeout=15,
+            )
+            # 200 = created, 400 = already exists (or name taken)
+            if r.status_code in (200, 201, 400):
+                return True
+            print(f"[PersistentStore] ensure_media_bucket HTTP {r.status_code}: {r.text[:200]}")
+            return False
+        except Exception as e:
+            print(f"[PersistentStore] ensure_media_bucket error: {e}")
+            return False
+
+    def upload_media(self, filename, data, content_type='application/octet-stream'):
+        """Upload a media file (bytes) to Supabase Storage. Returns True on success."""
+        if not self.enabled:
+            return False
+        try:
+            r = requests.post(
+                f"{self.url}/storage/v1/object/{self._storage_bucket()}/{filename}",
+                headers={"apikey": self.key, "Authorization": f"Bearer {self.key}",
+                         "Content-Type": content_type},
+                data=data,
+                timeout=60,
+            )
+            if r.status_code in (200, 201):
+                return True
+            print(f"[PersistentStore] upload_media({filename}) HTTP {r.status_code}: {r.text[:200]}")
+            return False
+        except Exception as e:
+            print(f"[PersistentStore] upload_media({filename}) error: {e}")
+            return False
+
+    def download_media(self, filename):
+        """Download a media file from Supabase Storage, or None if missing."""
+        if not self.enabled:
+            return None
+        try:
+            r = requests.get(
+                f"{self.url}/storage/v1/object/{self._storage_bucket()}/{filename}",
+                headers={"apikey": self.key, "Authorization": f"Bearer {self.key}"},
+                timeout=30,
+            )
+            if r.status_code == 200:
+                return r.content
+            return None
+        except Exception as e:
+            print(f"[PersistentStore] download_media({filename}) error: {e}")
+            return None
+
+    def media_public_url(self, filename):
+        """Public URL of a media file in Supabase Storage."""
+        return f"{self.url}/storage/v1/object/public/{self._storage_bucket()}/{filename}"
 
 
 # Single shared instance used everywhere in this file.
@@ -9723,10 +9796,25 @@ def create_web_interface(ads_agent, tenant_manager=None):
 
     UPLOAD_FOLDER = os.path.join(DATA_DIR, 'uploads')
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+    if persistent_store.enabled:
+        persistent_store.ensure_media_bucket()
+        for _fn in os.listdir(UPLOAD_FOLDER):
+            _fp = os.path.join(UPLOAD_FOLDER, _fn)
+            if os.path.isfile(_fp):
+                with open(_fp, 'rb') as _f:
+                    persistent_store.upload_media(_fn, _f.read())
 
     @app.route('/uploads/<filename>')
     def serve_upload(filename):
-        return send_from_directory(UPLOAD_FOLDER, filename)
+        safe_name = os.path.basename(filename)
+        local_path = os.path.join(UPLOAD_FOLDER, safe_name)
+        if os.path.isfile(local_path):
+            return send_from_directory(UPLOAD_FOLDER, safe_name)
+        data = persistent_store.download_media(safe_name)
+        if data is None:
+            return ('Not found', 404)
+        ctype = mimetypes.guess_type(safe_name)[0] or 'application/octet-stream'
+        return Response(data, mimetype=ctype)
 
     @app.route('/api/upload-media', methods=['POST'])
     @require_tenant_auth
@@ -9747,11 +9835,19 @@ def create_web_interface(ads_agent, tenant_manager=None):
         filepath = os.path.join(UPLOAD_FOLDER, filename)
         file.save(filepath)
         is_video = ext in allowed_videos
+        content_type = file.mimetype or ('video/mp4' if is_video else 'image/png')
+        mirrored = False
+        if persistent_store.enabled:
+            with open(filepath, 'rb') as _f:
+                mirrored = persistent_store.upload_media(filename, _f.read(), content_type)
+            if not mirrored:
+                print(f"[upload-media] WARNING: no se pudo subir {filename} a Supabase Storage")
         return jsonify({
             'success': True,
             'url': f'/uploads/{filename}',
             'is_video': is_video,
-            'filename': filename
+            'filename': filename,
+            'mirrored': mirrored
         })
 
     @app.route('/api/create-campaign', methods=['POST'])
